@@ -81,6 +81,18 @@ def _linear_lora(adapter, x):
     return F.linear(F.linear(x, down), up), scale
 
 
+def _swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate).mul_(up)
+
+
+def _is_supported_lora_adapter(adapter):
+    if not isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
+        return True
+    v = adapter.weights
+    return len(v) <= 3 or (v[3] is None and v[4] is None and v[5] is None)
+
+
 def _adapter_shape_matches(adapter, module):
     if not isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
         return True
@@ -131,37 +143,33 @@ def _build_token_mask(n, segments, audio_weight, video_weight, device):
     return mask
 
 
-def _build_row_mask(n, segments, audio_weight, video_weight, device):
-    mask = torch.ones(n, device=device, dtype=torch.float32)
+def _build_modality_mask(n, segments, audio_weight, video_weight, device):
+    mask = torch.ones(n, 3, device=device, dtype=torch.float32)
     for a, b, row in segments:
         if isinstance(row, torch.Tensor):
             idx = (row // 3).long()
-            tags = row % 3
+            tags = (row % 3).long()
             for i in torch.unique(idx):
-                vals = tags[idx == i]
-                if bool((vals == 2).any()):
-                    mask[int(i)] = audio_weight
-                elif bool((vals == 0).any()):
-                    mask[int(i)] = video_weight
+                tag = int(tags[idx == i][0])
+                value = audio_weight if tag == 2 else (video_weight if tag == 0 else 1.0)
+                mask[int(i), tag] = value
         else:
-            mask[int(row) // 3] = audio_weight if (int(row) % 3) == 2 else video_weight if (int(row) % 3) == 0 else 1.0
+            row_index = int(row)
+            tag = row_index % 3
+            value = audio_weight if tag == 2 else (video_weight if tag == 0 else 1.0)
+            mask[row_index // 3, tag] = value
     return mask
 
 
-def _build_final_row_mask(n, video_seg, audio_seg, audio_weight, video_weight, device):
+def _build_single_final_mask(n, seg, weight, device):
     mask = torch.ones(n, device=device, dtype=torch.float32)
-    if video_seg is not None:
-        row = video_seg[2]
-        if isinstance(row, torch.Tensor):
-            mask[row.unique().long()] = video_weight
-        else:
-            mask[int(row)] = video_weight
-    if audio_seg is not None:
-        row = audio_seg[2]
-        if isinstance(row, torch.Tensor):
-            mask[row.unique().long()] = audio_weight
-        else:
-            mask[int(row)] = audio_weight
+    if seg is None:
+        return mask
+    row = seg[2]
+    if isinstance(row, torch.Tensor):
+        mask[row.unique().long()] = weight
+    else:
+        mask[int(row)] = weight
     return mask
 
 
@@ -171,27 +179,43 @@ class _AVModuleBypass:
 
     def __init__(self, module, entries, mask_mode="token", scalar_mode="global", chunks=1):
         self.module = module
-        self.original_forward = module.forward
+        self.original_forward = None
         self.entries = entries
         self.mask_mode = mask_mode
         self.scalar_mode = scalar_mode
         self.masks = None
         self.scalars = None
         self.chunks = int(chunks)
+        self.chunk_offset = None
+        self.chunk_total = None
         self.shape_warned = False
 
     def install(self):
-        if getattr(self.module, "_h3_av_bypass", None) is not None:
-            logging.warning("[H3 AV LoRA] module already wrapped: %s", self.module)
-            return False
-        self.module._h3_av_bypass = self
-        self.module.forward = self._call
+        if getattr(self.module, "_h3_av_bypasses", None) is None:
+            self.module._h3_av_original_forward = self.module.forward
+            self.module._h3_av_bypasses = []
+            self.module.forward = self._dispatch
+        if self not in self.module._h3_av_bypasses:
+            self.module._h3_av_bypasses.append(self)
         return True
 
     def eject(self):
-        if getattr(self.module, "_h3_av_bypass", None) is self:
-            self.module.forward = self.original_forward
-            self.module._h3_av_bypass = None
+        bypasses = getattr(self.module, "_h3_av_bypasses", None)
+        if bypasses is None or self not in bypasses:
+            return
+        bypasses.remove(self)
+        if bypasses:
+            self.module.forward = bypasses[0]._dispatch
+            return
+        self.module.forward = self.module._h3_av_original_forward
+        del self.module._h3_av_bypasses
+        del self.module._h3_av_original_forward
+
+    def _dispatch(self, x, *args, **kwargs):
+        base = self.module._h3_av_original_forward(x, *args, **kwargs)
+        for wrapper in self.module._h3_av_bypasses:
+            base = wrapper._apply(x, base)
+        return base
 
     def set_masks(self, masks):
         self.masks = masks
@@ -202,11 +226,30 @@ class _AVModuleBypass:
     def clear_masks(self):
         self.masks = None
 
+    def set_chunk(self, offset, total):
+        self.chunk_offset = offset
+        self.chunk_total = total
+
+    def clear_chunk(self):
+        self.chunk_offset = None
+        self.chunk_total = None
+
     def _apply_mask_scale(self, delta, entry, idx, scale):
         if self.mask_mode in ("token", "adaln"):
             mask = self.masks[entry.mask_index] if self.masks is not None else None
             if mask is not None:
                 m = mask.to(device=delta.device, dtype=delta.dtype)
+                if (m.ndim == 2 and delta.ndim == 2
+                        and delta.shape[0] == m.shape[0]
+                        and delta.shape[1] % m.shape[1] == 0):
+                    delta.view(delta.shape[0], m.shape[1], -1).mul_(m.unsqueeze(-1))
+                    return scale
+                if (self.chunk_offset is not None and self.chunk_total is not None
+                        and m.ndim == 1 and m.shape[0] == self.chunk_total):
+                    start = self.chunk_offset
+                    end = min(start + delta.shape[0], m.shape[0])
+                    if start < end:
+                        m = m[start:end]
                 if delta.ndim == 2 and delta.shape[0] == m.shape[0]:
                     delta.mul_(m.unsqueeze(-1))
                 elif delta.ndim == 3 and delta.shape[1] == m.shape[0]:
@@ -226,7 +269,7 @@ class _AVModuleBypass:
                             _AVModuleBypass._warned_chunk_keys.add(warning_key)
                             logging.warning(
                                 "[H3 AV LoRA] chunked module detected for %s: mask %s, delta %s, "
-                                "using per-chunk divisor %d without AV mask",
+                                "falling back to per-chunk divisor %d without AV mask",
                                 entry.config.lora_name, tuple(m.shape), tuple(delta.shape), divisor
                             )
                     else:
@@ -243,8 +286,7 @@ class _AVModuleBypass:
                 scale *= float(self.scalars[idx])
         return scale
 
-    def _call(self, x, *args, **kwargs):
-        base = self.original_forward(x, *args, **kwargs)
+    def _apply(self, x, base):
         if not self.entries:
             return base
 
@@ -307,84 +349,196 @@ class _AVModuleBypass:
 class _H3BlockAVPatch:
     def __init__(self, block, child_wrappers, configs):
         self.block = block
-        self.original_forward = block.forward
+        self.original_forward = None
         self.child_wrappers = child_wrappers
         self.configs = configs
 
     def install(self):
-        if getattr(self.block, "_h3_av_block_patch", None) is not None:
-            logging.warning("[H3 AV LoRA] block already wrapped: %s", self.block)
-            return False
-        self.block._h3_av_block_patch = self
-        self.block.forward = self._call
+        if getattr(self.block, "_h3_av_block_patches", None) is None:
+            self.block._h3_av_block_original_forward = self.block.forward
+            self.block._h3_av_block_patches = []
+            self.block.forward = self._dispatch
+        if self not in self.block._h3_av_block_patches:
+            self.block._h3_av_block_patches.append(self)
         return True
 
     def eject(self):
-        if getattr(self.block, "_h3_av_block_patch", None) is self:
-            self.block.forward = self.original_forward
-            self.block._h3_av_block_patch = None
+        patches = getattr(self.block, "_h3_av_block_patches", None)
+        if patches is None or self not in patches:
+            return
+        patches.remove(self)
+        if patches:
+            self.block.forward = patches[0]._dispatch
+            return
+        self.block.forward = self.block._h3_av_block_original_forward
+        del self.block._h3_av_block_patches
+        del self.block._h3_av_block_original_forward
 
-    def _call(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, **kwargs):
+    def _dispatch(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, **kwargs):
+        try:
+            for patch in self.block._h3_av_block_patches:
+                patch._prepare(x, t_emb, mod_segments)
+            return self.block._h3_av_block_original_forward(
+                x, t_emb, mod_segments, rope_freqs, transformer_options, **kwargs
+            )
+        finally:
+            for patch in self.block._h3_av_block_patches:
+                for wrapper in patch.child_wrappers:
+                    wrapper.clear_masks()
+
+    def _prepare(self, x, t_emb, mod_segments):
         token_masks = [
             _build_token_mask(x.shape[0], mod_segments, c.audio_weight, c.video_weight, x.device)
             for c in self.configs
         ]
-        row_masks = [
-            _build_row_mask(t_emb.shape[0], mod_segments, c.audio_weight, c.video_weight, t_emb.device)
+        modality_masks = [
+            _build_modality_mask(t_emb.shape[0], mod_segments, c.audio_weight, c.video_weight, t_emb.device)
             for c in self.configs
         ]
         for wrapper in self.child_wrappers:
             if wrapper.mask_mode == "token":
                 wrapper.set_masks(token_masks)
             elif wrapper.mask_mode == "adaln":
-                wrapper.set_masks(row_masks)
-        try:
-            return self.original_forward(x, t_emb, mod_segments, rope_freqs, transformer_options, **kwargs)
-        finally:
-            for wrapper in self.child_wrappers:
-                wrapper.clear_masks()
+                wrapper.set_masks(modality_masks)
 
 
 class _H3FinalLayerAVPatch:
     def __init__(self, final_layer, child_wrappers, configs):
         self.final_layer = final_layer
-        self.original_forward = final_layer.forward
+        self.original_forward = None
         self.child_wrappers = child_wrappers
         self.configs = configs
 
     def install(self):
-        if getattr(self.final_layer, "_h3_av_final_patch", None) is not None:
-            logging.warning("[H3 AV LoRA] final layer already wrapped: %s", self.final_layer)
-            return False
-        self.final_layer._h3_av_final_patch = self
-        self.final_layer.forward = self._call
+        if getattr(self.final_layer, "_h3_av_final_patches", None) is None:
+            self.final_layer._h3_av_final_original_forward = self.final_layer.forward
+            self.final_layer._h3_av_final_patches = []
+            self.final_layer.forward = self._dispatch
+        if self not in self.final_layer._h3_av_final_patches:
+            self.final_layer._h3_av_final_patches.append(self)
         return True
 
     def eject(self):
-        if getattr(self.final_layer, "_h3_av_final_patch", None) is self:
-            self.final_layer.forward = self.original_forward
-            self.final_layer._h3_av_final_patch = None
+        patches = getattr(self.final_layer, "_h3_av_final_patches", None)
+        if patches is None or self not in patches:
+            return
+        patches.remove(self)
+        if patches:
+            self.final_layer.forward = patches[0]._dispatch
+            return
+        self.final_layer.forward = self.final_layer._h3_av_final_original_forward
+        del self.final_layer._h3_av_final_patches
+        del self.final_layer._h3_av_final_original_forward
 
-    def _call(self, x, t_emb, video_seg, audio_seg):
-        row_masks = [
-            _build_final_row_mask(t_emb.shape[0], video_seg, audio_seg, c.audio_weight, c.video_weight, t_emb.device)
+    def _dispatch(self, x, t_emb, video_seg, audio_seg):
+        patches = self.final_layer._h3_av_final_patches
+        video_masks = [patch._build_masks(t_emb, video_seg, "video") for patch in patches]
+        audio_masks = [patch._build_masks(t_emb, audio_seg, "audio") for patch in patches]
+
+        try:
+            for patch, masks in zip(patches, video_masks):
+                patch._set_masks(masks)
+            video_out, _ = self.final_layer._h3_av_final_original_forward(x, t_emb, video_seg, audio_seg)
+        finally:
+            for patch in patches:
+                patch._clear_masks()
+
+        try:
+            for patch, masks in zip(patches, audio_masks):
+                patch._set_masks(masks)
+            _, audio_out = self.final_layer._h3_av_final_original_forward(x, t_emb, video_seg, audio_seg)
+        finally:
+            for patch in patches:
+                patch._clear_masks()
+        return video_out, audio_out
+
+    def _build_masks(self, t_emb, seg, kind):
+        weights = [
+            c.video_weight if kind == "video" else c.audio_weight
             for c in self.configs
         ]
+        return [
+            _build_single_final_mask(t_emb.shape[0], seg, weight, t_emb.device)
+            for weight in weights
+        ]
+
+    def _set_masks(self, masks):
         for wrapper in self.child_wrappers:
-            wrapper.set_masks(row_masks)
+            wrapper.set_masks(masks)
+
+    def _clear_masks(self):
+        for wrapper in self.child_wrappers:
+            wrapper.clear_masks()
+
+
+class _H3MLPAVPatch:
+    def __init__(self, mlp, chunks=1):
+        self.mlp = mlp
+        self.chunks = int(chunks)
+        self.original_forward = None
+
+    def install(self):
+        if getattr(self.mlp, "_h3_av_mlp_refcount", None) is None:
+            self.original_forward = self.mlp.forward
+            self.mlp._h3_av_mlp_original_forward = self.original_forward
+            self.mlp._h3_av_mlp_refcount = 1
+            self.mlp.forward = self._call
+        else:
+            self.mlp._h3_av_mlp_refcount += 1
+        return True
+
+    def eject(self):
+        refcount = getattr(self.mlp, "_h3_av_mlp_refcount", 0)
+        if refcount <= 0:
+            return
+        refcount -= 1
+        self.mlp._h3_av_mlp_refcount = refcount
+        if refcount > 0:
+            return
+        self.mlp.forward = self.mlp._h3_av_mlp_original_forward
+        del self.mlp._h3_av_mlp_original_forward
+        del self.mlp._h3_av_mlp_refcount
+
+    def _set_chunk(self, offset, total):
+        for module in (self.mlp.fc1, self.mlp.fc2):
+            for wrapper in getattr(module, "_h3_av_bypasses", ()):
+                wrapper.set_chunk(offset, total)
+
+    def _clear_chunk(self):
+        for module in (self.mlp.fc1, self.mlp.fc2):
+            for wrapper in getattr(module, "_h3_av_bypasses", ()):
+                wrapper.clear_chunk()
+
+    def _forward_chunk(self, x):
+        return self.mlp.fc2(_swiglu(self.mlp.fc1(x)))
+
+    def _call(self, x):
+        if self.chunks > 1 and x.shape[0] > 1:
+            out = torch.empty_like(x)
+            offset = 0
+            for chunk in torch.chunk(x, self.chunks, dim=0):
+                self._set_chunk(offset, x.shape[0])
+                try:
+                    out[offset:offset + chunk.shape[0]] = self._forward_chunk(chunk)
+                finally:
+                    self._clear_chunk()
+                offset += chunk.shape[0]
+            return out
+        self._set_chunk(0, x.shape[0])
         try:
-            return self.original_forward(x, t_emb, video_seg, audio_seg)
+            return self._forward_chunk(x)
         finally:
-            for wrapper in self.child_wrappers:
-                wrapper.clear_masks()
+            self._clear_chunk()
 
 
 class _H3AVInjection:
-    def __init__(self, wrappers, block_patches, final_patches):
+    def __init__(self, wrappers, mlp_patches, block_patches, final_patches):
         self.wrappers = wrappers
+        self.mlp_patches = mlp_patches
         self.block_patches = block_patches
         self.final_patches = final_patches
         self.installed_wrappers = []
+        self.installed_mlps = []
         self.installed_blocks = []
         self.installed_finals = []
 
@@ -397,6 +551,9 @@ class _H3AVInjection:
                     _move_adapter_to_device(entry.adapter)
             if wrapper.install():
                 self.installed_wrappers.append(wrapper)
+        for patch in self.mlp_patches:
+            if patch.install():
+                self.installed_mlps.append(patch)
         for patch in self.block_patches:
             if patch.install():
                 self.installed_blocks.append(patch)
@@ -409,9 +566,12 @@ class _H3AVInjection:
             patch.eject()
         for patch in reversed(self.installed_blocks):
             patch.eject()
+        for patch in reversed(self.installed_mlps):
+            patch.eject()
         for wrapper in reversed(self.installed_wrappers):
             wrapper.eject()
         self.installed_wrappers.clear()
+        self.installed_mlps.clear()
         self.installed_blocks.clear()
         self.installed_finals.clear()
 
@@ -510,6 +670,9 @@ class MiniMaxH3AVLoRAStack:
             for key, adapter in loaded.items():
                 if not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
                     continue
+                if not _is_supported_lora_adapter(adapter):
+                    info.append(f"{lora_name}: skipped unsupported LoRA variant {key} (mid/dora/reshape)")
+                    continue
                 module = _get_module(dm, key)
                 if module is None:
                     info.append(f"{lora_name}: skipped missing module {key}")
@@ -527,6 +690,7 @@ class MiniMaxH3AVLoRAStack:
 
         wrappers = []
         block_map = {}
+        mlp_map = {}
         final_map = {}
 
         for key, entries in entries_by_key.items():
@@ -551,6 +715,9 @@ class MiniMaxH3AVLoRAStack:
                     continue
                 block_info = block_map.setdefault(int(m.group(1)), {"wrappers": []})
                 block_info["wrappers"].append(wrapper)
+                if ".mlp." in _module_path(key):
+                    mlp_info = mlp_map.setdefault(int(m.group(1)), {"wrappers": []})
+                    mlp_info["wrappers"].append(wrapper)
             elif mode == "final_adaln":
                 wrapper = _AVModuleBypass(module, entries, mask_mode="adaln")
                 wrappers.append(wrapper)
@@ -579,6 +746,13 @@ class MiniMaxH3AVLoRAStack:
             block = dm.blocks[block_id]
             block_patches.append(_H3BlockAVPatch(block, block_info["wrappers"], configs))
 
+        mlp_patches = []
+        for block_id, mlp_info in sorted(mlp_map.items()):
+            block = dm.blocks[block_id]
+            has_fc2 = any(wrapper.module is block.mlp.fc2 for wrapper in mlp_info["wrappers"])
+            if chunks > 1 or has_fc2:
+                mlp_patches.append(_H3MLPAVPatch(block.mlp, chunks=chunks))
+
         final_patches = []
         if "adaln" in final_map:
             configs = []
@@ -587,9 +761,10 @@ class MiniMaxH3AVLoRAStack:
                     entry.mask_index = self._config_index(configs, entry.config)
             final_patches.append(_H3FinalLayerAVPatch(dm.final_layer, final_map["adaln"]["wrappers"], configs))
 
-        injection = _H3AVInjection(wrappers, block_patches, final_patches)
-        new_model.set_injections("h3_av_lora", [PatcherInjection(injection.inject, injection.eject)])
-        info.append(f"wrapped {len(wrappers)} modules / {len(block_patches)} blocks")
+        injection = _H3AVInjection(wrappers, mlp_patches, block_patches, final_patches)
+        injection_key = "h3_av_lora_{}_{}".format(id(self), id(new_model))
+        new_model.set_injections(injection_key, [PatcherInjection(injection.inject, injection.eject)])
+        info.append(f"wrapped {len(wrappers)} modules / {len(mlp_patches)} MLP paths / {len(block_patches)} blocks")
         return (new_model, "; ".join(info))
 
 
