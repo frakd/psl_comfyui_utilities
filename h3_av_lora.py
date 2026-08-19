@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 import folder_paths
 import comfy.lora
+import comfy.lora_convert
 import comfy.model_management
 import comfy.utils
 import comfy.weight_adapter
@@ -91,6 +92,78 @@ def _is_supported_lora_adapter(adapter):
         return True
     v = adapter.weights
     return len(v) <= 3 or (v[3] is None and v[4] is None and v[5] is None)
+
+
+_MINIMAX_LORA_SUFFIXES = (".lora_A.weight", ".lora_B.weight")
+
+
+def _minimax_lora_base(key):
+    for suffix in _MINIMAX_LORA_SUFFIXES:
+        if key.endswith(suffix):
+            return key[:-len(suffix)]
+    return None
+
+
+def _linear_lora_pair_matches(target_shape, lora_a, lora_b):
+    if len(target_shape) != 2 or len(lora_a.shape) != 2 or len(lora_b.shape) != 2:
+        return True
+    return (
+        lora_a.shape[0] == lora_b.shape[1]
+        and lora_a.shape[1] == target_shape[1]
+        and lora_b.shape[0] == target_shape[0]
+    )
+
+
+def _prepare_minimax_h3_lora(inner, lora):
+    if inner is None or not hasattr(inner, "state_dict"):
+        return lora, 0
+
+    model_state = inner.state_dict()
+    normalized = {}
+    renamed = 0
+    for key, value in lora.items():
+        normalized_key = key
+        base = _minimax_lora_base(key)
+        if base is not None and not base.startswith("diffusion_model."):
+            candidate = "diffusion_model.{}".format(key)
+            candidate_base = _minimax_lora_base(candidate)
+            if "{}.weight".format(candidate_base) in model_state:
+                normalized_key = candidate
+                renamed += 1
+        normalized[normalized_key] = value
+
+    incompatible_bases = set()
+    bases = {
+        base
+        for key in normalized
+        if (base := _minimax_lora_base(key)) is not None
+    }
+    for base in bases:
+        target = model_state.get("{}.weight".format(base))
+        lora_a = normalized.get("{}.lora_A.weight".format(base))
+        lora_b = normalized.get("{}.lora_B.weight".format(base))
+        if target is None or lora_a is None or lora_b is None:
+            continue
+        if not _linear_lora_pair_matches(target.shape, lora_a, lora_b):
+            incompatible_bases.add(base)
+
+    if incompatible_bases:
+        for base in incompatible_bases:
+            normalized.pop("{}.lora_A.weight".format(base), None)
+            normalized.pop("{}.lora_B.weight".format(base), None)
+            normalized.pop("{}.alpha".format(base), None)
+        logging.warning(
+            "[H3 AV LoRA] skipped %d adapter pair(s) whose shapes do not match "
+            "the current H3 model (full-model/curve AdaLN mismatch)",
+            len(incompatible_bases),
+        )
+
+    if renamed:
+        logging.info(
+            "[H3 AV LoRA] normalized %d native MiniMax H3 LoRA key(s) for ComfyUI.",
+            renamed,
+        )
+    return normalized, len(incompatible_bases)
 
 
 def _adapter_shape_matches(adapter, module):
@@ -662,6 +735,14 @@ class MiniMaxH3AVLoRAStack:
                 info.append(f"{lora_name}: load error {e}")
                 logging.warning("[H3 AV LoRA] failed to load %s: %s", lora_name, e)
                 continue
+
+            lora_dict = comfy.lora_convert.convert_lora(lora_dict)
+            lora_dict, skipped_adaln = _prepare_minimax_h3_lora(inner, lora_dict)
+            if skipped_adaln:
+                info.append(
+                    f"{lora_name}: skipped {skipped_adaln} AdaLN adapter pair(s) "
+                    "incompatible with current H3 model"
+                )
 
             key_map = comfy.lora.model_lora_keys_unet(inner, {})
             loaded = comfy.lora.load_lora(lora_dict, key_map, log_missing=False)
