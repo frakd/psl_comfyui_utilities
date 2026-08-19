@@ -67,18 +67,18 @@ def _classify_key(key):
     return "global"
 
 
-def _linear_lora_delta(adapter, x):
+def _linear_lora(adapter, x):
     v = adapter.weights
     up, down, alpha = v[0], v[1], v[2]
     if up.ndim != 2 or down.ndim != 2:
-        return None
+        return None, 1.0
     if down.shape[1] != x.shape[-1] or up.shape[1] != down.shape[0]:
-        return None
+        return None, 1.0
     down = down.to(device=x.device, dtype=x.dtype)
     up = up.to(device=x.device, dtype=x.dtype)
     rank = down.shape[0]
     scale = (alpha / rank) if alpha is not None else 1.0
-    return F.linear(F.linear(x, down), up) * scale
+    return F.linear(F.linear(x, down), up), scale
 
 
 def _adapter_shape_matches(adapter, module):
@@ -202,77 +202,106 @@ class _AVModuleBypass:
     def clear_masks(self):
         self.masks = None
 
+    def _apply_mask_scale(self, delta, entry, idx, scale):
+        if self.mask_mode in ("token", "adaln"):
+            mask = self.masks[entry.mask_index] if self.masks is not None else None
+            if mask is not None:
+                m = mask.to(device=delta.device, dtype=delta.dtype)
+                if delta.ndim == 2 and delta.shape[0] == m.shape[0]:
+                    delta.mul_(m.unsqueeze(-1))
+                elif delta.ndim == 3 and delta.shape[1] == m.shape[0]:
+                    delta.mul_(m.view(1, -1, 1))
+                elif delta.ndim == 1 and delta.shape[0] == m.shape[0]:
+                    delta.mul_(m)
+                else:
+                    divisor = None
+                    if self.chunks > 1 and m.shape[0] == delta.shape[0] * self.chunks:
+                        divisor = self.chunks
+                    elif m.shape[0] and delta.shape[0] and m.shape[0] % delta.shape[0] == 0:
+                        divisor = m.shape[0] // delta.shape[0]
+                    if divisor is not None:
+                        scale /= float(divisor)
+                        warning_key = (entry.config.lora_name, tuple(m.shape), tuple(delta.shape), divisor)
+                        if warning_key not in _AVModuleBypass._warned_chunk_keys:
+                            _AVModuleBypass._warned_chunk_keys.add(warning_key)
+                            logging.warning(
+                                "[H3 AV LoRA] chunked module detected for %s: mask %s, delta %s, "
+                                "using per-chunk divisor %d without AV mask",
+                                entry.config.lora_name, tuple(m.shape), tuple(delta.shape), divisor
+                            )
+                    else:
+                        warning_key = (entry.config.lora_name, tuple(m.shape), tuple(delta.shape))
+                        if warning_key not in _AVModuleBypass._warned_shape_keys:
+                            _AVModuleBypass._warned_shape_keys.add(warning_key)
+                            logging.warning(
+                                "[H3 AV LoRA] mask shape %s does not match delta %s for %s; skipping this module delta",
+                                tuple(m.shape), tuple(delta.shape), entry.config.lora_name
+                            )
+                        return None
+        elif self.mask_mode == "scalar":
+            if self.scalars is not None:
+                scale *= float(self.scalars[idx])
+        return scale
+
     def _call(self, x, *args, **kwargs):
         base = self.original_forward(x, *args, **kwargs)
         if not self.entries:
             return base
 
-        total = None
+        # Accumulate each LoRA delta into the fresh module output to avoid holding
+        # multiple full-size activations at once.
+        non_lora_total = None
         for idx, entry in enumerate(self.entries):
             adapter = entry.adapter
+            if isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
+                continue
             adapter.multiplier = 1.0
-            delta = _linear_lora_delta(adapter, x) if isinstance(adapter, comfy.weight_adapter.LoRAAdapter) else None
-            if delta is None:
-                if isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
-                    logging.warning(
-                        "[H3 AV LoRA] skipping incompatible LoRA delta for %s (%s)",
-                        entry.config.lora_name, type(self.module).__name__
-                    )
-                    continue
-                try:
-                    delta = adapter.h(x, base)
-                except Exception as e:
-                    logging.warning("[H3 AV LoRA] adapter delta failed for %s: %s", entry.config.lora_name, e)
-                    continue
+            try:
+                delta = adapter.h(x, base)
+            except Exception as e:
+                logging.warning("[H3 AV LoRA] adapter delta failed for %s: %s", entry.config.lora_name, e)
+                continue
             if delta is None:
                 continue
+            if delta.device != base.device or delta.dtype != base.dtype:
+                delta = delta.to(device=base.device, dtype=base.dtype)
 
             scale = float(entry.config.strength)
-            if self.mask_mode in ("token", "adaln"):
-                mask = self.masks[entry.mask_index] if self.masks is not None else None
-                if mask is not None:
-                    m = mask.to(device=base.device, dtype=base.dtype)
-                    if delta.ndim == 2 and delta.shape[0] == m.shape[0]:
-                        delta = delta * m.unsqueeze(-1)
-                    elif delta.ndim == 3 and delta.shape[1] == m.shape[0]:
-                        delta = delta * m.view(1, -1, 1)
-                    elif delta.ndim == 1 and delta.shape[0] == m.shape[0]:
-                        delta = delta * m
-                    else:
-                        divisor = None
-                        if self.chunks > 1 and m.shape[0] == delta.shape[0] * self.chunks:
-                            divisor = self.chunks
-                        elif m.shape[0] and delta.shape[0] and m.shape[0] % delta.shape[0] == 0:
-                            divisor = m.shape[0] // delta.shape[0]
-                        if divisor is not None:
-                            scale /= float(divisor)
-                            warning_key = (entry.config.lora_name, tuple(m.shape), tuple(delta.shape), divisor)
-                            if warning_key not in _AVModuleBypass._warned_chunk_keys:
-                                _AVModuleBypass._warned_chunk_keys.add(warning_key)
-                                logging.warning(
-                                    "[H3 AV LoRA] chunked module detected for %s: mask %s, delta %s, "
-                                    "using per-chunk divisor %d without AV mask",
-                                    entry.config.lora_name, tuple(m.shape), tuple(delta.shape), divisor
-                                )
-                        else:
-                            warning_key = (entry.config.lora_name, tuple(m.shape), tuple(delta.shape))
-                            if warning_key not in _AVModuleBypass._warned_shape_keys:
-                                _AVModuleBypass._warned_shape_keys.add(warning_key)
-                                logging.warning(
-                                    "[H3 AV LoRA] mask shape %s does not match delta %s for %s; skipping this module delta",
-                                    tuple(m.shape), tuple(delta.shape), entry.config.lora_name
-                                )
-                            continue
-            elif self.mask_mode == "scalar":
-                if self.scalars is not None:
-                    scale *= float(self.scalars[idx])
+            scale = self._apply_mask_scale(delta, entry, idx, scale)
+            if scale is None:
+                continue
+            if non_lora_total is None:
+                if scale != 1.0:
+                    delta.mul_(scale)
+                non_lora_total = delta
+            else:
+                non_lora_total.add_(delta, alpha=scale)
 
-            scaled = delta * scale
-            total = scaled if total is None else total + scaled
+        if non_lora_total is not None:
+            base.add_(non_lora_total)
 
-        if total is None:
-            return base
-        return base + total
+        for idx, entry in enumerate(self.entries):
+            adapter = entry.adapter
+            if not isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
+                continue
+            adapter.multiplier = 1.0
+            delta, lora_scale = _linear_lora(adapter, x)
+            if delta is None:
+                logging.warning(
+                    "[H3 AV LoRA] skipping incompatible LoRA delta for %s (%s)",
+                    entry.config.lora_name, type(self.module).__name__
+                )
+                continue
+            if delta.device != base.device or delta.dtype != base.dtype:
+                delta = delta.to(device=base.device, dtype=base.dtype)
+
+            scale = float(entry.config.strength) * float(lora_scale)
+            scale = self._apply_mask_scale(delta, entry, idx, scale)
+            if scale is None:
+                continue
+            base.add_(delta, alpha=scale)
+
+        return base
 
 
 class _H3BlockAVPatch:
@@ -362,7 +391,10 @@ class _H3AVInjection:
     def inject(self, model_patcher):
         for wrapper in self.wrappers:
             for entry in wrapper.entries:
-                _move_adapter_to_device(entry.adapter)
+                # LoRA tensors are cast per module in _linear_lora; pre-moving every
+                # adapter to the GPU at injection adds avoidable VRAM pressure.
+                if not isinstance(entry.adapter, comfy.weight_adapter.LoRAAdapter):
+                    _move_adapter_to_device(entry.adapter)
             if wrapper.install():
                 self.installed_wrappers.append(wrapper)
         for patch in self.block_patches:
