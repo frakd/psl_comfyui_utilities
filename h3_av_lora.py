@@ -712,6 +712,8 @@ class MiniMaxH3AVLoRAStack:
         new_model = model.clone()
         entries_by_key = {}
         info = []
+        use_merge = True
+        merge_entries = []
 
         for i in range(1, MAX_LORAS + 1):
             lora_name = kwargs.get(f"lora_{i}", "None")
@@ -746,6 +748,11 @@ class MiniMaxH3AVLoRAStack:
 
             key_map = comfy.lora.model_lora_keys_unet(inner, {})
             loaded = comfy.lora.load_lora(lora_dict, key_map, log_missing=False)
+            equal_weights = abs(audio_weight - video_weight) < 1e-6
+            if not equal_weights:
+                use_merge = False
+            elif use_merge:
+                merge_entries.append((lora_name, loaded, strength * audio_weight))
             config = _LoraConfig(lora_name, strength, audio_weight, video_weight)
             count = 0
             for key, adapter in loaded.items():
@@ -764,6 +771,16 @@ class MiniMaxH3AVLoRAStack:
                 entries_by_key.setdefault(key, []).append(_LoraEntry(config, adapter))
                 count += 1
             info.append(f"{lora_name}: {count} modules")
+
+        if use_merge and merge_entries:
+            total_merged = 0
+            for merge_name, loaded, effective_strength in merge_entries:
+                patched = new_model.add_patches(loaded, effective_strength)
+                info.append(f"{merge_name}: merged {len(patched)} modules")
+                total_merged += len(patched)
+            if total_merged == 0:
+                info.append("no compatible LoRA modules loaded")
+            return (new_model, "; ".join(info))
 
         if not entries_by_key:
             info.append("no compatible LoRA modules loaded")
