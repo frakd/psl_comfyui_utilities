@@ -38,9 +38,9 @@ _EPS = 1e-12
 def suppress_harshness(
     waveform: torch.Tensor,
     sample_rate: int,
-    harsh_low_hz: float = 2500.0,
-    harsh_high_hz: float = 9000.0,
-    sensitivity_db: float = 0.0,
+    harsh_low_hz: float = 5500.0,
+    harsh_high_hz: float = 14000.0,
+    sensitivity_db: float = -12.0,
     max_reduction_db: float = 18.0,
     attack_ms: float = 5.0,
     release_ms: float = 120.0,

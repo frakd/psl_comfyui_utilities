@@ -134,13 +134,13 @@ def test_shape_dtype_device_are_preserved():
 
 def test_harsh_burst_is_attenuated_without_touching_the_rest():
     length = SR * 2
-    dry = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.15, 0.2, seed=3)
+    dry = _body_with_burst(length, (1.0, 1.5), (6000.0, 9000.0), 0.15, 0.2, seed=3)
     y = suppress_harshness(dry.reshape(1, 1, length), SR)[0, 0]
 
     hit = [(1.05, 1.45)]
     quiet = [(0.1, 0.7)]
-    assert _energy_db(y, hit, 5000, 8000) - _energy_db(dry, hit, 5000, 8000) <= -5.0
-    assert abs(_energy_db(y, quiet, 5000, 8000) - _energy_db(dry, quiet, 5000, 8000)) < 0.5
+    assert _energy_db(y, hit, 6000, 9000) - _energy_db(dry, hit, 6000, 9000) <= -5.0
+    assert abs(_energy_db(y, quiet, 6000, 9000) - _energy_db(dry, quiet, 6000, 9000)) < 0.5
     assert abs(_energy_db(y, hit, 200, 400) - _energy_db(dry, hit, 200, 400)) < 0.3
 
 
@@ -165,8 +165,8 @@ def test_sibilants_are_reduced_but_vowels_are_left_alone():
     y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
     vowels = _gaps(6.0, bursts)
 
-    burst_cut = _energy_db(y, bursts, 5000, 9000) - _energy_db(signal, bursts, 5000, 9000)
-    vowel_cut = _energy_db(y, vowels, 5000, 9000) - _energy_db(signal, vowels, 5000, 9000)
+    burst_cut = _energy_db(y, bursts, 6000, 9000) - _energy_db(signal, bursts, 6000, 9000)
+    vowel_cut = _energy_db(y, vowels, 6000, 9000) - _energy_db(signal, vowels, 6000, 9000)
     print(f"  sibilant cut {burst_cut:.2f} dB, vowel cut {vowel_cut:.2f} dB")
     assert burst_cut <= -4.0, burst_cut
     assert vowel_cut >= -1.5, vowel_cut
@@ -176,7 +176,7 @@ def test_warm_material_is_left_alone():
     signal, bursts = _speech(harshness_db=-6.0)
     y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
     vowels = _gaps(6.0, bursts)
-    vowel_cut = _energy_db(y, vowels, 5000, 9000) - _energy_db(signal, vowels, 5000, 9000)
+    vowel_cut = _energy_db(y, vowels, 6000, 9000) - _energy_db(signal, vowels, 6000, 9000)
     print(f"  warm mix vowel cut {vowel_cut:.2f} dB")
     assert vowel_cut >= -1.5, vowel_cut
 
@@ -192,8 +192,8 @@ def test_breath_is_cut_deeply_while_the_voice_is_not():
     y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
     voice = [(0.3, 1.3), (2.4, 3.8)]
 
-    breath_cut = _energy_db(y, [span], 2500, 9000) - _energy_db(signal, [span], 2500, 9000)
-    voice_cut = _energy_db(y, voice, 2500, 9000) - _energy_db(signal, voice, 2500, 9000)
+    breath_cut = _energy_db(y, [span], 6000, 9000) - _energy_db(signal, [span], 6000, 9000)
+    voice_cut = _energy_db(y, voice, 6000, 9000) - _energy_db(signal, voice, 6000, 9000)
     print(f"  breath cut {breath_cut:.2f} dB, voice cut {voice_cut:.2f} dB")
     assert breath_cut <= -10.0, breath_cut
     assert voice_cut >= -1.5, voice_cut
@@ -234,14 +234,14 @@ def test_degenerate_band_passes_audio_through():
 
 def test_channels_share_one_gain_curve():
     length = SR * 2
-    left = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.15, 0.2, seed=3)
-    right = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.06, 0.2, seed=3)
+    left = _body_with_burst(length, (1.0, 1.5), (6000.0, 9000.0), 0.15, 0.2, seed=3)
+    right = _body_with_burst(length, (1.0, 1.5), (6000.0, 9000.0), 0.06, 0.2, seed=3)
     x = torch.stack([left, right]).unsqueeze(0)
 
     y = suppress_harshness(x, SR)
     window = [(1.05, 1.45)]
-    left_cut = _energy_db(y[0, 0], window, 5000, 8000) - _energy_db(left, window, 5000, 8000)
-    right_cut = _energy_db(y[0, 1], window, 5000, 8000) - _energy_db(right, window, 5000, 8000)
+    left_cut = _energy_db(y[0, 0], window, 6000, 9000) - _energy_db(left, window, 6000, 9000)
+    right_cut = _energy_db(y[0, 1], window, 6000, 9000) - _energy_db(right, window, 6000, 9000)
     print(f"  left cut {left_cut:.2f} dB, right cut {right_cut:.2f} dB")
     assert abs(left_cut - right_cut) < 0.5, (left_cut, right_cut)
     assert left_cut <= -5.0

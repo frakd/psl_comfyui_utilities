@@ -19,30 +19,29 @@ class AudioHarshnessSuppressor(io.ComfyNode):
                 io.Audio.Input("audio"),
                 io.Float.Input(
                     "harsh_low_hz",
-                    default=2500.0,
+                    default=5500.0,
                     min=200.0,
                     max=20000.0,
                     step=50.0,
-                    tooltip="Bottom of the band to watch. 2500 Hz covers presence and sibilance.",
+                    tooltip="Bottom of the band to watch. The default covers sibilance and the bright top end.",
                 ),
                 io.Float.Input(
                     "harsh_high_hz",
-                    default=9000.0,
+                    default=14000.0,
                     min=200.0,
                     max=20000.0,
                     step=50.0,
-                    tooltip="Top of the band to watch. Narrow it to 5000-9000 Hz to target sibilance only.",
+                    tooltip="Top of the band to watch. Lower it if the top end is not what bothers you.",
                 ),
                 io.Float.Input(
                     "sensitivity_db",
-                    default=0.0,
+                    default=-12.0,
                     min=-30.0,
                     max=12.0,
                     step=0.5,
                     tooltip=(
                         "How much denser than the rest of the spectrum the band has to be before it is "
-                        "reduced, in dB. A spectrally flat signal measures 0 dB, so 0 targets only "
-                        "genuinely bright, hiss-like moments. Lower values also catch ordinary tonal content."
+                        "reduced, in dB. A spectrally flat signal measures 0 dB. Lower is more aggressive."
                     ),
                 ),
                 io.Float.Input(
