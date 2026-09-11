@@ -27,7 +27,11 @@ N_FFT = 2048
 HOP_LENGTH = 512
 
 # Excess tilt in dB over which the reduction ramps from zero to its maximum.
-_KNEE_DB = 6.0
+# Deliberately narrow: the strength has to come from this and max_reduction_db,
+# not from lowering the threshold.  Lowering the threshold drags ordinary tonal
+# content in and turns the node into a static EQ, which was measured on a real
+# track as cutting the singing by 8.1 dB to cut the harsh breath by 10.7 dB.
+_KNEE_DB = 1.5
 _EPS = 1e-12
 
 
@@ -36,8 +40,8 @@ def suppress_harshness(
     sample_rate: int,
     harsh_low_hz: float = 2500.0,
     harsh_high_hz: float = 9000.0,
-    sensitivity_db: float = -12.0,
-    max_reduction_db: float = 12.0,
+    sensitivity_db: float = 0.0,
+    max_reduction_db: float = 18.0,
     attack_ms: float = 5.0,
     release_ms: float = 120.0,
     mix: float = 1.0,

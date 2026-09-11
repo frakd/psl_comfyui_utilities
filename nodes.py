@@ -35,20 +35,21 @@ class AudioHarshnessSuppressor(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "sensitivity_db",
-                    default=-12.0,
+                    default=0.0,
                     min=-30.0,
                     max=12.0,
                     step=0.5,
                     tooltip=(
-                        "How much louder than the rest of the spectrum the band has to be before it is "
-                        "reduced, in dB. A spectrally flat signal measures 0 dB. Lower is more aggressive."
+                        "How much denser than the rest of the spectrum the band has to be before it is "
+                        "reduced, in dB. A spectrally flat signal measures 0 dB, so 0 targets only "
+                        "genuinely bright, hiss-like moments. Lower values also catch ordinary tonal content."
                     ),
                 ),
                 io.Float.Input(
                     "max_reduction_db",
-                    default=12.0,
+                    default=18.0,
                     min=0.0,
-                    max=30.0,
+                    max=40.0,
                     step=0.5,
                     tooltip="Deepest cut applied at the harshest moment. 0 disables processing.",
                 ),

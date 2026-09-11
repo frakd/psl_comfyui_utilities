@@ -80,6 +80,49 @@ def _gaps(seconds: float, bursts):
     return [(edges[i], edges[i + 1]) for i in range(0, len(edges) - 1, 2)]
 
 
+def _body_with_burst(length: int, span, band, amplitude: float, duck: float, seed: int,
+                     body_freq: float = 300.0, body_amplitude: float = 0.2) -> torch.Tensor:
+    """A tone plus a noise burst, with the tone ducked while the burst is present.
+
+    Real sibilants and breaths happen when the voice gets out of the way, and the
+    detector keys on exactly that: the watched band taking over the frame.
+    """
+    g = torch.Generator().manual_seed(seed)
+    body = _tone(body_freq, length, body_amplitude)
+    i0, i1 = int(span[0] * SR), int(span[1] * SR)
+    segment = _bandpass(torch.randn(i1 - i0, generator=g), band[0], band[1])
+    burst = torch.zeros(length)
+    burst[i0:i1] = segment / segment.abs().max() * amplitude
+    body[i0:i1] *= duck
+    return body + burst
+
+
+def _breath_over_voice(seconds: float = 4.0, seed: int = 0, hiss_db: float = -12.0):
+    """A sung note with a broadband breath burst where the voice stops.
+
+    Mirrors the real material: the breath is far quieter than the note in absolute
+    terms but is 10-24 dB brighter, and the note is essentially absent under it.
+    """
+    g = torch.Generator().manual_seed(seed)
+    n = int(seconds * SR)
+    t = torch.arange(n) / SR
+    body = torch.zeros(n)
+    for harmonic in range(1, 60):
+        freq = 220.0 * harmonic
+        if freq > SR / 2 - 100:
+            break
+        body += (1.0 / (1.0 + (freq / 2500.0) ** 4)) / harmonic * torch.sin(2 * math.pi * freq * t)
+    body = body / body.abs().max() * 0.4
+
+    span = (1.5, 2.1)
+    i0, i1 = int(span[0] * SR), int(span[1] * SR)
+    segment = _bandpass(torch.randn(i1 - i0, generator=g), 1000.0, 12000.0)
+    breath = torch.zeros(n)
+    breath[i0:i1] = segment / segment.abs().max() * 0.4 * (10 ** (hiss_db / 20.0))
+    body[i0:i1] *= 0.05
+    return body + breath, span
+
+
 def test_shape_dtype_device_are_preserved():
     for shape in [(1, 1, SR), (2, 2, SR * 2), (3, 1, 7777)]:
         x = torch.randn(*shape) * 0.1
@@ -91,13 +134,10 @@ def test_shape_dtype_device_are_preserved():
 
 def test_harsh_burst_is_attenuated_without_touching_the_rest():
     length = SR * 2
-    body = _tone(300.0, length, 0.2)
-    burst = torch.zeros(length)
-    burst[SR * 8 // 10:SR * 12 // 10] = _tone(6500.0, SR * 4 // 10, 0.12)
-    dry = body + burst
+    dry = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.15, 0.2, seed=3)
     y = suppress_harshness(dry.reshape(1, 1, length), SR)[0, 0]
 
-    hit = [(0.85, 1.15)]
+    hit = [(1.05, 1.45)]
     quiet = [(0.1, 0.7)]
     assert _energy_db(y, hit, 5000, 8000) - _energy_db(dry, hit, 5000, 8000) <= -5.0
     assert abs(_energy_db(y, quiet, 5000, 8000) - _energy_db(dry, quiet, 5000, 8000)) < 0.5
@@ -106,16 +146,18 @@ def test_harsh_burst_is_attenuated_without_touching_the_rest():
 
 def test_band_selection_is_respected():
     length = SR * 2
-    low_burst = torch.zeros(length)
-    low_burst[SR:SR * 3 // 2] = _tone(2700.0, SR // 2, 0.12)
-    high_burst = torch.zeros(length)
-    high_burst[SR:SR * 3 // 2] = _tone(6500.0, SR // 2, 0.12)
-    dry = _tone(120.0, length, 0.2) + low_burst + high_burst
-
-    narrow = suppress_harshness(dry.reshape(1, 1, length), SR, harsh_low_hz=2500.0, harsh_high_hz=3000.0)[0, 0]
     window = [(1.05, 1.45)]
-    assert _energy_db(narrow, window, 2600, 2800) - _energy_db(dry, window, 2600, 2800) <= -5.0
-    assert abs(_energy_db(narrow, window, 6000, 7000) - _energy_db(dry, window, 6000, 7000)) < 0.2
+    high = _body_with_burst(length, (1.0, 1.5), (6000.0, 7000.0), 0.15, 0.2, seed=5)
+
+    # a band above the burst leaves it alone
+    above = suppress_harshness(high.reshape(1, 1, length), SR,
+                               harsh_low_hz=2500.0, harsh_high_hz=3000.0)[0, 0]
+    assert abs(_energy_db(above, window, 6000, 7000) - _energy_db(high, window, 6000, 7000)) < 0.3
+
+    # a band on the burst cuts it
+    on = suppress_harshness(high.reshape(1, 1, length), SR,
+                            harsh_low_hz=5500.0, harsh_high_hz=7500.0)[0, 0]
+    assert _energy_db(on, window, 6000, 7000) - _energy_db(high, window, 6000, 7000) <= -5.0
 
 
 def test_sibilants_are_reduced_but_vowels_are_left_alone():
@@ -139,18 +181,22 @@ def test_warm_material_is_left_alone():
     assert vowel_cut >= -1.5, vowel_cut
 
 
-def test_bright_material_is_cut_deeply():
-    """Guards against the eased response curve that made bright mixes inaudible.
+def test_breath_is_cut_deeply_while_the_voice_is_not():
+    """The property the node exists for: a bright breath comes down, the note does not.
 
-    With a smoothstep curve and -6 dB / 9 dB limits this cut measured -1.3 dB
-    average, i.e. no audible change on real material.
+    Guards the mistake of buying strength by lowering `sensitivity_db`. At -1 dB
+    this same measurement gives -4.3 dB on the voice for 0.06 dB more on the
+    breath; at -3 dB the voice loses 9.1 dB.
     """
-    signal, bursts = _speech(harshness_db=9.0)
+    signal, span = _breath_over_voice()
     y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
-    vowels = _gaps(6.0, bursts)
-    vowel_cut = _energy_db(y, vowels, 5000, 9000) - _energy_db(signal, vowels, 5000, 9000)
-    print(f"  bright mix vowel cut {vowel_cut:.2f} dB")
-    assert vowel_cut <= -6.0, vowel_cut
+    voice = [(0.3, 1.3), (2.4, 3.8)]
+
+    breath_cut = _energy_db(y, [span], 2500, 9000) - _energy_db(signal, [span], 2500, 9000)
+    voice_cut = _energy_db(y, voice, 2500, 9000) - _energy_db(signal, voice, 2500, 9000)
+    print(f"  breath cut {breath_cut:.2f} dB, voice cut {voice_cut:.2f} dB")
+    assert breath_cut <= -10.0, breath_cut
+    assert voice_cut >= -1.5, voice_cut
 
 
 def test_zero_reduction_is_transparent():
@@ -188,11 +234,8 @@ def test_degenerate_band_passes_audio_through():
 
 def test_channels_share_one_gain_curve():
     length = SR * 2
-    body = _tone(300.0, length, 0.2)
-    burst = torch.zeros(length)
-    burst[SR:SR * 3 // 2] = _tone(6500.0, SR // 2, 0.12)
-    left = body + burst
-    right = body + burst * 0.4
+    left = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.15, 0.2, seed=3)
+    right = _body_with_burst(length, (1.0, 1.5), (5000.0, 8000.0), 0.06, 0.2, seed=3)
     x = torch.stack([left, right]).unsqueeze(0)
 
     y = suppress_harshness(x, SR)
