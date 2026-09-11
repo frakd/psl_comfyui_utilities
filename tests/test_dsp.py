@@ -42,8 +42,11 @@ def _energy_db(x: torch.Tensor, windows, low: float, high: float) -> float:
     return 10 * math.log10(total / len(windows) + 1e-30)
 
 
-def _speech(seconds: float = 6.0, seed: int = 0):
+def _speech(seconds: float = 6.0, seed: int = 0, harshness_db: float = 0.0):
     """Voiced body with a steep rolloff plus periodic /s/ bursts.
+
+    `harshness_db` tilts everything above ~2.5 kHz, so the same performance can be
+    handed to the node as a warm mix or a bright, harsh one.
 
     Returns the signal and the (start, end) windows of the bursts.
     """
@@ -63,7 +66,13 @@ def _speech(seconds: float = 6.0, seed: int = 0):
         sibilant[i0:i1] = _bandpass(torch.randn(i1 - i0, generator=g), 5000.0, 9000.0)
         body[i0:i1] *= 0.35
     sibilant = sibilant / sibilant.abs().max() * 0.12
-    return body + sibilant, bursts
+    signal = body + sibilant
+
+    if harshness_db:
+        ramp = ((freqs - 1500.0) / 2500.0).clamp(0.0, 1.0)
+        shelf = 1.0 + (10 ** (harshness_db / 20.0) - 1.0) * (ramp * ramp * (3.0 - 2.0 * ramp))
+        signal = torch.fft.irfft(torch.fft.rfft(signal) * shelf, n=n)
+    return signal, bursts
 
 
 def _gaps(seconds: float, bursts):
@@ -119,6 +128,29 @@ def test_sibilants_are_reduced_but_vowels_are_left_alone():
     print(f"  sibilant cut {burst_cut:.2f} dB, vowel cut {vowel_cut:.2f} dB")
     assert burst_cut <= -4.0, burst_cut
     assert vowel_cut >= -1.5, vowel_cut
+
+
+def test_warm_material_is_left_alone():
+    signal, bursts = _speech(harshness_db=-6.0)
+    y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
+    vowels = _gaps(6.0, bursts)
+    vowel_cut = _energy_db(y, vowels, 5000, 9000) - _energy_db(signal, vowels, 5000, 9000)
+    print(f"  warm mix vowel cut {vowel_cut:.2f} dB")
+    assert vowel_cut >= -1.5, vowel_cut
+
+
+def test_bright_material_is_cut_deeply():
+    """Guards against the eased response curve that made bright mixes inaudible.
+
+    With a smoothstep curve and -6 dB / 9 dB limits this cut measured -1.3 dB
+    average, i.e. no audible change on real material.
+    """
+    signal, bursts = _speech(harshness_db=9.0)
+    y = suppress_harshness(signal.reshape(1, 1, -1), SR)[0, 0]
+    vowels = _gaps(6.0, bursts)
+    vowel_cut = _energy_db(y, vowels, 5000, 9000) - _energy_db(signal, vowels, 5000, 9000)
+    print(f"  bright mix vowel cut {vowel_cut:.2f} dB")
+    assert vowel_cut <= -6.0, vowel_cut
 
 
 def test_zero_reduction_is_transparent():

@@ -35,7 +35,7 @@ class AudioHarshnessSuppressor(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "sensitivity_db",
-                    default=-6.0,
+                    default=-12.0,
                     min=-30.0,
                     max=12.0,
                     step=0.5,
@@ -46,7 +46,7 @@ class AudioHarshnessSuppressor(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "max_reduction_db",
-                    default=9.0,
+                    default=12.0,
                     min=0.0,
                     max=30.0,
                     step=0.5,

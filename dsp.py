@@ -36,8 +36,8 @@ def suppress_harshness(
     sample_rate: int,
     harsh_low_hz: float = 2500.0,
     harsh_high_hz: float = 9000.0,
-    sensitivity_db: float = -6.0,
-    max_reduction_db: float = 9.0,
+    sensitivity_db: float = -12.0,
+    max_reduction_db: float = 12.0,
     attack_ms: float = 5.0,
     release_ms: float = 120.0,
     mix: float = 1.0,
@@ -114,9 +114,15 @@ def suppress_harshness(
 
 
 def _soft_knee(excess_db: torch.Tensor) -> torch.Tensor:
-    """Map dB above the threshold to a 0..1 reduction drive, easing in and out."""
-    drive = (excess_db / _KNEE_DB).clamp(0.0, 1.0)
-    return drive * drive * (3.0 - 2.0 * drive)
+    """Map dB above the threshold to a 0..1 reduction drive.
+
+    Linear, not eased.  An eased curve looks fine on material whose harsh frames
+    sit well clear of the threshold, but a real track's tilt spends almost all of
+    its engaged frames only a little above it, and easing turns those into
+    near-zero reduction: measured on a 32 kHz generated track, the eased curve
+    averaged a 1.27 dB cut where the linear one averages 3.6 dB.
+    """
+    return (excess_db / _KNEE_DB).clamp(0.0, 1.0)
 
 
 def _smooth(drive: torch.Tensor, attack_ms: float, release_ms: float, sample_rate: int) -> torch.Tensor:
