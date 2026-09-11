@@ -12,14 +12,3 @@ class AudioFilterExtension(ComfyExtension):
 
 async def comfy_entrypoint():
     return AudioFilterExtension()
-
-
-NODE_CLASS_MAPPINGS = {
-    "AudioHarshnessSuppressor": AudioHarshnessSuppressor,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "AudioHarshnessSuppressor": "Audio Harshness Suppressor",
-}
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
