@@ -426,6 +426,243 @@ def _unload_selected_models(
 
 
 # ---------------------------------------------------------------------------
+#  Per-node execution-cache eviction (只清指定节点的运行缓存)
+# ---------------------------------------------------------------------------
+#
+#  依据（均在本机 ComfyUI 源码中读码确认）：
+#   * 节点输出存在 caches.outputs，值为 CacheEntry(ui, outputs)（execution.py:109 / :618），
+#     outputs 里就是该节点的输出对象（含 tensor 与 ModelPatcher）；
+#   * 该缓存的 key 按节点算出：cache.cache_key_set.get_data_key(node_id)（caching.py:206 等）；
+#   * 层次缓存要先下钻到真正持有条目的子缓存：_get_cache_for(node_id)（caching.py:366）；
+#   * LRU / RAM 压力缓存还有同 key 的 used_generation / timestamps / children 字典，
+#     内核自己删条目时是一起删的（caching.py:460-463 / :611-614），手动删必须镜像；
+#   * 节点执行时拿到的是解析后的“值”，链接只存在于 prompt 里 —— 所以上游节点号必须
+#     从 hidden 输入 PROMPT 里按自己的 unique_id 读回（execution.py:219 / :227）；
+#   * ExecutionList.output_cache 就是活着的 caches.outputs（execution.py:779），
+#     而 ExecutionList 由 hidden 输入 EXECUTION_LIST 交给节点（execution.py:223）。
+#
+#  安全性判据（读码推导，避免“清了又活”或“下游拿到 None”）：
+#   下游只在 ExecutionList.get_cache（graph.py:244）里读边缓存，而边缓存持有同一个
+#   CacheEntry（cache_link/cache_update，graph.py:233-260），并在命中时写回主缓存。
+#   因此只要还有未执行的下游消费者，清主缓存要么被写回（引用没断），要么让它重新
+#   入队重算（两个消费者可能拿到不同的值）。所以：只有在目标节点没有其它待执行
+#   消费者时才真正动手，否则跳过并如实上报。
+
+_CACHE_CLASS_NAMES = ("BasicCache", "HierarchicalCache", "LRUCache", "RAMPressureCache")
+
+
+def _is_node_link(value) -> bool:
+    """判断一个输入值是不是节点连线 [node_id, output_index]。"""
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], (str, int))
+        and not isinstance(value[0], bool)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+    )
+
+
+def _linked_source_node_id(unique_id, prompt) -> Tuple[Any, str]:
+    """从 prompt 图里读回本节点 cache_source 端口连的是哪个上游节点。
+
+    返回 (node_id 或 None, 失败原因)。节点执行时只能拿到解析后的值，链接本身只在 prompt 里。
+    """
+    if unique_id is None:
+        return None, "拿不到本节点 id（hidden UNIQUE_ID 缺失）"
+    if not isinstance(prompt, dict) or not prompt:
+        return None, "拿不到 prompt 图（hidden PROMPT 缺失）"
+    node = prompt.get(str(unique_id))
+    if node is None:
+        node = prompt.get(unique_id)
+    if not isinstance(node, dict):
+        return None, f"prompt 图里找不到本节点 #{unique_id}"
+    link = (node.get("inputs") or {}).get("cache_source")
+    if not _is_node_link(link):
+        return None, "cache_source 端口没有连线"
+    return str(link[0]), ""
+
+
+def _node_consumers(node_id, prompt) -> List[str]:
+    """prompt 图里所有消费 node_id 输出的节点（不含动态子图里临时生成的节点）。"""
+    consumers: List[str] = []
+    if not isinstance(prompt, dict):
+        return consumers
+    target = str(node_id)
+    known = {str(k) for k in prompt.keys()}
+    for nid, node in prompt.items():
+        inputs = (node or {}).get("inputs") or {}
+        for value in inputs.values():
+            if _is_node_link(value) and str(value[0]) == target and str(value[0]) in known:
+                consumers.append(str(nid))
+                break
+    return consumers
+
+
+def _pending_node_ids(execution_list):
+    """当前还没执行的节点集合；拿不到返回 None（调用方按保守策略处理）。"""
+    pending = getattr(execution_list, "pendingNodes", None)
+    if isinstance(pending, dict):
+        return {str(k) for k in pending.keys()}
+    return None
+
+
+def _size_cache_entry(entry) -> float:
+    """估算缓存条目里 tensor 的字节数（同一 storage 只算一次）。"""
+    seen = set()
+    total = 0
+
+    def walk(value, depth=0):
+        nonlocal total
+        if value is None or depth > 4:
+            return
+        if torch.is_tensor(value):
+            try:
+                storage = value.untyped_storage()
+                key = (storage.data_ptr(), storage.nbytes())
+                if key not in seen:
+                    seen.add(key)
+                    total += storage.nbytes()
+            except Exception:
+                pass
+            return
+        if isinstance(value, dict):
+            value = list(value.values())
+        elif not isinstance(value, (list, tuple)):
+            return
+        for item in value:
+            walk(item, depth + 1)
+
+    try:
+        walk(getattr(entry, "outputs", None))
+    except Exception as exc:
+        logging.warning("[DeepVRAMCleanup] 估算缓存条目体积失败: %s", exc)
+    return float(total)
+
+
+def _cache_objects_for_eviction(execution_list) -> List[Any]:
+    """拿到输出缓存对象：优先 ExecutionList.output_cache（活的 caches.outputs），否则 gc 扫描回退。"""
+    cache = getattr(execution_list, "output_cache", None) if execution_list is not None else None
+    if cache is not None:
+        return [cache]
+    found = []
+    for obj in gc.get_objects():
+        if type(obj).__name__ in _CACHE_CLASS_NAMES:
+            found.append(obj)
+    return found
+
+
+def _lookup_cache_entry(cache, node_id):
+    """定位真正持有 node_id 条目的缓存对象与 key（层次缓存需下钻子缓存）。"""
+    target = cache
+    resolve = getattr(cache, "_get_cache_for", None)
+    if callable(resolve):
+        try:
+            target = resolve(node_id)
+        except Exception as exc:
+            logging.warning(
+                "[DeepVRAMCleanup] 在 %s 上定位子缓存失败: %s", type(cache).__name__, exc, exc_info=True
+            )
+            return None, None
+    if target is None:
+        return None, None
+    key_set = getattr(target, "cache_key_set", None)
+    if key_set is None or not hasattr(key_set, "get_data_key"):
+        return None, None
+    key = key_set.get_data_key(node_id)
+    if key is None:
+        return None, None
+    return target, key
+
+
+def _drop_edge_refs(execution_list, node_id) -> int:
+    """断开 ExecutionList 边缓存里对目标条目的引用。
+
+    不清这里的话，下游 get_cache 命中时会把它写回主缓存（graph.py:244-252），
+    等于“清了又活”、引用也没真正断开。
+    """
+    dropped = 0
+    edge = getattr(execution_list, "execution_cache", None)
+    if isinstance(edge, dict):
+        if edge.pop(node_id, None) is not None:
+            dropped += 1
+        for mapping in edge.values():
+            if isinstance(mapping, dict) and mapping.pop(node_id, None) is not None:
+                dropped += 1
+    listeners = getattr(execution_list, "execution_cache_listeners", None)
+    if isinstance(listeners, dict):
+        listeners.pop(node_id, None)
+    return dropped
+
+
+def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[str]:
+    """清掉 node_id 在输出缓存里的条目，返回诊断行。"""
+    lines: List[str] = []
+    caches = _cache_objects_for_eviction(execution_list)
+    if not caches:
+        msg = f"无法清理节点 {node_id}：找不到输出缓存对象（execution_list 与 gc 扫描都没有）"
+        logging.error("[DeepVRAMCleanup] %s", msg)
+        lines.append(msg)
+        return lines
+
+    # 安全判据：目标还有别的待执行消费者时不动手
+    consumers = [c for c in _node_consumers(node_id, prompt) if our_id is None or c != str(our_id)]
+    pending = _pending_node_ids(execution_list)
+    if pending is None:
+        blockers = consumers
+        reason = "无法判定调度状态，保守跳过"
+    else:
+        blockers = [c for c in consumers if c in pending]
+        reason = f"仍有下游待执行: {sorted(blockers)}"
+    if blockers:
+        msg = f"skip clear node {node_id}: {reason}（清了会被写回或让它们重算，可能取到不同结果）"
+        logging.warning("[DeepVRAMCleanup] %s", msg)
+        lines.append(msg)
+        return lines
+
+    removed = 0
+    freed = 0.0
+    for cache in caches:
+        target, key = _lookup_cache_entry(cache, node_id)
+        if target is None or key is None:
+            continue
+        store = getattr(target, "cache", None)
+        if not isinstance(store, dict) or key not in store:
+            continue
+        entry = store[key]
+        freed += _size_cache_entry(entry)
+        try:
+            del store[key]
+        except Exception as exc:
+            logging.error(
+                "[DeepVRAMCleanup] 删除 %s 中的节点 %s 缓存条目失败: %s",
+                type(cache).__name__, node_id, exc, exc_info=True,
+            )
+            lines.append(f"FAILED clear node {node_id} in {type(cache).__name__}: {type(exc).__name__}: {exc}")
+            continue
+        # 镜像内核自己的删除动作，避免 side dict 残留导致 KeyError
+        for side in ("used_generation", "timestamps", "children"):
+            side_dict = getattr(target, side, None)
+            if isinstance(side_dict, dict):
+                side_dict.pop(key, None)
+        removed += 1
+
+    edge_dropped = _drop_edge_refs(execution_list, node_id)
+    if removed == 0:
+        msg = f"node {node_id}: 输出缓存里没有条目（未执行或已被释放）"
+        lines.append(msg)
+        logging.info("[DeepVRAMCleanup] %s", msg)
+    else:
+        msg = (
+            f"cleared node {node_id}: {removed} 个缓存条目, "
+            f"{freed / (1024 ** 2):.1f} MB tensor, 边引用 {edge_dropped} 处"
+        )
+        lines.append(msg)
+        logging.info("[DeepVRAMCleanup] %s", msg)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 #  Diagnostics
 # ---------------------------------------------------------------------------
 
@@ -501,8 +738,13 @@ class DeepVRAMCleanup:
     trim_cuda_pool          Direct cudaMemPoolTrimTo(0) (cudaMallocAsync)
     purge_orphan_tensors    Hunt & detach stray CUDA tensors from heap
     unload_connected_models Unload ONLY the model wired into model/clip/vae
+    clear_source_node_cache Clear ONLY the wired node's execution-cache entry
     ======================  ==============================================
     """
+
+    # 输出节点：允许在画布上直接点节点的运行按钮单独执行本节点
+    # （前端只把被点名的节点作为 partial_execution_targets 发给后端）。
+    OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -530,6 +772,8 @@ class DeepVRAMCleanup:
                     "tooltip": "选择性卸载时，连带卸载挂在目标模型上的附属模型（如多卡场景下 deepclone 出来的模型副本）。\n\n关掉则只卸目标本身及其 clone，附属模型留在显存里。仅在明确知道附属模型是别人在用的时候才关。"}),
                 "unload_all_devices": ("BOOLEAN", {"default": False,
                     "tooltip": "选择性卸载时，连其它设备上的残留一起清理。\n\n背景：ComfyUI 官方的卸载路径只按「GPU 设备」过滤（free_memory 里的 shift_model.device == device），而且 get_all_torch_devices() 在有显卡时不返回 cpu。所以本节点默认会额外按目标自身所在的设备补卸一次——主机内存（cpu）常驻的目标始终会处理；这个开关管的是「是否连第二张卡等其它 GPU 设备上的目标也一起卸」。\n\n关掉时，落在其它 GPU 上的目标不会被卸，但会在 diag 里如实标出 partial + 仍驻留的设备，不会假装成功。"}),
+                "clear_source_node_cache": ("BOOLEAN", {"default": True,
+                    "tooltip": "清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的显存/内存引用；代价是下次需要这个输出时该节点会重新执行。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"}),
             },
             "optional": {
                 "passthrough1": ("*", {"default": None, "forceInput": False}),
@@ -539,6 +783,12 @@ class DeepVRAMCleanup:
                 "model": ("MODEL", {"tooltip": "接在这里的 diffusion 模型（checkpoint / UNET）会被单独卸载，其它已加载模型不动。\n\n配合 unload_connected_models 开关使用。LoRA patch 会被一并 unpatch，下次用到时重新加载。"}),
                 "clip": ("CLIP", {"tooltip": "接在这里的 text encoder 会被单独卸载，不碰 diffusion 模型和 VAE。\n\n注意落点：显存不紧张时 ComfyUI 会把 TE 常驻在系统内存而不是显存（text_encoder_device() 在低显存/非 --gpu-only 时直接返回 cpu）。本节点会按目标自身所在的设备补卸，所以内存里的 TE 同样会被解下——但主机内存常驻时，基础权重要等执行缓存释放引用后才真正归还，diag 里会标注这一点。\n\n下次 CLIPTextEncode 执行时会重新从磁盘加载。"}),
                 "vae": ("VAE", {"tooltip": "接在这里的 VAE 会被单独卸载。\n\nVAE 体积小、重载快，跑完大分辨率解码后卸载它是纯赚的。"}),
+                "cache_source": ("*", {"tooltip": "把「要清运行缓存的节点」的任意一个输出接到这里。\n\n节点执行时只能拿到解析后的值，链接本身只存在于 prompt 图里——所以上游节点号是从隐藏输入 PROMPT 里按本节点 id 读回来的，这样不需要你手填节点号。\n\n作用对象是这一个节点在 outputs 缓存里的条目（含它缓存的 tensor / ModelPatcher 输出），不是全清。配合 clear_source_node_cache 开关使用。"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "execution_list": "EXECUTION_LIST",
             },
         }
 
@@ -568,6 +818,7 @@ class DeepVRAMCleanup:
         unload_connected_models: bool,
         unload_additional_models: bool,
         unload_all_devices: bool,
+        clear_source_node_cache: bool,
         passthrough1=None,
         passthrough2=None,
         passthrough3=None,
@@ -575,6 +826,10 @@ class DeepVRAMCleanup:
         model=None,
         clip=None,
         vae=None,
+        cache_source=None,
+        unique_id=None,
+        prompt=None,
+        execution_list=None,
     ) -> Tuple[float, float, float, str]:
         device = mm.get_torch_device()
         used_before, total = self._vram(device)
@@ -588,6 +843,32 @@ class DeepVRAMCleanup:
         if execution_cache:
             n = _find_and_clear_execution_caches()
             logging.info("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
+
+        # 指定节点的运行缓存（只清 cache_source 连着的那个节点）
+        cache_lines: List[str] = []
+        if clear_source_node_cache:
+            if execution_cache:
+                msg = "skip 指定节点缓存清理: execution_cache 已开启，全清已覆盖"
+                logging.info("[DeepVRAMCleanup] %s", msg)
+                cache_lines.append(msg)
+            else:
+                source_id, why = _linked_source_node_id(unique_id, prompt)
+                if source_id is None:
+                    msg = f"指定节点缓存清理已开启，但没找到目标节点：{why}"
+                    logging.warning("[DeepVRAMCleanup] %s", msg)
+                    cache_lines.append(msg)
+                else:
+                    logging.info(
+                        "[DeepVRAMCleanup] 准备清理节点 #%s 的运行缓存（由 #%s 连线指定）",
+                        source_id, unique_id,
+                    )
+                    cache_lines = _evict_node_output_cache(
+                        source_id, execution_list, unique_id, prompt
+                    )
+        elif cache_source is not None:
+            logging.info(
+                "[DeepVRAMCleanup] cache_source 已连线，但 clear_source_node_cache 未开启，保持不变"
+            )
 
         offload_lines: List[str] = []
         if offload_models_to_ram:
@@ -667,6 +948,9 @@ class DeepVRAMCleanup:
         if unload_lines:
             lines.append("")
             lines.extend(unload_lines)
+        if cache_lines:
+            lines.append("")
+            lines.extend(cache_lines)
         lines.append("")
         lines.extend(_find_gpu_tensors_direct())
 
