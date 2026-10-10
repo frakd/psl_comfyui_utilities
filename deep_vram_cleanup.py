@@ -739,7 +739,7 @@ class DeepVRAMCleanup:
     开关按「作用对象 + 全局/定向」成对排列：
     --------------------  --  ----------------------------------------------
     第一组 运行缓存
-    execution_cache         清空所有中间节点输出缓存（全局）
+    clear_all_node_cache    清空所有中间节点输出缓存（全局）
     clear_source_node_cache 只清 cache_source 连着的那个节点的缓存条目
     第二组 模型
     unload_models            卸载所有已加载模型（全局）
@@ -760,10 +760,10 @@ class DeepVRAMCleanup:
         return {
                         "required": {
                 # ===== 第一组：运行缓存（全局清 -> 只清连线节点）=====
-                "execution_cache": ("BOOLEAN", {"default": True,
-                    "tooltip": "【清缓存 · 全局】清空 ComfyUI 的中间节点输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。\n\n这是腾内存的主力（中间结果占的往往是内存里的大头）。代价：清掉后所有分支都得重算，缓存加速失效。"}),
+                "clear_all_node_cache": ("BOOLEAN", {"default": True,
+                    "tooltip": "【清缓存 · 全局】清空 ComfyUI 所有节点的中间输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。\n\n这是腾内存的主力（中间结果占的往往是内存里的大头）。代价：清掉后所有分支都得重算，缓存加速失效。\n\n与下面 clear_source_node_cache（只清连线指定的那一个节点）是一对：全清粗暴但彻底，定向清理精细但有前提。"}),
                 "clear_source_node_cache": ("BOOLEAN", {"default": True,
-                    "tooltip": "【清缓存 · 只清指定的】清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的内存/显存引用；代价是下次需要这个输出时该节点会重新执行。比上面的全局清理精细得多。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"}),
+                    "tooltip": "【清缓存 · 只清指定的】清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的内存/显存引用；代价是下次需要这个输出时该节点会重新执行。比上面的全局清理精细得多。\n\n注意：全局清理 clear_all_node_cache 开启时本开关会被跳过（全清已覆盖）。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"}),
                 # ===== 第二组：模型（全局卸 -> 只卸连线模型）=====
                 "unload_models": ("BOOLEAN", {"default": False,
                     "tooltip": "【卸模型 · 全局】卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非内存/显存极度紧张。"}),
@@ -815,7 +815,7 @@ class DeepVRAMCleanup:
     def cleanup(
         self,
         # 第一组：运行缓存（全局 -> 指定节点）
-        execution_cache: bool,
+        clear_all_node_cache: bool,
         clear_source_node_cache: bool,
         # 第二组：模型（全局 -> 指定模型）
         unload_models: bool,
@@ -841,15 +841,15 @@ class DeepVRAMCleanup:
 
         # ===================== 第一组：运行缓存 =====================
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
-        if execution_cache:
+        if clear_all_node_cache:
             n = _find_and_clear_execution_caches()
             logging.info("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
 
         # 指定节点的运行缓存（只清 cache_source 连着的那个节点）
         cache_lines: List[str] = []
         if clear_source_node_cache:
-            if execution_cache:
-                msg = "skip 指定节点缓存清理: execution_cache 已开启，全清已覆盖"
+            if clear_all_node_cache:
+                msg = "skip 指定节点缓存清理: clear_all_node_cache 已开启，全清已覆盖"
                 logging.info("[DeepVRAMCleanup] %s", msg)
                 cache_lines.append(msg)
             else:
