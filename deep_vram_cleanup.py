@@ -30,19 +30,24 @@ except ImportError:
 # ---------------------------------------------------------------------------
 #  Third-party caches  (leak sources to clear)
 # ---------------------------------------------------------------------------
-
-_RIFE_CACHE = None          # RIFE _model_cache
-_BACKWARP_GRID = None        # RIFE backwarp_tenGrid
-try:
-    from vfi_models.rife import _model_cache as _rife_cache
-    _RIFE_CACHE = _rife_cache
-except Exception:
-    pass
-try:
-    from vfi_models.rife.rife_arch import backwarp_tenGrid as _grid
-    _BACKWARP_GRID = _grid
-except Exception:
-    pass
+#
+# ===== RIFE 相关支持已停用（用户不再用插帧节点）=====
+# 下面两处 RIFE 缓存导入与 _clear_vfi_model_caches 已整体注释掉，INPUT_TYPES 里对应
+# 的 rife_backwarp_grid / rife_model_cache 两个开关也已删除。
+# 如需恢复：取消本段与被注释函数的注释，并把 cleanup() 里的 rife_which 分支加回来。
+#
+# _RIFE_CACHE = None          # RIFE _model_cache
+# _BACKWARP_GRID = None        # RIFE backwarp_tenGrid
+# try:
+#     from vfi_models.rife import _model_cache as _rife_cache
+#     _RIFE_CACHE = _rife_cache
+# except Exception:
+#     pass
+# try:
+#     from vfi_models.rife.rife_arch import backwarp_tenGrid as _grid
+#     _BACKWARP_GRID = _grid
+# except Exception:
+#     pass
 
 
 # ---------------------------------------------------------------------------
@@ -123,52 +128,53 @@ def _find_and_clear_execution_caches() -> int:
     return cleared
 
 
-def _clear_vfi_model_caches(which: str = "all") -> Dict[str, int]:
-    """Clear RIFE module-level caches.
-
-    Moves tensors to CPU first to avoid PyTorch C++ warning storms.
-
-    Args:
-        which: "all", "grid" (backwarp_tenGrid only), or "model" (_model_cache only)
-    """
-    result: Dict[str, int] = {}
-
-    if which in ("all", "model"):
-        if _RIFE_CACHE is not None:
-            try:
-                n = 0
-                for _key, model in list(_RIFE_CACHE.items()):
-                    try:
-                        model.cpu()
-                    except Exception:
-                        pass
-                    n += 1
-                _RIFE_CACHE.clear()
-                result["RIFE _model_cache"] = n
-            except Exception:
-                pass
-
-    if which in ("all", "grid"):
-        if _BACKWARP_GRID is not None:
-            try:
-                n = 0
-                for _key, t in list(_BACKWARP_GRID.items()):
-                    try:
-                        if torch.is_tensor(t) and t.is_cuda:
-                            t.detach_()
-                            t.data = torch.empty(0, device="cpu")
-                    except Exception:
-                        pass
-                    n += 1
-                _BACKWARP_GRID.clear()
-                result["RIFE backwarp_tenGrid"] = n
-            except Exception:
-                pass
-
-    for k, v in result.items():
-        logging.info("[DeepVRAMCleanup] Cleared %s: %d entries", k, v)
-
-    return result
+# ===== RIFE 清理函数已停用，整体注释保留备查 =====
+# def _clear_vfi_model_caches(which: str = "all") -> Dict[str, int]:
+#     """Clear RIFE module-level caches.
+#
+#     Moves tensors to CPU first to avoid PyTorch C++ warning storms.
+#
+#     Args:
+#         which: "all", "grid" (backwarp_tenGrid only), or "model" (_model_cache only)
+#     """
+#     result: Dict[str, int] = {}
+#
+#     if which in ("all", "model"):
+#         if _RIFE_CACHE is not None:
+#             try:
+#                 n = 0
+#                 for _key, model in list(_RIFE_CACHE.items()):
+#                     try:
+#                         model.cpu()
+#                     except Exception:
+#                         pass
+#                     n += 1
+#                 _RIFE_CACHE.clear()
+#                 result["RIFE _model_cache"] = n
+#             except Exception:
+#                 pass
+#
+#     if which in ("all", "grid"):
+#         if _BACKWARP_GRID is not None:
+#             try:
+#                 n = 0
+#                 for _key, t in list(_BACKWARP_GRID.items()):
+#                     try:
+#                         if torch.is_tensor(t) and t.is_cuda:
+#                             t.detach_()
+#                             t.data = torch.empty(0, device="cpu")
+#                     except Exception:
+#                         pass
+#                     n += 1
+#                 _BACKWARP_GRID.clear()
+#                 result["RIFE backwarp_tenGrid"] = n
+#             except Exception:
+#                 pass
+#
+#     for k, v in result.items():
+#         logging.info("[DeepVRAMCleanup] Cleared %s: %d entries", k, v)
+#
+#     return result
 
 
 def _has_safe_dict(obj) -> bool:
@@ -732,8 +738,6 @@ class DeepVRAMCleanup:
     execution_cache         Clear ComfyUI intermediate node output cache
     unload_models           Unload all loaded models (needs reload later)
     offload_models_to_ram   Move loaded model weights VRAM -> RAM (models stay loaded)
-    rife_backwarp_grid      Clear RIFE backwarp_tenGrid (grid tensors)
-    rife_model_cache        Clear RIFE _model_cache (cached IFNet)
     gc_empty_cache          gc.collect() + torch.cuda.empty_cache()
     trim_cuda_pool          Direct cudaMemPoolTrimTo(0) (cudaMallocAsync)
     purge_orphan_tensors    Hunt & detach stray CUDA tensors from heap
@@ -756,10 +760,9 @@ class DeepVRAMCleanup:
                     "tooltip": "卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非显存极度紧张。"}),
                 "offload_models_to_ram": ("BOOLEAN", {"default": False,
                     "tooltip": "把已加载模型的权重从显存搬到系统内存，但不卸载模型。\n\n走的是 ComfyUI 自己的部分卸载路径（ModelPatcher.partially_unload，即显存不足时 free_memory 用的同一套机制）：权重留在（可锁页的）内存里，模型仍处于「已加载」状态，下次用到时自动回传到显存，不需要重新从磁盘加载。\n\n适合「采样跑完了，先腾出显存给放大/VAE，但不想丢掉 checkpoint」这类场景。代价是下次用到该模型时要走一次 PCIe 回传。注意：同时开启 unload_models 时，模型最终还是会被卸载。"}),
-                "rife_backwarp_grid": ("BOOLEAN", {"default": True,
-                    "tooltip": "清空 RIFE 插帧节点的 backwarp_tenGrid 模块级缓存。\n\nRIFE 的 warp() 函数会按 (分辨率, 批量大小) 缓存光流坐标网格（shape: batch×2×H×W 的 float32 CUDA tensor）。每处理一个不同分辨率的视频就会新增一个条目，且永远不会自动释放。\n\n这是 ComfyUI-Frame-Interpolation 最主要的显存泄漏源。清空后下次插帧会自动重建当前分辨率需要的网格。"}),
-                "rife_model_cache": ("BOOLEAN", {"default": False,
-                    "tooltip": "清空 RIFE 插帧节点的 _model_cache 模块级缓存。\n\nRIFE 会把加载的 IFNet 模型缓存在模块全局字典中，避免每次插帧重复加载。清空后下次插帧需要重新从磁盘加载模型（几秒延迟）。日常不建议开启。"}),
+                # RIFE 开关已按用户要求移除（不再使用插帧节点）。原来的两个 widget 位于此处：
+                #   rife_backwarp_grid / rife_model_cache
+                # 恢复方式见文件顶部 “RIFE 相关支持已停用” 说明。
                 "gc_empty_cache": ("BOOLEAN", {"default": True,
                     "tooltip": "执行 Python gc.collect() + torch.cuda.empty_cache()。释放 Python 层不再被引用的对象，并将 PyTorch CUDA 缓存池中已标记为空闲的内存归还给操作系统。"}),
                 "trim_cuda_pool": ("BOOLEAN", {"default": True,
@@ -810,8 +813,6 @@ class DeepVRAMCleanup:
         execution_cache: bool,
         unload_models: bool,
         offload_models_to_ram: bool,
-        rife_backwarp_grid: bool,
-        rife_model_cache: bool,
         gc_empty_cache: bool,
         trim_cuda_pool: bool,
         purge_orphan_tensors: bool,
@@ -909,15 +910,15 @@ class DeepVRAMCleanup:
             if device.type == "cuda":
                 soft_empty_cache(force=True)
 
-        # RIFE caches (selective)
-        rife_which = (
-            "all" if (rife_backwarp_grid and rife_model_cache)
-            else "grid" if rife_backwarp_grid
-            else "model" if rife_model_cache
-            else ""
-        )
-        if rife_which:
-            _clear_vfi_model_caches(which=rife_which)
+        # ===== RIFE 缓存清理已停用（见文件顶部说明）=====
+        # rife_which = (
+        #     "all" if (rife_backwarp_grid and rife_model_cache)
+        #     else "grid" if rife_backwarp_grid
+        #     else "model" if rife_model_cache
+        #     else ""
+        # )
+        # if rife_which:
+        #     _clear_vfi_model_caches(which=rife_which)
 
         if purge_orphan_tensors:
             n = _purge_cuda_orphans()
