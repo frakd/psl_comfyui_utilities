@@ -220,27 +220,29 @@ def _purge_cuda_orphans() -> int:
 #  VRAM -> system RAM offload (non-destructive)
 # ---------------------------------------------------------------------------
 
-def _offload_loaded_models_to_ram() -> List[str]:
-    """Move loaded model weights from VRAM to system RAM, keeping the models loaded.
-
-    Calls ComfyUI's own partial-offload path (ModelPatcher.partially_unload, the same
-    one free_memory() uses under VRAM pressure): weights stay in (pinned) host RAM and
-    are streamed back to VRAM automatically the next time the model runs.
-    """
-    gb = 1024 ** 3
-    lines: List[str] = []
-    for loaded in list(mm.current_loaded_models):
-        patcher = loaded.model
-        if patcher is None:
-            continue
-        resident = patcher.loaded_size()
-        if resident <= 0:
-            continue
-        freed = patcher.partially_unload(patcher.offload_device, 1e32)
-        name = patcher.model.__class__.__name__
-        lines.append(f"offloaded {name}: {freed / gb:.3f} GB VRAM -> {patcher.offload_device} (was {resident / gb:.3f} GB)")
-        logging.info("[DeepVRAMCleanup] Offloaded %s: %.1f MB VRAM -> %s", name, freed / (1024 ** 2), patcher.offload_device)
-    return lines
+# ===== 显存 -> 内存 offload 已停用 =====
+# 用户明确不要这个功能：本节点的目的在腾内存，而它恰恰是把显存搬进内存（增加内存
+# 占用）；且 ComfyUI 自身在显存吃紧时 free_memory -> ModelPatcher.partially_unload
+# 已经做得很好。输入开关与 cleanup() 调用点均已移除。
+# 如需恢复：取消本段注释，并在 INPUT_TYPES 加回 offload_models_to_ram 开关、
+# 在 cleanup() 里恢复 offload_lines 分支。
+#
+# def _offload_loaded_models_to_ram() -> List[str]:
+#     """Move loaded model weights from VRAM to system RAM, keeping the models loaded."""
+#     gb = 1024 ** 3
+#     lines: List[str] = []
+#     for loaded in list(mm.current_loaded_models):
+#         patcher = loaded.model
+#         if patcher is None:
+#             continue
+#         resident = patcher.loaded_size()
+#         if resident <= 0:
+#             continue
+#         freed = patcher.partially_unload(patcher.offload_device, 1e32)
+#         name = patcher.model.__class__.__name__
+#         lines.append(f"offloaded {name}: {freed / gb:.3f} GB VRAM -> {patcher.offload_device} (was {resident / gb:.3f} GB)")
+#         logging.info("[DeepVRAMCleanup] Offloaded %s: %.1f MB VRAM -> %s", name, freed / (1024 ** 2), patcher.offload_device)
+#     return lines
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +343,7 @@ def _free_leftovers(patcher, all_devices: bool) -> List[str]:
     remaining = _target_loaded_models(patcher)
     if remaining:
         devs = sorted({str(getattr(lm, "device", "?")) for lm in remaining})
-        lines.append(f"still loaded: {devs}（目标在其它设备上，需开启 unload_all_devices）")
+        lines.append(f"still loaded: {devs}（已尝试所有设备，仍未释放，请看日志里的报错）")
         logging.warning("[DeepVRAMCleanup] 目标模型仍驻留在 %s", devs)
     return lines
 
@@ -737,7 +739,6 @@ class DeepVRAMCleanup:
     ======================  ==============================================
     execution_cache         Clear ComfyUI intermediate node output cache
     unload_models           Unload all loaded models (needs reload later)
-    offload_models_to_ram   Move loaded model weights VRAM -> RAM (models stay loaded)
     gc_empty_cache          gc.collect() + torch.cuda.empty_cache()
     trim_cuda_pool          Direct cudaMemPoolTrimTo(0) (cudaMallocAsync)
     purge_orphan_tensors    Hunt & detach stray CUDA tensors from heap
@@ -758,8 +759,11 @@ class DeepVRAMCleanup:
                     "tooltip": "清空 ComfyUI 的中间节点输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。"}),
                 "unload_models": ("BOOLEAN", {"default": False,
                     "tooltip": "卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非显存极度紧张。"}),
-                "offload_models_to_ram": ("BOOLEAN", {"default": False,
-                    "tooltip": "把已加载模型的权重从显存搬到系统内存，但不卸载模型。\n\n走的是 ComfyUI 自己的部分卸载路径（ModelPatcher.partially_unload，即显存不足时 free_memory 用的同一套机制）：权重留在（可锁页的）内存里，模型仍处于「已加载」状态，下次用到时自动回传到显存，不需要重新从磁盘加载。\n\n适合「采样跑完了，先腾出显存给放大/VAE，但不想丢掉 checkpoint」这类场景。代价是下次用到该模型时要走一次 PCIe 回传。注意：同时开启 unload_models 时，模型最终还是会被卸载。"}),
+                # 以下三项已按用户要求从 UI 移除（语义固定为常开 / 停用），详见文件顶部与各函数旁注释：
+                #   offload_models_to_ram   —— 目的在腾内存，而它会把显存搬到内存（增加内存占用）；
+                #                              且 ComfyUI 自身在显存吃紧时的 free_memory 已经做得很好
+                #   unload_additional_models —— 固定 True（连带卸载附属模型）
+                #   unload_all_devices       —— 固定 True（所有设备上的残留一起清）
                 # RIFE 开关已按用户要求移除（不再使用插帧节点）。原来的两个 widget 位于此处：
                 #   rife_backwarp_grid / rife_model_cache
                 # 恢复方式见文件顶部 “RIFE 相关支持已停用” 说明。
@@ -770,11 +774,7 @@ class DeepVRAMCleanup:
                 "purge_orphan_tensors": ("BOOLEAN", {"default": False,
                     "tooltip": "（暴力模式）遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在 deep 清理无效时作为最后手段使用。"}),
                 "unload_connected_models": ("BOOLEAN", {"default": False,
-                    "tooltip": "只卸载右侧 model / clip / vae 三个可选端口连进来的那个模型，其余已加载模型保持不动。\n\n走 ComfyUI 内核的选择性卸载接口（comfy.model_management.unload_model_and_clones），按 clone_base_uuid 把目标模型本身、它的 clone（如 CLIPSetLastLayer 产生的副本、LoRA patch 过的副本）以及挂在它上面的附属模型一起卸掉。\n\n注意：必须至少连一个 model / clip / vae 端口才有效果，三者都不连时本开关不做事（会在 diag 里说明）。同时开启 unload_models 时以全卸为准，本开关自动跳过。\n\n前提：本节点必须位于通往「输出节点」的链路上才会被执行——用 passthrough 端口把它串在流程中间，或把它的输出连到后续节点，否则 ComfyUI 会直接跳过这个节点。\n\n典型用法：采样跑完后只卸 text_encoder（几 GB）给 VAE 解码腾地方，同时保留 checkpoint 不重载。"}),
-                "unload_additional_models": ("BOOLEAN", {"default": True,
-                    "tooltip": "选择性卸载时，连带卸载挂在目标模型上的附属模型（如多卡场景下 deepclone 出来的模型副本）。\n\n关掉则只卸目标本身及其 clone，附属模型留在显存里。仅在明确知道附属模型是别人在用的时候才关。"}),
-                "unload_all_devices": ("BOOLEAN", {"default": False,
-                    "tooltip": "选择性卸载时，连其它设备上的残留一起清理。\n\n背景：ComfyUI 官方的卸载路径只按「GPU 设备」过滤（free_memory 里的 shift_model.device == device），而且 get_all_torch_devices() 在有显卡时不返回 cpu。所以本节点默认会额外按目标自身所在的设备补卸一次——主机内存（cpu）常驻的目标始终会处理；这个开关管的是「是否连第二张卡等其它 GPU 设备上的目标也一起卸」。\n\n关掉时，落在其它 GPU 上的目标不会被卸，但会在 diag 里如实标出 partial + 仍驻留的设备，不会假装成功。"}),
+                    "tooltip": "只卸载右侧 model / clip / vae 三个可选端口连进来的那个模型，其余已加载模型保持不动。\n\n走 ComfyUI 内核的选择性卸载接口（comfy.model_management.unload_model_and_clones），按 clone_base_uuid 把目标模型本身、它的 clone（如 CLIPSetLastLayer 产生的副本、LoRA patch 过的副本）以及挂在它上面的附属模型一起卸掉（附属模型一定连带，所有设备上的残留也一并清理）。\n\n注意：必须至少连一个 model / clip / vae 端口才有效果，三者都不连时本开关不做事（会在 diag 里说明）。同时开启 unload_models 时以全卸为准，本开关自动跳过。\n\n前提：本节点必须位于通往「输出节点」的链路上才会被执行——用 passthrough 端口把它串在流程中间，或把它的输出连到后续节点，否则 ComfyUI 会直接跳过这个节点。\n\n典型用法：采样跑完后只卸 text_encoder（几 GB）给 VAE 解码腾地方，同时保留 checkpoint 不重载。"}),
                 "clear_source_node_cache": ("BOOLEAN", {"default": True,
                     "tooltip": "清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的显存/内存引用；代价是下次需要这个输出时该节点会重新执行。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"}),
             },
@@ -812,13 +812,10 @@ class DeepVRAMCleanup:
         self,
         execution_cache: bool,
         unload_models: bool,
-        offload_models_to_ram: bool,
         gc_empty_cache: bool,
         trim_cuda_pool: bool,
         purge_orphan_tensors: bool,
         unload_connected_models: bool,
-        unload_additional_models: bool,
-        unload_all_devices: bool,
         clear_source_node_cache: bool,
         passthrough1=None,
         passthrough2=None,
@@ -871,11 +868,13 @@ class DeepVRAMCleanup:
                 "[DeepVRAMCleanup] cache_source 已连线，但 clear_source_node_cache 未开启，保持不变"
             )
 
-        offload_lines: List[str] = []
-        if offload_models_to_ram:
-            offload_lines = _offload_loaded_models_to_ram()
+        # ===== 显存 -> 内存 offload 已停用（用户不要；ComfyUI 自身处理得很好）=====
+        # offload_lines: List[str] = []
+        # if offload_models_to_ram:
+        #     offload_lines = _offload_loaded_models_to_ram()
 
         # 选择性卸载：只卸指定端口连进来的模型（可与全卸同时勾选，此时以全卸为准）
+        # 附属模型与其它设备上的残留固定为一起清理（原来是对应开关，按用户要求收进内部常开）。
         unload_lines: List[str] = []
         if unload_connected_models:
             if unload_models:
@@ -895,8 +894,8 @@ class DeepVRAMCleanup:
                 else:
                     unload_lines = _unload_selected_models(
                         targets,
-                        unload_additional_models=unload_additional_models,
-                        all_devices=unload_all_devices,
+                        unload_additional_models=True,
+                        all_devices=True,
                     )
         elif model is not None or clip is not None or vae is not None:
             logging.info(
@@ -943,9 +942,6 @@ class DeepVRAMCleanup:
             "",
         ]
         lines.extend(_inspect_comfy_caches())
-        if offload_lines:
-            lines.append("")
-            lines.extend(offload_lines)
         if unload_lines:
             lines.append("")
             lines.extend(unload_lines)
