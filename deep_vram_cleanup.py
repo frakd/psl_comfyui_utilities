@@ -16,6 +16,16 @@ from comfy.model_management import (
     cleanup_models_gc,
 )
 
+# 内核的选择性卸载接口（较新的 ComfyUI 才有）。缺失时退回本文件内置的 keep_loaded 实现。
+try:
+    from comfy.model_management import unload_model_and_clones as _unload_model_and_clones
+except ImportError:
+    _unload_model_and_clones = None
+    logging.info(
+        "[DeepVRAMCleanup] comfy.model_management.unload_model_and_clones 不可用，"
+        "指定模型卸载将使用内置 keep_loaded 回退实现"
+    )
+
 
 # ---------------------------------------------------------------------------
 #  Third-party caches  (leak sources to clear)
@@ -228,6 +238,194 @@ def _offload_loaded_models_to_ram() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+#  Selective model unload (只卸载指定模型)
+# ---------------------------------------------------------------------------
+
+def _fallback_unload_model_and_clones(patcher, all_devices: bool = False) -> None:
+    """内置回退实现，语义与内核 unload_model_and_clones 一致：白名单之外才允许卸载。
+
+    keep_loaded 里保留除目标（及其同 clone_base_uuid 的 clone）以外的所有已加载模型，
+    因此 free_memory 只会把目标卸掉。
+    """
+    target_uuid = getattr(patcher, "clone_base_uuid", None)
+    keep_loaded = []
+    for loaded in list(mm.current_loaded_models):
+        p = loaded.model
+        if p is None:
+            continue
+        if target_uuid is not None and getattr(p, "clone_base_uuid", None) == target_uuid:
+            continue
+        keep_loaded.append(loaded)
+
+    devices = mm.get_all_torch_devices() if all_devices else [mm.get_torch_device()]
+    for dev in devices:
+        mm.free_memory(1e30, dev, keep_loaded)
+
+
+def _selective_unload_one(patcher, unload_additional_models: bool, all_devices: bool) -> None:
+    """卸载单个 ModelPatcher（含其 clone / 附属模型），其余已加载模型不受影响。"""
+    if _unload_model_and_clones is not None:
+        try:
+            _unload_model_and_clones(
+                patcher,
+                unload_additional_models=unload_additional_models,
+                all_devices=all_devices,
+            )
+            return
+        except TypeError as exc:
+            logging.warning(
+                "[DeepVRAMCleanup] unload_model_and_clones 调用签名不兼容(%s)，改用内置回退实现", exc
+            )
+    _fallback_unload_model_and_clones(patcher, all_devices=all_devices)
+
+
+def _target_loaded_models(patcher) -> List[Any]:
+    """内核眼里仍登记为「已加载」的目标模型（含其同 clone_base_uuid 的 clone）。"""
+    target_uuid = getattr(patcher, "clone_base_uuid", None)
+    if target_uuid is None:
+        return []
+    return [
+        lm for lm in list(mm.current_loaded_models)
+        if lm.model is not None and getattr(lm.model, "clone_base_uuid", None) == target_uuid
+    ]
+
+
+def _free_leftovers(patcher, all_devices: bool) -> List[str]:
+    """按目标自身所在设备补刀。
+
+    必需原因（已在 model_management.py:903 / 215-245 读码 + 本机实测确认）：
+    free_memory 只处理 `shift_model.device == device` 的模型，而 unload_all_models /
+    get_all_torch_devices 在有 GPU 时只返回 GPU 设备——于是 load_device 为 cpu 的
+    LoadedModel（低显存下 text_encoder 的常见落点）永远不会被官方路径释放。
+
+    这里对残留目标按其自身设备再发一次 free_memory，keep_loaded 排除目标组，其余模型原位保留。
+    目标在其它 GPU 设备上且未开 all_devices 时不动手，只如实上报。
+    """
+    lines: List[str] = []
+    leftovers = _target_loaded_models(patcher)
+    if not leftovers:
+        return lines
+
+    devices: List[Any] = []
+    for lm in leftovers:
+        dev = getattr(lm, "device", None)
+        if dev is None:
+            continue
+        is_host = getattr(dev, "type", None) == "cpu"
+        if (is_host or all_devices) and dev not in devices:
+            devices.append(dev)
+
+    target_uuid = getattr(patcher, "clone_base_uuid", None)
+    for dev in devices:
+        keep_loaded = [
+            lm for lm in list(mm.current_loaded_models)
+            if lm.model is None or getattr(lm.model, "clone_base_uuid", None) != target_uuid
+        ]
+        try:
+            freed = mm.free_memory(1e30, dev, keep_loaded)
+        except Exception as exc:
+            logging.error(
+                "[DeepVRAMCleanup] 在 %s 上补卸目标失败: %s", dev, exc, exc_info=True
+            )
+            lines.append(f"sweep FAILED on {dev}: {type(exc).__name__}: {exc}")
+            continue
+        logging.info("[DeepVRAMCleanup] 补卸 %s 上的目标模型 %d 个", dev, len(freed))
+        lines.append(f"swept {len(freed)} on {dev}")
+
+    remaining = _target_loaded_models(patcher)
+    if remaining:
+        devs = sorted({str(getattr(lm, "device", "?")) for lm in remaining})
+        lines.append(f"still loaded: {devs}（目标在其它设备上，需开启 unload_all_devices）")
+        logging.warning("[DeepVRAMCleanup] 目标模型仍驻留在 %s", devs)
+    return lines
+
+
+def _describe_patcher(patcher) -> str:
+    """给日志/诊断一个人能读的模型标识（类名 + 是否 text encoder + 加载设备）。"""
+    try:
+        inner = getattr(patcher, "model", None)
+        cls = type(inner).__name__ if inner is not None else "?"
+        kind = "text_encoder" if getattr(patcher, "is_clip", False) else "model"
+        return f"{cls}[{kind}]@{(getattr(patcher, 'load_device', None))}"
+    except Exception as exc:
+        return f"<describe failed: {exc}>"
+
+
+def _as_model_patcher(obj, label: str, lines: List[str]):
+    """从节点端口对象取出 ModelPatcher。
+
+    MODEL 端口传进来的本身就是 ModelPatcher；CLIP / VAE 是包装对象，patcher 挂在 .patcher 上。
+    取不到就记日志 + 写诊断，绝不静默跳过。
+    """
+    if obj is None:
+        return None
+    try:
+        patcher = getattr(obj, "patcher", obj)
+    except Exception:
+        patcher = None
+    if patcher is None:
+        msg = f"skip {label}: {type(obj).__name__} 上找不到 patcher（可能未加载权重）"
+        logging.warning("[DeepVRAMCleanup] %s", msg)
+        lines.append(msg)
+        return None
+    if not hasattr(patcher, "clone_base_uuid") or not hasattr(patcher, "loaded_size"):
+        msg = f"skip {label}: {type(patcher).__name__} 不是可识别的 ModelPatcher"
+        logging.warning("[DeepVRAMCleanup] %s", msg)
+        lines.append(msg)
+        return None
+    return patcher
+
+
+def _unload_selected_models(
+    targets: List[Tuple[str, Any]],
+    unload_additional_models: bool,
+    all_devices: bool,
+) -> List[str]:
+    """按 (标签, 端口对象) 列表逐个选择性卸载，返回诊断行。"""
+    gb = 1024 ** 3
+    lines: List[str] = []
+    for label, obj in targets:
+        patcher = _as_model_patcher(obj, label, lines)
+        if patcher is None:
+            continue
+        name = _describe_patcher(patcher)
+        before = _target_loaded_models(patcher)
+        devs = sorted({str(getattr(lm, "device", "?")) for lm in before})
+        try:
+            resident = patcher.loaded_size()
+        except Exception as exc:
+            resident = -1
+            logging.warning("[DeepVRAMCleanup] 读取 %s 的 loaded_size 失败: %s", name, exc)
+
+        try:
+            _selective_unload_one(patcher, unload_additional_models, all_devices)
+        except Exception as exc:
+            logging.error(
+                "[DeepVRAMCleanup] 卸载 %s(%s) 失败: %s", label, name, exc, exc_info=True
+            )
+            lines.append(f"FAILED unload {label} {name}: {type(exc).__name__}: {exc}")
+            continue
+
+        # 官方路径只覆盖 GPU 设备，主机内存常驻的目标要靠这一步补卸
+        lines.extend(_free_leftovers(patcher, all_devices))
+
+        remaining = _target_loaded_models(patcher)
+        if not before:
+            lines.append(f"{label} {name}: 内核未登记为已加载，无需释放")
+            logging.info("[DeepVRAMCleanup] %s %s: 未驻留", label, name)
+        elif remaining:
+            still = sorted({str(getattr(lm, "device", "?")) for lm in remaining})
+            lines.append(f"partial {label} {name}: 已处理，但仍驻留 {still}")
+        else:
+            host_note = "（主机内存常驻：已解下登记与 patch，基础权重待引用释放后才真正归还）" if "cpu" in devs else ""
+            lines.append(f"unloaded {label} {name}: {max(resident, 0) / gb:.3f} GB @ {','.join(devs)}{host_note}")
+            logging.info(
+                "[DeepVRAMCleanup] Unloaded %s %s: %.1f MB @ %s", label, name, max(resident, 0) / (1024 ** 2), devs
+            )
+    return lines
+
+
+# ---------------------------------------------------------------------------
 #  Diagnostics
 # ---------------------------------------------------------------------------
 
@@ -302,6 +500,7 @@ class DeepVRAMCleanup:
     gc_empty_cache          gc.collect() + torch.cuda.empty_cache()
     trim_cuda_pool          Direct cudaMemPoolTrimTo(0) (cudaMallocAsync)
     purge_orphan_tensors    Hunt & detach stray CUDA tensors from heap
+    unload_connected_models Unload ONLY the model wired into model/clip/vae
     ======================  ==============================================
     """
 
@@ -325,12 +524,21 @@ class DeepVRAMCleanup:
                     "tooltip": "直接调用 CUDA Runtime 的 cudaMemPoolTrimTo(0)，强制将 cudaMallocAsync 内存池中所有未使用的内存归还给操作系统。\n\n这是对 torch.cuda.empty_cache() 的补充——在 CUDA 13.x + cudaMallocAsync 后端下，仅靠 empty_cache() 往往无法彻底释放 reserved 内存。此选项直接绕过 PyTorch 操作 CUDA 内存池。"}),
                 "purge_orphan_tensors": ("BOOLEAN", {"default": False,
                     "tooltip": "（暴力模式）遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在 deep 清理无效时作为最后手段使用。"}),
+                "unload_connected_models": ("BOOLEAN", {"default": False,
+                    "tooltip": "只卸载右侧 model / clip / vae 三个可选端口连进来的那个模型，其余已加载模型保持不动。\n\n走 ComfyUI 内核的选择性卸载接口（comfy.model_management.unload_model_and_clones），按 clone_base_uuid 把目标模型本身、它的 clone（如 CLIPSetLastLayer 产生的副本、LoRA patch 过的副本）以及挂在它上面的附属模型一起卸掉。\n\n注意：必须至少连一个 model / clip / vae 端口才有效果，三者都不连时本开关不做事（会在 diag 里说明）。同时开启 unload_models 时以全卸为准，本开关自动跳过。\n\n前提：本节点必须位于通往「输出节点」的链路上才会被执行——用 passthrough 端口把它串在流程中间，或把它的输出连到后续节点，否则 ComfyUI 会直接跳过这个节点。\n\n典型用法：采样跑完后只卸 text_encoder（几 GB）给 VAE 解码腾地方，同时保留 checkpoint 不重载。"}),
+                "unload_additional_models": ("BOOLEAN", {"default": True,
+                    "tooltip": "选择性卸载时，连带卸载挂在目标模型上的附属模型（如多卡场景下 deepclone 出来的模型副本）。\n\n关掉则只卸目标本身及其 clone，附属模型留在显存里。仅在明确知道附属模型是别人在用的时候才关。"}),
+                "unload_all_devices": ("BOOLEAN", {"default": False,
+                    "tooltip": "选择性卸载时，连其它设备上的残留一起清理。\n\n背景：ComfyUI 官方的卸载路径只按「GPU 设备」过滤（free_memory 里的 shift_model.device == device），而且 get_all_torch_devices() 在有显卡时不返回 cpu。所以本节点默认会额外按目标自身所在的设备补卸一次——主机内存（cpu）常驻的目标始终会处理；这个开关管的是「是否连第二张卡等其它 GPU 设备上的目标也一起卸」。\n\n关掉时，落在其它 GPU 上的目标不会被卸，但会在 diag 里如实标出 partial + 仍驻留的设备，不会假装成功。"}),
             },
             "optional": {
                 "passthrough1": ("*", {"default": None, "forceInput": False}),
                 "passthrough2": ("*", {"default": None, "forceInput": False}),
                 "passthrough3": ("*", {"default": None, "forceInput": False}),
                 "passthrough4": ("*", {"default": None, "forceInput": False}),
+                "model": ("MODEL", {"tooltip": "接在这里的 diffusion 模型（checkpoint / UNET）会被单独卸载，其它已加载模型不动。\n\n配合 unload_connected_models 开关使用。LoRA patch 会被一并 unpatch，下次用到时重新加载。"}),
+                "clip": ("CLIP", {"tooltip": "接在这里的 text encoder 会被单独卸载，不碰 diffusion 模型和 VAE。\n\n注意落点：显存不紧张时 ComfyUI 会把 TE 常驻在系统内存而不是显存（text_encoder_device() 在低显存/非 --gpu-only 时直接返回 cpu）。本节点会按目标自身所在的设备补卸，所以内存里的 TE 同样会被解下——但主机内存常驻时，基础权重要等执行缓存释放引用后才真正归还，diag 里会标注这一点。\n\n下次 CLIPTextEncode 执行时会重新从磁盘加载。"}),
+                "vae": ("VAE", {"tooltip": "接在这里的 VAE 会被单独卸载。\n\nVAE 体积小、重载快，跑完大分辨率解码后卸载它是纯赚的。"}),
             },
         }
 
@@ -357,10 +565,16 @@ class DeepVRAMCleanup:
         gc_empty_cache: bool,
         trim_cuda_pool: bool,
         purge_orphan_tensors: bool,
+        unload_connected_models: bool,
+        unload_additional_models: bool,
+        unload_all_devices: bool,
         passthrough1=None,
         passthrough2=None,
         passthrough3=None,
         passthrough4=None,
+        model=None,
+        clip=None,
+        vae=None,
     ) -> Tuple[float, float, float, str]:
         device = mm.get_torch_device()
         used_before, total = self._vram(device)
@@ -378,6 +592,34 @@ class DeepVRAMCleanup:
         offload_lines: List[str] = []
         if offload_models_to_ram:
             offload_lines = _offload_loaded_models_to_ram()
+
+        # 选择性卸载：只卸指定端口连进来的模型（可与全卸同时勾选，此时以全卸为准）
+        unload_lines: List[str] = []
+        if unload_connected_models:
+            if unload_models:
+                msg = "skip 指定卸载: unload_models 已开启，全卸覆盖本次选择性卸载"
+                logging.info("[DeepVRAMCleanup] %s", msg)
+                unload_lines.append(msg)
+            else:
+                targets = [
+                    (label, obj)
+                    for label, obj in (("MODEL", model), ("CLIP", clip), ("VAE", vae))
+                    if obj is not None
+                ]
+                if not targets:
+                    msg = "指定卸载已开启，但 model / clip / vae 三个端口都没连线，未卸载任何模型"
+                    logging.warning("[DeepVRAMCleanup] %s", msg)
+                    unload_lines.append(msg)
+                else:
+                    unload_lines = _unload_selected_models(
+                        targets,
+                        unload_additional_models=unload_additional_models,
+                        all_devices=unload_all_devices,
+                    )
+        elif model is not None or clip is not None or vae is not None:
+            logging.info(
+                "[DeepVRAMCleanup] model/clip/vae 端口已连线，但 unload_connected_models 未开启，保持不变"
+            )
 
         if unload_models:
             cleanup_models()
@@ -422,6 +664,9 @@ class DeepVRAMCleanup:
         if offload_lines:
             lines.append("")
             lines.extend(offload_lines)
+        if unload_lines:
+            lines.append("")
+            lines.extend(unload_lines)
         lines.append("")
         lines.extend(_find_gpu_tensors_direct())
 
