@@ -1,7 +1,7 @@
 import { app } from '../../scripts/app.js';
 
 // ============================================================
-//  Mask Paint Output — 粘贴底图按钮
+//  Mask Paint Output — 粘贴底图 / 清除遮罩 / 底图预览
 //  把剪贴板里的图片上传后写进名为 image 的 widget，也就是官方遮罩编辑器
 //  保存时写入的同一个槽，所以 Python 侧的 execute 不需要任何改动。
 // ============================================================
@@ -13,6 +13,8 @@ const BTN = { serialize: false };
 const UPSTREAM_ALERT =
     '本节点已连接上游图像：IMAGE 输出以上游为权威，粘贴进来的图不会成为底图。\n\n'
     + '想用粘贴的图当底图，请先断开上游连线。';
+
+const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 async function uploadBlob(blob, filename) {
     const fd = new FormData();
@@ -26,13 +28,13 @@ async function uploadBlob(blob, filename) {
     return r.json();   // { name, subfolder, type }
 }
 
-function applyToNode(node, imageW, info) {
-    const sub = info.subfolder || '';
-    imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
-    // 同步预览，否则要等下一次运行才会显示刚粘贴的图
-    node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
-    node.previewMediaType = 'image';
-    node.setSize?.(node.computeSize?.());
+function viewUrl(info) {
+    const q = new URLSearchParams({
+        filename: info.filename || info.name,
+        subfolder: info.subfolder || '',
+        type: info.type || 'input',
+    });
+    return `/view?${q.toString()}`;
 }
 
 async function readImageFromClipboard() {
@@ -55,9 +57,55 @@ app.registerExtension({
             console.error('[MaskPaintOutput] 找不到名为 image 的 widget，粘贴按钮不可用');
             return;
         }
+        // 这个 widget 是给遮罩编辑器/粘贴按钮写文件名用的，不该让用户手填
+        imageW.hidden = true;
 
-        // 上游 image_input 是否连着：拆分语义下 IMAGE 以上游为权威，
-        // 连着时粘贴的图不会成为底图输出，得提前说清楚，免得静默困惑。
+        // ---------- 预览区 ----------
+        // 本节点没有 COMFYIMAGE widget，node.imgs 不会被渲染出来，
+        // 所以自己放一个 DOM widget 显示当前底图。
+        const wrap = document.createElement('div');
+        Object.assign(wrap.style, {
+            width: '100%',
+            background: '#161616',
+            borderRadius: '6px',
+            marginTop: '5px',
+            overflow: 'hidden',
+            boxSizing: 'border-box',
+        });
+        const img = document.createElement('img');
+        img.src = BLANK;
+        img.draggable = false;
+        Object.assign(img.style, {
+            display: 'block',
+            width: '100%',
+            height: '200px',
+            objectFit: 'contain',
+            background: '#101010',
+        });
+        wrap.appendChild(img);
+        node.addDOMWidget('mask_paint_preview', 'HTML', wrap, { serialize: false, hideOnZoom: false });
+
+        function setPreview(info) {
+            img.src = info ? viewUrl(info) : BLANK;
+        }
+
+        function applyToNode(info) {
+            const sub = info.subfolder || '';
+            imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
+            // 只更新预览图。不要碰 node.setSize —— 那会把节点强制重置回初始尺寸。
+            setPreview(info);
+        }
+
+        // 上游已连接时 IMAGE 以上游为权威；运行后后端回传 ui.images（解析后的底图），
+        // 用它刷新预览，保证「看到的 = 会输出的」。
+        const prevOnExecuted = node.onExecuted;
+        node.onExecuted = function (output) {
+            prevOnExecuted?.apply(this, arguments);
+            const first = output?.images?.[0];
+            if (first) setPreview(first);
+        };
+
+        // 上游已连接时 IMAGE 以上游为权威，粘贴的图不会成为底图，得提前说清楚
         function upstreamLinked() {
             const slot = node.inputs?.findIndex((i) => i.name === 'image_input');
             return slot >= 0 && !!node.getInputLink?.(slot);
@@ -83,8 +131,7 @@ app.registerExtension({
                 return;
             }
             try {
-                const info = await uploadBlob(shot.blob, `paste-${Date.now()}.${shot.ext}`);
-                applyToNode(node, imageW, info);
+                applyToNode(await uploadBlob(shot.blob, `paste-${Date.now()}.${shot.ext}`));
             } catch (e) {
                 console.error('[MaskPaintOutput] 粘贴上传失败', e);
                 window.alert(`${label}：上传失败 —— ${e.message}`);
@@ -100,6 +147,7 @@ app.registerExtension({
                 '没有连接上游图像，清除后本节点将没有任何可输出的图片，运行会报错。仍要清除吗？'
             )) return;
             imageW.value = '';
+            setPreview(null);
         }, BTN);
 
         // Ctrl+V 兜底：仅当本节点被选中、且剪贴板里确实是图片时才接管，
@@ -123,8 +171,7 @@ app.registerExtension({
                 return;
             }
             try {
-                const info = await uploadBlob(file, file.name || `paste-${Date.now()}.png`);
-                applyToNode(node, imageW, info);
+                applyToNode(await uploadBlob(file, file.name || `paste-${Date.now()}.png`));
             } catch (err) {
                 console.error('[MaskPaintOutput] 粘贴上传失败', err);
                 window.alert(`粘贴上传失败 —— ${err.message}`);

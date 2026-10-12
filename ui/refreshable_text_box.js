@@ -6,8 +6,8 @@ import { app } from '../../scripts/app.js';
 //  于是 prompt 字节稳定、运行缓存不失效。
 // ============================================================
 
-const UNLOCKED_LABEL = '🔓 允许覆盖 · 点击锁定';
-const LOCKED_LABEL = '🔒 已锁定 · 点击解锁';
+const UNLOCKED_LABEL = '允许覆盖';
+const LOCKED_LABEL = '禁止覆盖';
 
 // 按钮 widget 必须显式 serialize:false —— addWidget 不会自动加，
 // 否则按钮的名字和值会漏进 prompt，白白参与运行缓存签名。
@@ -41,6 +41,10 @@ app.registerExtension({
         const textW = node.widgets?.find((w) => w.name === 'locked_text');
         const lockW = node.widgets?.find((w) => w.name === 'allow_overwrite');
         if (!textW || !lockW) return;
+
+        // 状态只通过下面的按钮展示和切换；布尔 widget 留着是给它当数据源和持久化载体，
+        // 界面上再显示一份就重了。hidden 不影响它进 prompt 和存工作流。
+        lockW.hidden = true;
 
         // 最近一次从上游收到的文本，供「还原上游」按钮使用。
         // 只在运行时存在，刷新页面后要等下一次运行才会重新填充。

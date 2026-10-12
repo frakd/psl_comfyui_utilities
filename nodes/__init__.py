@@ -21,8 +21,9 @@ _NODE_CLASSES = (
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-# 在节点搜索框里输入这个词就能筛出本包全部节点。
-_SEARCH_ALIAS = "personal"
+# 在节点搜索框里输入这些词中的任意一个就能筛出本包全部节点。
+# psl 是包名 psl_comfyui_utilities 的缩写，敲起来短；personal 保留作同义词。
+_SEARCH_ALIASES = ("psl", "personal")
 
 
 def _inject_search_alias(cls):
@@ -40,7 +41,7 @@ def _inject_search_alias(cls):
     @classmethod
     def define_schema(kls):
         schema = original(kls)
-        schema.search_aliases = list(dict.fromkeys([_SEARCH_ALIAS, *(schema.search_aliases or [])]))
+        schema.search_aliases = list(dict.fromkeys([*_SEARCH_ALIASES, *(schema.search_aliases or [])]))
         return schema
 
     cls.define_schema = define_schema

@@ -15,6 +15,9 @@ const ENTRY_CLS = 'ic-entry';
 const DRAG_HOLD_MS = 200;   // 按住这么久即进入拖拽
 const DRAG_MOVE_PX = 6;     // 或位移超过这么多像素即进入拖拽
 const LAZY_ROOT_MARGIN = '100px';
+// 懒加载占位：1x1 透明 gif。没有它，<img> 在 observer 赋真 src 之前会闪一帧
+// broken image 图标 + alt 文本（点选/删除触发重绘时尤其明显）。
+const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 let stylesInjected = false;
 
@@ -107,7 +110,9 @@ function injectStyles() {
             height: 100%;
             /* contain：整张图可见，最长边缩放到格子尺寸；cover 会把超出部分硬裁掉 */
             object-fit: contain;
-            pointer-events: none;
+            /* 不要设 pointer-events:none —— 那会让右键落在外层 div 上，
+               浏览器就不给「复制图片」等图片专属菜单了。点击/拖拽靠冒泡到格子处理，
+               原生图片拖拽已由 draggable=false 挡掉。 */
         }
         .ic-entry.selected { border-color: #0095ff; }
         .ic-entry.dragging { opacity: 0.3; }
@@ -259,27 +264,24 @@ app.registerExtension({
         let cols = 4;
 
         function readPoolState() {
+            let st = {};
             try {
-                const st = JSON.parse(poolW.value || '{}');
-                pool = Array.isArray(st.items) ? st.items.filter((x) => x && x.name) : [];
-                cols = Number.isFinite(st.cols) ? Math.min(10, Math.max(1, st.cols | 0)) : 4;
+                st = JSON.parse(poolW.value || '{}');
             } catch (e) {
-                pool = [];
-                cols = 4;
+                st = {};
             }
-            // 选中列表按 id 过滤掉已不在容器里的项
-            try {
-                const sel = JSON.parse(selectedW.value || '[]');
-                const ids = Array.isArray(sel) ? sel.map((x) => (x && x.id) || null).filter(Boolean) : [];
-                const alive = new Set(pool.map((p) => p.id));
-                selectedIds = ids.filter((id) => alive.has(id)).slice(0, SLOT_COUNT);
-            } catch (e) {
-                selectedIds = [];
-            }
+            pool = Array.isArray(st.items) ? st.items.filter((x) => x && x.name) : [];
+            cols = Number.isFinite(st.cols) ? Math.min(10, Math.max(1, st.cols | 0)) : 4;
+            // 选中顺序存在 pool_json 里：它随工作流文件持久化、但不进 prompt。
+            // selected_json 是给后端看的、剥掉了 id 的副本，不能用来恢复选中状态。
+            const alive = new Set(pool.map((p) => p.id));
+            selectedIds = (Array.isArray(st.selected) ? st.selected : [])
+                .filter((id) => alive.has(id))
+                .slice(0, SLOT_COUNT);
         }
 
         function writeState() {
-            poolW.value = JSON.stringify({ cols, items: pool });
+            poolW.value = JSON.stringify({ cols, items: pool, selected: selectedIds });
             const byId = new Map(pool.map((p) => [p.id, p]));
             selectedW.value = JSON.stringify(
                 selectedIds.map((id) => byId.get(id)).filter(Boolean)
@@ -331,6 +333,15 @@ app.registerExtension({
         const spacer = document.createElement('div');
         spacer.className = 'ic-spacer';
 
+        const deselectBtn = document.createElement('button');
+        deselectBtn.className = 'ic-btn plain';
+        deselectBtn.textContent = '⬚ 全不选';
+        deselectBtn.onclick = () => {
+            if (!selectedIds.length) return;
+            selectedIds = [];
+            refreshSelection();
+        };
+
         const minusBtn = document.createElement('button');
         minusBtn.className = 'ic-btn plain';
         minusBtn.textContent = '−';
@@ -347,13 +358,16 @@ app.registerExtension({
             cols = Math.min(10, Math.max(1, v | 0));
             colsInput.value = cols;
             writeState();
-            render();
+            // 只改每格宽度，不重建 DOM，免得整网格闪一下
+            const w = itemWidth();
+            for (const el of grid.querySelectorAll('.' + ENTRY_CLS)) el.style.width = w;
+            updateStatus();
         }
         minusBtn.onclick = () => setCols(cols - 1);
         plusBtn.onclick = () => setCols(cols + 1);
         colsInput.onchange = () => setCols(parseInt(colsInput.value, 10) || 4);
 
-        header.append(uploadBtn, pasteBtn, clearBtn, spacer, minusBtn, colsInput, plusBtn);
+        header.append(uploadBtn, pasteBtn, clearBtn, deselectBtn, spacer, minusBtn, colsInput, plusBtn);
 
         const scroll = document.createElement('div');
         scroll.className = 'ic-scroll';
@@ -370,6 +384,24 @@ app.registerExtension({
         // ---------- 渲染 ----------
         let observer = null;
 
+        function makeObserver() {
+            observer = new IntersectionObserver((entries) => {
+                for (const en of entries) {
+                    if (!en.isIntersecting) continue;
+                    const img = en.target;
+                    if (img.dataset.src) {
+                        img.src = img.dataset.src;
+                        img.removeAttribute('data-src');
+                    }
+                    observer.unobserve(img);
+                }
+            }, { root: scroll, rootMargin: LAZY_ROOT_MARGIN, threshold: 0.01 });
+        }
+
+        function itemWidth() {
+            return `calc(${100 / cols}% - ${8 - 8 / cols}px)`;
+        }
+
         function render() {
             if (observer) { observer.disconnect(); observer = null; }
             grid.innerHTML = '';
@@ -381,21 +413,31 @@ app.registerExtension({
                 hint.textContent = '点「上传」、把图片文件拖到这里、或选中本节点后 Ctrl+V 粘贴';
                 grid.appendChild(hint);
             } else {
-                observer = new IntersectionObserver((entries) => {
-                    for (const en of entries) {
-                        if (!en.isIntersecting) continue;
-                        const img = en.target;
-                        if (img.dataset.src) {
-                            img.src = img.dataset.src;
-                            img.removeAttribute('data-src');
-                        }
-                        observer.unobserve(img);
-                    }
-                }, { root: scroll, rootMargin: LAZY_ROOT_MARGIN, threshold: 0.01 });
-
-                const itemW = `calc(${100 / cols}% - ${8 - 8 / cols}px)`;
-                pool.forEach((entry) => grid.appendChild(buildEntry(entry, itemW)));
+                makeObserver();
+                pool.forEach((entry) => grid.appendChild(buildEntry(entry, itemWidth())));
             }
+            updateStatus();
+        }
+
+        // 只更新角标 / 选中样式 / 状态栏，不重建 DOM。
+        // 重建会让所有 <img> 重新走一遍懒加载，点一下闪一下。
+        function refreshSelection() {
+            for (const el of grid.querySelectorAll('.' + ENTRY_CLS)) {
+                const rank = selectedIds.indexOf(el.dataset.id);
+                el.classList.toggle('selected', rank >= 0);
+                let badge = el.querySelector('.ic-badge');
+                if (rank >= 0) {
+                    if (!badge) {
+                        badge = document.createElement('div');
+                        badge.className = 'ic-badge';
+                        el.appendChild(badge);
+                    }
+                    badge.textContent = String(rank + 1);
+                } else if (badge) {
+                    badge.remove();
+                }
+            }
+            writeState();
             updateStatus();
         }
 
@@ -415,6 +457,7 @@ app.registerExtension({
 
             const img = document.createElement('img');
             img.draggable = false;             // 禁掉浏览器原生的图片拖拽
+            img.src = BLANK;                   // 占位，避免懒加载赋值前闪 broken 图标
             img.dataset.src = viewUrl(entry);  // 懒加载：进入视口才真正请求
             img.alt = entry.name;
             el.appendChild(img);
@@ -449,15 +492,22 @@ app.registerExtension({
             pool = pool.filter((p) => p.id !== id);
             selectedIds = selectedIds.filter((x) => x !== id);
             writeState();
-            render();
+            if (!pool.length) { render(); return; }   // 空了才重建，以显示提示语
+            const el = grid.querySelector('.' + ENTRY_CLS + '[data-id="' + id + '"]');
+            if (el) el.remove();
+            updateStatus();
         }
 
         async function addItems(items) {
             const uploaded = await uploadBlobs(items);
             if (!uploaded.length) return;
+            const wasEmpty = !pool.length;
             pool = pool.concat(uploaded);
             writeState();
-            render();
+            if (wasEmpty) { render(); return; }   // 从空提示切到网格才需要重建
+            if (!observer) makeObserver();        // 追加的格子也要挂懒加载
+            for (const entry of uploaded) grid.appendChild(buildEntry(entry, itemWidth()));
+            updateStatus();
         }
 
         function toggleSelect(id) {
@@ -471,8 +521,7 @@ app.registerExtension({
                 }
                 selectedIds.push(id);      // 按点击先后占用下一个输出槽
             }
-            writeState();
-            render();
+            refreshSelection();
         }
 
         // ---------- 单击选中 / 长按拖拽排序 ----------
@@ -572,7 +621,7 @@ app.registerExtension({
             const byId = new Map(pool.map((p) => [p.id, p]));
             pool = domIds.map((x) => byId.get(x)).filter(Boolean);
             writeState();
-            render();
+            updateStatus();   // DOM 已是新顺序，只同步状态，不重建
         }
 
         // ---------- 抑制 ComfyUI 原生拖放 ----------
