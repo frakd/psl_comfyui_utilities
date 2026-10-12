@@ -10,6 +10,10 @@ import { app } from '../../scripts/app.js';
 // 否则按钮的名字和值会漏进 prompt，白白参与运行缓存签名。
 const BTN = { serialize: false };
 
+const UPSTREAM_ALERT =
+    '本节点已连接上游图像：IMAGE 输出以上游为权威，粘贴进来的图不会成为底图。\n\n'
+    + '想用粘贴的图当底图，请先断开上游连线。';
+
 async function uploadBlob(blob, filename) {
     const fd = new FormData();
     fd.append('image', blob, filename);
@@ -52,7 +56,18 @@ app.registerExtension({
             return;
         }
 
+        // 上游 image_input 是否连着：拆分语义下 IMAGE 以上游为权威，
+        // 连着时粘贴的图不会成为底图输出，得提前说清楚，免得静默困惑。
+        function upstreamLinked() {
+            const slot = node.inputs?.findIndex((i) => i.name === 'image_input');
+            return slot >= 0 && !!node.getInputLink?.(slot);
+        }
+
         async function pasteBase(label) {
+            if (upstreamLinked()) {
+                window.alert(UPSTREAM_ALERT);
+                return;
+            }
             let shot = null;
             try {
                 shot = await readImageFromClipboard();
@@ -77,32 +92,42 @@ app.registerExtension({
         }
 
         node.addWidget('button', '📋 粘贴底图', null, () => pasteBase('粘贴底图'), BTN);
-        // 用途是「不再用粘贴/绘制进来的文件，回到上游 image_input」：
-        // image widget 一旦有值，execute 就以它为准、上游输入被忽略，
-        // 所以想回到上游必须把它清空，光粘贴新图覆盖不掉这个状态。
-        node.addWidget('button', '↺ 回到上游图', null, () => {
+        // 清空 image widget = 丢弃绘制/粘贴进来的文件，MASK 退回全零；
+        // IMAGE 不受影响（连着上游就一直用上游）。
+        node.addWidget('button', '🧹 清除遮罩', null, () => {
+            if (!imageW.value) return;
+            if (!upstreamLinked() && !confirm(
+                '没有连接上游图像，清除后本节点将没有任何可输出的图片，运行会报错。仍要清除吗？'
+            )) return;
             imageW.value = '';
-            node.imgs = null;
-            node.setSize?.(node.computeSize?.());
         }, BTN);
 
-        // Ctrl+V 兜底：仅当本节点被选中时生效，免得抢走别的节点的粘贴
+        // Ctrl+V 兜底：仅当本节点被选中、且剪贴板里确实是图片时才接管，
+        // 免得抢走别的节点的粘贴或打断复制文本。
         document.addEventListener('paste', async (e) => {
             const selected = app.canvas?.selected_nodes || {};
             const isTarget = node === app.canvas?.currentNode || Object.values(selected).includes(node);
             if (!isTarget) return;
+
+            let file = null;
             for (const it of e.clipboardData?.items || []) {
                 if (it.kind !== 'file' || !it.type.startsWith('image/')) continue;
-                const f = it.getAsFile();
-                if (!f) continue;
-                e.preventDefault();
-                try {
-                    const info = await uploadBlob(f, f.name || `paste-${Date.now()}.png`);
-                    applyToNode(node, imageW, info);
-                } catch (err) {
-                    console.error('[MaskPaintOutput] 粘贴上传失败', err);
-                }
+                file = it.getAsFile();
+                if (file) break;
+            }
+            if (!file) return;
+
+            e.preventDefault();
+            if (upstreamLinked()) {
+                window.alert(UPSTREAM_ALERT);
                 return;
+            }
+            try {
+                const info = await uploadBlob(file, file.name || `paste-${Date.now()}.png`);
+                applyToNode(node, imageW, info);
+            } catch (err) {
+                console.error('[MaskPaintOutput] 粘贴上传失败', err);
+                window.alert(`粘贴上传失败 —— ${err.message}`);
             }
         });
     },

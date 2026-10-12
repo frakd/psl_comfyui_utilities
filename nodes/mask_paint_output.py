@@ -8,8 +8,15 @@
 因此上游 IMAGE 插槽不能叫 image —— graphToPrompt 先写 widget 再遍历 inputs，
 连线会用 [源节点, slot] 覆盖同名 widget，画好的遮罩文件名会被冲掉。插槽改叫
 image_input，把 image 这个名字让给编辑器。
+
+IMAGE 与 MASK 的来源是**拆开**的：IMAGE 以上游 image_input 为权威（没连上游才用
+绘制文件的 RGB），MASK 始终取绘制文件的 alpha。若让上游整体覆盖 image widget，
+遮罩就会在每次运行时被冲掉（RGB 和 alpha 存在同一个 PNG 里），节点将永远输出不了
+遮罩。拆开后上游换图会自动跟上，遮罩则跨运行保留；两者分辨率不一致时退回全零遮罩
+并打 warning —— 错位的遮罩比空遮罩更危险。
 """
 
+import logging
 import os
 import random
 
@@ -31,9 +38,10 @@ class MaskPaintOutput(io.ComfyNode):
             display_name="Mask Paint Output",
             category="image/mask",
             description=(
-                "预览上游图片并在其上绘制遮罩，输出 IMAGE 与 MASK。"
-                "右键本节点选 Open in MaskEditor（或图片工具栏的遮罩按钮）即可唤出官方绘制工具；"
-                "保存后遮罩取自上传 PNG 的 alpha 通道，未绘制时输出全零遮罩并原样透传上游图片。"
+                "预览底图并在其上绘制遮罩，输出 IMAGE 与 MASK。"
+                "两个输出的来源是分开的：IMAGE 以上游输入为权威（没连上游才用粘贴/绘制文件的 RGB），"
+                "MASK 始终取绘制文件的 alpha，因此重跑不会被上游图冲掉。"
+                "右键本节点选 Open in MaskEditor（或图片工具栏的遮罩按钮）唤出官方绘制工具。"
                 "stop_here 开启时本节点会静默阻断下游：整条工作流跑到这里就停，画完遮罩再关掉它继续，"
                 "此时上游节点签名未变、命中缓存不会重算。"
             ),
@@ -42,7 +50,11 @@ class MaskPaintOutput(io.ComfyNode):
                 io.Image.Input(
                     "image_input",
                     display_name="图像",
-                    tooltip="上游图片（单张或一批）。会先被预览出来，供官方遮罩编辑器加载绘制。",
+                    optional=True,
+                    tooltip=(
+                        "上游底图（单张或一批），可选。连着就以它为 IMAGE 输出的权威来源，"
+                        "每次运行都会跟上上游的变化；不连则用粘贴/绘制进来的那张图的 RGB。"
+                    ),
                 ),
                 io.String.Input(
                     "image",
@@ -50,8 +62,9 @@ class MaskPaintOutput(io.ComfyNode):
                     optional=True,
                     tooltip=(
                         "官方遮罩编辑器保存后自动写入的文件名，形如 "
-                        "clipspace-painted-masked-1234.png [input]。不要手填。"
-                        "清空即回到「透传上游图片 + 全零遮罩」的状态。"
+                        "clipspace-painted-masked-1234.png [input]；「粘贴底图」按钮也写这里。"
+                        "不要手填。该文件的 alpha 通道就是 MASK 输出的来源，跨运行保留。"
+                        "清空即丢弃遮罩（MASK 退回全零）。"
                     ),
                 ),
                 io.Boolean.Input(
@@ -112,12 +125,36 @@ class MaskPaintOutput(io.ComfyNode):
         return results
 
     @classmethod
-    def execute(cls, image_input, image="", stop_here=True):
-        if image:
-            images, mask = cls._load_painted(image)
-        else:
+    def execute(cls, image_input=None, image="", stop_here=True):
+        painted = cls._load_painted(image) if image else None
+
+        # IMAGE：上游为权威；没连上游才用绘制/粘贴文件的 RGB。
+        # 这样上游换了图会自动跟上，而遮罩存在另一个通道里不会被冲掉。
+        if image_input is not None:
             images = image_input
-            mask = torch.zeros(images.shape[:3], dtype=images.dtype, device=images.device)
+        elif painted is not None:
+            images = painted[0]
+        else:
+            raise ValueError(
+                "MaskPaintOutput 没有可输出的图片：既没连接上游 image_input，"
+                "也没粘贴或绘制过底图。"
+            )
+
+        # MASK：始终取绘制文件的 alpha。尺寸对不上就当没画过——错位的遮罩比空遮罩更危险。
+        mask = torch.zeros(images.shape[:3], dtype=images.dtype, device=images.device)
+        if painted is not None:
+            painted_mask = painted[1]
+            if tuple(painted_mask.shape[1:3]) == tuple(images.shape[1:3]):
+                mask = painted_mask.to(dtype=images.dtype, device=images.device)
+                if images.shape[0] > 1 and mask.shape[0] == 1:
+                    mask = mask.expand(images.shape[0], -1, -1).contiguous()
+            else:
+                logging.warning(
+                    "[MaskPaintOutput] 遮罩尺寸 %dx%d 与当前底图 %dx%d 不一致，已退回全零遮罩；"
+                    "请在新尺寸上重新绘制。",
+                    painted_mask.shape[2], painted_mask.shape[1],
+                    images.shape[2], images.shape[1],
+                )
 
         # ui 与阻断值是两条独立通道（execution.py 里分别从 uis 与 results 收集），
         # 所以阻断下游的同时图片照样能显示出来，用户才有东西可画。
