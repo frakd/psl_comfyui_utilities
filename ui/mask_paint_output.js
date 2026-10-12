@@ -1,7 +1,7 @@
 import { app } from '../../scripts/app.js';
 
 // ============================================================
-//  Mask Paint Output — 底图上传 / 清除遮罩
+//  Mask Paint Output — 底图上传（粘贴 / 拖放）
 //
 //  粘贴走官方机制：Vue 节点菜单里「粘贴图像」的判定只有
 //  typeof node.pasteFiles === 'function'（useImageMenuOptions.ts:18-20），
@@ -25,43 +25,6 @@ async function uploadBlob(blob, filename) {
     const r = await fetch('/upload/image', { method: 'POST', body: fd });
     if (!r.ok) throw new Error(`上传失败 HTTP ${r.status}: ${await r.text()}`);
     return r.json();   // { name, subfolder, type }
-}
-
-function viewUrl(info) {
-    const q = new URLSearchParams({
-        filename: info.filename || info.name,
-        subfolder: info.subfolder || '',
-        type: info.type || 'input',
-    });
-    return `/view?${q.toString()}`;
-}
-
-// widget 值形如 "[子目录/]文件名 [input]"，拆回 {name, subfolder, type}
-function parseWidgetValue(v) {
-    const type = (v.match(/\[(input|output|temp)\]$/) || [, 'input'])[1];
-    const bare = v.replace(/\s*\[(input|output|temp)\]$/, '');
-    const i = bare.lastIndexOf('/');
-    return i >= 0
-        ? { name: bare.slice(i + 1), subfolder: bare.slice(0, i), type }
-        : { name: bare, subfolder: '', type };
-}
-
-// 把当前底图重传一份 alpha 全不透明的副本：RGB 保留、遮罩归零。
-// 这样「清除遮罩」不会动底图 —— 遮罩与底图在编辑器保存的文件里是同一个
-// PNG 的 alpha 与 RGB，没法只删其一，只能换一份没有 alpha 的文件。
-async function stripAlphaToBlob(info) {
-    const im = new Image();
-    im.src = viewUrl(info);
-    await im.decode();
-    const c = document.createElement('canvas');
-    c.width = im.naturalWidth;
-    c.height = im.naturalHeight;
-    const g = c.getContext('2d');
-    g.drawImage(im, 0, 0);
-    const d = g.getImageData(0, 0, c.width, c.height);
-    for (let i = 3; i < d.data.length; i += 4) d.data[i] = 255;
-    g.putImageData(d, 0, 0);
-    return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('toBlob 失败'))), 'image/png'));
 }
 
 app.registerExtension({
@@ -170,23 +133,5 @@ app.registerExtension({
             }
             return true;
         };
-
-        // 清除遮罩：只把 alpha 抹掉重传一份，底图 RGB 原样保留。
-        node.addWidget('button', '🧹 清除遮罩', null, async () => {
-            const cur = imageW.value;
-            if (!cur) return;
-            try {
-                const blob = await stripAlphaToBlob(parseWidgetValue(cur));
-                const info = await uploadBlob(blob, `base-${Date.now()}.png`);
-                const sub = info.subfolder || '';
-                imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
-                node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
-                node.graph?.setDirtyCanvas(true, true);
-                await refreshByRunning();
-            } catch (e) {
-                console.error('[MaskPaintOutput] 清除遮罩失败', e);
-                window.alert(`清除遮罩失败 —— ${e.message}`);
-            }
-        }, BTN);
     },
 });

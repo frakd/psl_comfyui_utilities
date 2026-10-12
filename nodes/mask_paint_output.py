@@ -63,8 +63,8 @@ class MaskPaintOutput(io.ComfyNode):
                     tooltip=(
                         "官方遮罩编辑器保存后自动写入的文件名，形如 "
                         "clipspace-painted-masked-1234.png [input]；「粘贴底图」按钮也写这里。"
-                        "不要手填。该文件的 alpha 通道就是 MASK 输出的来源，跨运行保留。"
-                        "清空即丢弃遮罩（MASK 退回全零）。"
+                        "不要手填（前端已隐藏该输入框）。该文件的 alpha 通道就是 MASK 输出的来源，"
+                        "跨运行保留。重新粘贴或拖入一张底图即丢弃当前遮罩（MASK 退回全零）。"
                     ),
                 ),
                 io.Boolean.Input(
