@@ -70,13 +70,17 @@ app.registerExtension({
             await refreshByRunning();
         }
 
-        // ---------- 取图模式：上游换新图时作废当前绘制 ----------
+        // ---------- 取图模式：什么时候作废当前绘制、改用上游图 ----------
         // 遮罩编辑器优先读 image widget（useMaskEditorLoader.ts:106-111），widget 不清空
         // 就会在旧图上画；后端也以 widget 为准，输出同样停在旧图旧遮罩上。
-        // 判定「上游变了」用 app.nodeOutputs 里的文件名，记录存在 node.properties 上，
-        // 随工作流 JSON 保存，所以刷新页面/切换工作流不会误清。
+        // 两个触发点：
+        //   A. stop_here 由关到开（用户明确要重新取图）—— 见下面 serializeValue
+        //   B. 停在取图模式期间上游换了新图 —— 见下面 onExecuted
+        // 「上游是哪张图」用 app.nodeOutputs 里的文件名判定，记录存在 node.properties
+        // 上，随工作流 JSON 保存，所以刷新页面/切换工作流不会误清。
         const stopW = node.widgets?.find((w) => w.name === 'stop_here');
         const ADOPTED = 'psl_adopted_upstream';
+        const LAST_STOP = 'psl_last_stop';
 
         function upstreamRefKey() {
             const idx = node.inputs?.findIndex((i) => i.name === 'image_input');
@@ -93,14 +97,34 @@ app.registerExtension({
             if (key) node.properties[ADOPTED] = key;
         }
 
+        function adoptUpstream() {
+            imageW.value = '';
+            node.imgs = undefined;
+        }
+
+        // 触发点 A。放在 serializeValue 里是因为它是扩展能拿到的、构建 prompt 之前的
+        // 唯一钩子（executionUtil.ts:134-136 每次排队都会调）：在这里清空 widget，
+        // 同一次运行就直接改用上游图，不必像 onExecuted 那样再多跑一轮。
+        imageW.serializeValue = () => {
+            const taking = !!stopW?.value;
+            const justEntered = taking && node.properties[LAST_STOP] === false;
+            node.properties[LAST_STOP] = taking;
+            // 没连上游（或上游还没出过图）时无图可取，不作废当前绘制，免得白丢遮罩。
+            if (justEntered && upstreamRefKey()) {
+                rememberUpstream();
+                adoptUpstream();
+            }
+            return imageW.value;
+        };
+
+        // 触发点 B。
         node.onExecuted = () => {
             if (!stopW?.value) return;                 // 输出模式：当前图锁定，不动
             const key = upstreamRefKey();
             if (!key || key === node.properties[ADOPTED]) return;
             node.properties[ADOPTED] = key;
             if (!imageW.value) return;
-            imageW.value = '';
-            node.imgs = undefined;
+            adoptUpstream();
             // 刚才那次运行用的还是旧 widget，预览停在旧图上；再跑一次本节点让预览
             // 换成接管后的上游图。stop_here 开着，下游不会被牵动。
             refreshByRunning();
