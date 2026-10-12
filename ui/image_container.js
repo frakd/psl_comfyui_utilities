@@ -105,7 +105,8 @@ function injectStyles() {
             display: block;
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            /* contain：整张图可见，最长边缩放到格子尺寸；cover 会把超出部分硬裁掉 */
+            object-fit: contain;
             pointer-events: none;
         }
         .ic-entry.selected { border-color: #0095ff; }
