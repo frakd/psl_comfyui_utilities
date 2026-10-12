@@ -1,7 +1,11 @@
+from .audio_filter import AudioHarshnessSuppressor
 from .deep_vram_cleanup import DeepVRAMCleanup
+from .h3_av_lora import MiniMaxH3AVLoRAStack
 
 _NODE_CLASSES = (
     DeepVRAMCleanup,
+    AudioHarshnessSuppressor,
+    MiniMaxH3AVLoRAStack,
 )
 
 NODE_CLASS_MAPPINGS = {}

@@ -11,6 +11,7 @@ import comfy.model_management
 import comfy.utils
 import comfy.weight_adapter
 from comfy.patcher_extension import PatcherInjection
+from comfy_api.latest import io
 
 
 MAX_LORAS = 8
@@ -649,50 +650,42 @@ class _H3AVInjection:
         self.installed_finals.clear()
 
 
-class MiniMaxH3AVLoRAStack:
+class MiniMaxH3AVLoRAStack(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
+    def define_schema(cls) -> io.Schema:
         lora_list = ["None"] + folder_paths.get_filename_list("loras")
-        optional = {
-            "chunks": (
-                "INT",
-                {
-                    "default": 1,
-                    "min": 1,
-                    "max": 16,
-                    "step": 1,
-                    "tooltip": "Set to the same value as SolAttn's MiniMax H3 Chunk FeedForward when enabled.",
-                },
+        inputs = [
+            io.Model.Input("model"),
+            io.Int.Input(
+                "chunks",
+                default=1,
+                min=1,
+                max=16,
+                step=1,
+                optional=True,
+                tooltip="Set to the same value as SolAttn's MiniMax H3 Chunk FeedForward when enabled.",
             ),
-        }
+        ]
         for i in range(1, MAX_LORAS + 1):
-            optional[f"lora_{i}"] = (lora_list, {"default": "None"})
-            optional[f"strength_{i}"] = (
-                "FLOAT",
-                {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
-            )
-            optional[f"audio_weight_{i}"] = (
-                "FLOAT",
-                {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
-            )
-            optional[f"video_weight_{i}"] = (
-                "FLOAT",
-                {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
-            )
-        return {
-            "required": {"model": ("MODEL",)},
-            "optional": optional,
-        }
-
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "loaded_info")
-    FUNCTION = "load_loras"
-    CATEGORY = "MiniMax-H3/LoRA"
-    DESCRIPTION = (
-        "Stack MiniMax H3 LoRAs with per-LoRA audio/video weights. "
-        "For standard H3 LoRAs the node applies token-row masks inside the "
-        "shared DiT blocks; optional audio/video-specific keys are split by key."
-    )
+            inputs.append(io.Combo.Input(f"lora_{i}", options=lora_list, default="None", optional=True))
+            inputs.append(io.Float.Input(f"strength_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
+            inputs.append(io.Float.Input(f"audio_weight_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
+            inputs.append(io.Float.Input(f"video_weight_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
+        return io.Schema(
+            node_id="MiniMaxH3AVLoRAStack",
+            display_name="MiniMax H3 AV LoRA Stack",
+            category="MiniMax-H3/LoRA",
+            description=(
+                "Stack MiniMax H3 LoRAs with per-LoRA audio/video weights. "
+                "For standard H3 LoRAs the node applies token-row masks inside the "
+                "shared DiT blocks; optional audio/video-specific keys are split by key."
+            ),
+            inputs=inputs,
+            outputs=[
+                io.Model.Output("model", display_name="model"),
+                io.String.Output("loaded_info", display_name="loaded_info"),
+            ],
+        )
 
     @staticmethod
     def _config_index(configs, config):
@@ -702,7 +695,8 @@ class MiniMaxH3AVLoRAStack:
         configs.append(config)
         return len(configs) - 1
 
-    def load_loras(self, model, **kwargs):
+    @classmethod
+    def execute(cls, model, **kwargs):
         chunks = max(1, int(kwargs.get("chunks", 1)))
         inner = getattr(model, "model", None)
         dm = getattr(inner, "diffusion_model", None) if inner is not None else None
@@ -840,7 +834,7 @@ class MiniMaxH3AVLoRAStack:
             configs = []
             for wrapper in block_info["wrappers"]:
                 for entry in wrapper.entries:
-                    entry.mask_index = self._config_index(configs, entry.config)
+                    entry.mask_index = cls._config_index(configs, entry.config)
             block = dm.blocks[block_id]
             block_patches.append(_H3BlockAVPatch(block, block_info["wrappers"], configs))
 
@@ -856,20 +850,13 @@ class MiniMaxH3AVLoRAStack:
             configs = []
             for wrapper in final_map["adaln"]["wrappers"]:
                 for entry in wrapper.entries:
-                    entry.mask_index = self._config_index(configs, entry.config)
+                    entry.mask_index = cls._config_index(configs, entry.config)
             final_patches.append(_H3FinalLayerAVPatch(dm.final_layer, final_map["adaln"]["wrappers"], configs))
 
         injection = _H3AVInjection(wrappers, mlp_patches, block_patches, final_patches)
-        injection_key = "h3_av_lora_{}_{}".format(id(self), id(new_model))
+        # new_model 是本次执行新建的 clone，key 天然每次唯一；V3 下 cls 也是每次执行的
+        # 临时克隆，两者都只用于命名空间，不承载跨执行的稳定性。
+        injection_key = "h3_av_lora_{}_{}".format(id(cls), id(new_model))
         new_model.set_injections(injection_key, [PatcherInjection(injection.inject, injection.eject)])
         info.append(f"wrapped {len(wrappers)} modules / {len(mlp_patches)} MLP paths / {len(block_patches)} blocks")
         return (new_model, "; ".join(info))
-
-
-NODE_CLASS_MAPPINGS = {
-    "MiniMaxH3AVLoRAStack": MiniMaxH3AVLoRAStack,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxH3AVLoRAStack": "MiniMax H3 AV LoRA Stack",
-}
