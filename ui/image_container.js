@@ -243,6 +243,15 @@ app.registerExtension({
         poolW.options = poolW.options || {};
         poolW.options.serialize = false;
 
+        const modeW = node.widgets?.find((w) => w.name === 'unselected_output');
+        if (modeW) {
+            const prevModeCb = modeW.callback;
+            modeW.callback = function (value) {
+                prevModeCb?.apply(this, arguments);
+                updateStatus();   // 切换档位时同步状态栏提示
+            };
+        }
+
         // ---------- 状态 ----------
         let pool = [];          // [{id,name,subfolder,type}]，容器内显示顺序
         let selectedIds = [];   // 有序，最多 SLOT_COUNT 个
@@ -390,8 +399,10 @@ app.registerExtension({
         }
 
         function updateStatus() {
-            status.textContent = `容器 ${pool.length} 张 · 已选 ${selectedIds.length}/${SLOT_COUNT}`
-                + (selectedIds.length < SLOT_COUNT ? ` · 未选中的输出槽会静默阻断下游` : '');
+            // 未选中槽的语义由 unselected_output 开关决定，状态栏如实反映当前档位
+            const mode = modeW?.value || 'none';
+            const hint = selectedIds.length < SLOT_COUNT ? ` · 未选中槽: ${mode}` : '';
+            status.textContent = `容器 ${pool.length} 张 · 已选 ${selectedIds.length}/${SLOT_COUNT}${hint}`;
         }
 
         function buildEntry(entry, itemW) {
