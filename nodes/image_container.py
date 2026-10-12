@@ -13,6 +13,7 @@
 """
 
 import json
+import logging
 
 import torch
 
@@ -38,10 +39,12 @@ class ImageContainer(io.ComfyNode):
             category="image/container",
             description=(
                 "图片容器：点按钮上传、把图片文件拖到节点上、或 Ctrl+V 粘贴剪贴板图片。"
-                "单击缩略图选中它并按点击先后决定输出到第几个槽（再点一次取消，后面的自动前移）；"
-                "长按左键拖拽可调整容器内顺序；缩略图右上角 × 移除该图。"
-                f"前 {SLOT_COUNT} 个输出各出一张图，未选中的槽静默阻断下游；"
-                "第 7 个 batch 输出把选中的图合成一个批次，要求尺寸一致。"
+                "单击缩略图选中它，按点击先后占用输出槽 1..6，左上角角标显示它占第几个槽；"
+                "再点一次取消输出，后面的角标自动进位。长按左键拖拽只调整容器内的显示顺序，"
+                "不影响角标编号。缩略图右上角 × 把该图从容器移除。"
+                f"前 {SLOT_COUNT} 个输出各出一张图，未选中的槽静默阻断连到它的下游；"
+                f"第 7 个 batch 输出把选中的图合成一个批次，尺寸不一致时跳过合成"
+                f"（该槽静默阻断，前 {SLOT_COUNT} 个单图输出不受影响）。"
             ),
             # 必须是输出节点：既让「运行到此节点」可用（execution.py:1181-1183 只把
             # OUTPUT_NODE 当作部分执行的根），也让它不依赖下游连线就能被执行。
@@ -115,9 +118,12 @@ class ImageContainer(io.ComfyNode):
             if (t.shape[1], t.shape[2]) != (height, width)
         ]
         if mismatched:
-            raise ValueError(
-                f"batch 输出要求所有选中图片尺寸一致，第一张是 {width}x{height}，"
-                f"这些不一致: {', '.join(mismatched)}。"
-                f"取消选中它们，或只使用前 {SLOT_COUNT} 个单图输出。"
+            # 尺寸不一致就不尝试合成：batch 槽静默阻断，前 6 个单图输出照常工作。
+            # 这里不用字面量 None —— 输出值没有类型校验，None 会原样送进下游 FUNCTION
+            # 再崩在那里（execution.py:185-193），报错点会指向无辜的下游节点。
+            logging.warning(
+                "[ImageContainer] batch 输出跳过：选中图片尺寸不一致，第一张 %dx%d，不一致的有 %s",
+                width, height, ", ".join(mismatched),
             )
+            return io.NodeOutput(*slots, ExecutionBlocker(None))
         return io.NodeOutput(*slots, torch.cat(loaded, dim=0))

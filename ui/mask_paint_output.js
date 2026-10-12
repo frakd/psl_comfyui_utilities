@@ -77,7 +77,10 @@ app.registerExtension({
         }
 
         node.addWidget('button', '📋 粘贴底图', null, () => pasteBase('粘贴底图'), BTN);
-        node.addWidget('button', '🧹 清除底图', null, () => {
+        // 用途是「不再用粘贴/绘制进来的文件，回到上游 image_input」：
+        // image widget 一旦有值，execute 就以它为准、上游输入被忽略，
+        // 所以想回到上游必须把它清空，光粘贴新图覆盖不掉这个状态。
+        node.addWidget('button', '↺ 回到上游图', null, () => {
             imageW.value = '';
             node.imgs = null;
             node.setSize?.(node.computeSize?.());

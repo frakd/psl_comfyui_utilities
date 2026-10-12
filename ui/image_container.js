@@ -4,9 +4,9 @@ import { app } from '../../scripts/app.js';
 //  Image Container — 多图容器
 //  上传 / 拖入 / 粘贴图片，点选决定输出槽，长按拖拽排序。
 //
-//  顺序规则：单击选中即按点击先后占用输出槽 1..6；一旦拖动排序，
-//  输出顺序改为按容器内视觉顺序重新推导，保证「所见即所得」。
-//  缩略图左上角的序号徽章始终等于它实际占用的输出槽。
+//  顺序规则：输出槽编号完全由点击先后决定，缩略图左上角的角标就是它占的槽；
+//  取消选中某张后，后面所有角标自动进位。长按拖拽只改变容器内的显示顺序，
+//  不动角标 —— 两套顺序互不干扰。
 // ============================================================
 
 const SUBFOLDER = 'imageContainer';
@@ -552,14 +552,13 @@ app.registerExtension({
             return e ? viewUrl(e) : '';
         }
 
-        // 拖动结束后：容器顺序以 DOM 为准，且输出顺序重新按视觉顺序推导
+        // 拖动结束后：只把容器显示顺序改成 DOM 顺序。
+        // selectedIds 原样不动 —— 输出槽编号由点击先后决定，拖拽不影响角标。
         function commitDomOrder() {
             const domIds = [...grid.querySelectorAll('.' + ENTRY_CLS)].map((el) => el.dataset.id);
             if (domIds.length !== pool.length) return;   // DOM 与状态不一致时不覆盖，避免丢数据
             const byId = new Map(pool.map((p) => [p.id, p]));
             pool = domIds.map((x) => byId.get(x)).filter(Boolean);
-            const stillSelected = new Set(selectedIds);
-            selectedIds = pool.filter((p) => stillSelected.has(p.id)).map((p) => p.id);
             writeState();
             render();
         }
