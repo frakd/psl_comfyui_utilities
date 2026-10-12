@@ -10,7 +10,7 @@
   所以**多个槽汇入同一个节点时，只要有一个没选，那个节点整个不跑**。
 - placeholder：产出纯黑图。下游一定会跑，但会把黑图当真图处理。
 
-batch 槽在「没选图」或「选中图尺寸不一致」时按同一规则产出，并在不一致时打一条 warning。
+batch 槽在「没选图」或「选中图尺寸不一致」时按同一规则产出（不打日志，结果本身就看得出来）。
 
 两个 widget 的分工是缓存正确性的关键：
 - selected_json 进 prompt，是后端唯一需要的东西（有序的被选文件名）。
@@ -21,7 +21,6 @@ batch 槽在「没选图」或「选中图尺寸不一致」时按同一规则�
 """
 
 import json
-import logging
 
 import torch
 
@@ -51,7 +50,7 @@ class ImageContainer(io.ComfyNode):
                 "再点一次取消输出，后面的角标自动进位。长按左键拖拽只调整容器内的显示顺序，"
                 "不影响角标编号。缩略图右上角 × 把该图从容器移除。"
                 f"前 {SLOT_COUNT} 个输出各出一张图，未选中的槽按「未选中槽输出」开关处理；"
-                f"第 7 个 batch 输出把选中的图合成一个批次，尺寸不一致时跳过合成并打一条警告，"
+                f"第 7 个 batch 输出把选中的图合成一个批次，尺寸不一致时跳过合成，"
                 f"前 {SLOT_COUNT} 个单图输出不受影响。"
             ),
             # 必须是输出节点：既让「运行到此节点」可用（execution.py:1181-1183 只把
@@ -161,17 +160,9 @@ class ImageContainer(io.ComfyNode):
         batch = cls._inert(unselected_output, ref)
         if loaded:
             height, width = loaded[0].shape[1], loaded[0].shape[2]
-            mismatched = [
-                f"{entries[i].get('name')} ({t.shape[2]}x{t.shape[1]})"
-                for i, t in enumerate(loaded)
-                if (t.shape[1], t.shape[2]) != (height, width)
-            ]
-            if mismatched:
-                logging.warning(
-                    "[ImageContainer] batch 输出跳过：选中图片尺寸不一致，第一张 %dx%d，不一致的有 %s",
-                    width, height, ", ".join(mismatched),
-                )
-            else:
+            # 尺寸不一致就不合成，batch 槽按当前档位产出惰性值。不打日志：
+            # 结果本身就能看出来（batch 下游没动），刷屏不值得。
+            if all((t.shape[1], t.shape[2]) == (height, width) for t in loaded):
                 batch = torch.cat(loaded, dim=0)
 
         return io.NodeOutput(*slots, batch)

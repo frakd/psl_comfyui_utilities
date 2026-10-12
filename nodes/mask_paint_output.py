@@ -12,11 +12,10 @@ image_input，把 image 这个名字让给编辑器。
 IMAGE 与 MASK 的来源是**拆开**的：IMAGE 以上游 image_input 为权威（没连上游才用
 绘制文件的 RGB），MASK 始终取绘制文件的 alpha。若让上游整体覆盖 image widget，
 遮罩就会在每次运行时被冲掉（RGB 和 alpha 存在同一个 PNG 里），节点将永远输出不了
-遮罩。拆开后上游换图会自动跟上，遮罩则跨运行保留；两者分辨率不一致时退回全零遮罩
-并打 warning —— 错位的遮罩比空遮罩更危险。
+遮罩。拆开后上游换图会自动跟上，遮罩则跨运行保留；两者分辨率不一致时退回全零遮罩 —— 错位的遮罩比空遮罩更危险，
+而空遮罩在预览里一眼可见，不必打日志。
 """
 
-import logging
 import os
 import random
 
@@ -141,6 +140,7 @@ class MaskPaintOutput(io.ComfyNode):
             )
 
         # MASK：始终取绘制文件的 alpha。尺寸对不上就当没画过——错位的遮罩比空遮罩更危险。
+        # 不打日志：预览里一眼就能看出遮罩是空的。
         mask = torch.zeros(images.shape[:3], dtype=images.dtype, device=images.device)
         if painted is not None:
             painted_mask = painted[1]
@@ -148,13 +148,6 @@ class MaskPaintOutput(io.ComfyNode):
                 mask = painted_mask.to(dtype=images.dtype, device=images.device)
                 if images.shape[0] > 1 and mask.shape[0] == 1:
                     mask = mask.expand(images.shape[0], -1, -1).contiguous()
-            else:
-                logging.warning(
-                    "[MaskPaintOutput] 遮罩尺寸 %dx%d 与当前底图 %dx%d 不一致，已退回全零遮罩；"
-                    "请在新尺寸上重新绘制。",
-                    painted_mask.shape[2], painted_mask.shape[1],
-                    images.shape[2], images.shape[1],
-                )
 
         # ui 与阻断值是两条独立通道（execution.py 里分别从 uis 与 results 收集），
         # 所以阻断下游的同时图片照样能显示出来，用户才有东西可画。
