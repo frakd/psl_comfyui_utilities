@@ -24,20 +24,32 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 # 在节点搜索框里输入这个词就能筛出本包全部节点。
 _SEARCH_ALIAS = "personal"
 
+
+def _inject_search_alias(cls):
+    """V3 节点的 object_info 只从 schema 取 search_aliases。
+
+    server.py:819-820 对 V3 节点直接 return GET_NODE_INFO_V1()，走不到 859 行那句
+    读 SEARCH_ALIASES 类属性的代码（那行只对 V1 节点生效）；而 GET_NODE_INFO_V1
+    的 search_aliases 来自 schema（_io.py:2017，未声明时为 None）。
+    所以统一前缀必须进 schema。在这里包一层 define_schema 注入，免得每个节点
+    都要记得写、以后新增节点漏掉。前端 nodeSearchService.ts:17 的 Fuse keys 是
+    ['name', 'display_name', 'search_aliases']，category 不在其中，只能走别名。
+    """
+    original = cls.define_schema.__func__
+
+    @classmethod
+    def define_schema(kls):
+        schema = original(kls)
+        schema.search_aliases = list(dict.fromkeys([_SEARCH_ALIAS, *(schema.search_aliases or [])]))
+        return schema
+
+    cls.define_schema = define_schema
+
+
 # GET_SCHEMA() 会顺带校验 schema，写错在加载时就炸，而不是等到运行节点时。
 # node_id 只由各类的 define_schema 决定，这里不再重复维护一份键名。
 for _cls in _NODE_CLASSES:
+    _inject_search_alias(_cls)
     _schema = _cls.GET_SCHEMA()
     NODE_CLASS_MAPPINGS[_schema.node_id] = _cls
     NODE_DISPLAY_NAME_MAPPINGS[_schema.node_id] = _schema.display_name
-
-    # V3 Schema 的 search_aliases 传不到 server.py:859 读取的 SEARCH_ALIASES 类属性
-    # —— GET_SCHEMA() 同步了 _DESCRIPTION/_CATEGORY/_OUTPUT_NODE 等一堆，唯独漏了它，
-    # _io.py 里也没有对应的 classproperty。所以在此把 schema 里声明的别名与统一前缀
-    # 合并后显式挂上。前端 nodeSearchService.ts:17 的 Fuse keys 是
-    # ['name', 'display_name', 'search_aliases']，category 不在其中，只能走别名。
-    _cls.SEARCH_ALIASES = list(dict.fromkeys([
-        _SEARCH_ALIAS,
-        *(_schema.search_aliases or []),
-        *getattr(_cls, "SEARCH_ALIASES", []),
-    ]))
