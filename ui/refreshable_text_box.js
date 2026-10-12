@@ -6,8 +6,8 @@ import { app } from '../../scripts/app.js';
 //  于是 prompt 字节稳定、运行缓存不失效。
 // ============================================================
 
-const UNLOCKED_LABEL = '允许覆盖';
-const LOCKED_LABEL = '禁止覆盖';
+const UNLOCKED_LABEL = '🔓 允许覆盖';
+const LOCKED_LABEL = '🔒 禁止覆盖';
 
 // 按钮 widget 必须显式 serialize:false —— addWidget 不会自动加，
 // 否则按钮的名字和值会漏进 prompt，白白参与运行缓存签名。
