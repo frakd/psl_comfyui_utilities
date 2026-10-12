@@ -8,6 +8,7 @@ import sys
 from typing import Tuple, List, Dict, Any
 
 import torch
+from comfy_api.latest import io
 import comfy.model_management as mm
 from comfy.model_management import (
     soft_empty_cache,
@@ -32,9 +33,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 #
 # ===== RIFE 相关支持已停用（用户不再用插帧节点）=====
-# 下面两处 RIFE 缓存导入与 _clear_vfi_model_caches 已整体注释掉，INPUT_TYPES 里对应
+# 下面两处 RIFE 缓存导入与 _clear_vfi_model_caches 已整体注释掉，define_schema 里对应
 # 的 rife_backwarp_grid / rife_model_cache 两个开关也已删除。
-# 如需恢复：取消本段与被注释函数的注释，并把 cleanup() 里的 rife_which 分支加回来。
+# 如需恢复：取消本段与被注释函数的注释，并把 execute() 里的 rife_which 分支加回来。
 #
 # _RIFE_CACHE = None          # RIFE _model_cache
 # _BACKWARP_GRID = None        # RIFE backwarp_tenGrid
@@ -223,9 +224,9 @@ def _purge_cuda_orphans() -> int:
 # ===== 显存 -> 内存 offload 已停用 =====
 # 用户明确不要这个功能：本节点的目的在腾内存，而它恰恰是把显存搬进内存（增加内存
 # 占用）；且 ComfyUI 自身在显存吃紧时 free_memory -> ModelPatcher.partially_unload
-# 已经做得很好。输入开关与 cleanup() 调用点均已移除。
-# 如需恢复：取消本段注释，并在 INPUT_TYPES 加回 offload_models_to_ram 开关、
-# 在 cleanup() 里恢复 offload_lines 分支。
+# 已经做得很好。输入开关与 execute() 调用点均已移除。
+# 如需恢复：取消本段注释，并在 define_schema 加回 offload_models_to_ram 开关、
+# 在 execute() 里恢复 offload_lines 分支。
 #
 # def _offload_loaded_models_to_ram() -> List[str]:
 #     """Move loaded model weights from VRAM to system RAM, keeping the models loaded."""
@@ -733,7 +734,7 @@ def _inspect_comfy_caches() -> List[str]:
 #  Node
 # ---------------------------------------------------------------------------
 
-class DeepVRAMCleanup:
+class DeepVRAMCleanup(io.ComfyNode):
     """Selective memory/VRAM cleanup with per-source toggles.
 
     开关按「作用对象 + 全局/定向」成对排列：
@@ -751,60 +752,62 @@ class DeepVRAMCleanup:
     --------------------  --  ----------------------------------------------
     """
 
-    # 输出节点：允许在画布上直接点节点的运行按钮单独执行本节点
-    # （前端只把被点名的节点作为 partial_execution_targets 发给后端）。
-    OUTPUT_NODE = True
-
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-                        "required": {
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DeepVRAMCleanup",
+            display_name="Deep VRAM Cleanup",
+            category="utils/VRAM",
+            # 输出节点：允许在画布上直接点节点的运行按钮单独执行本节点
+            # （前端只把被点名的节点作为 partial_execution_targets 发给后端）。
+            is_output_node=True,
+            inputs=[
                 # ===== 第一组：运行缓存（全局清 -> 只清连线节点）=====
-                "clear_all_node_cache": ("BOOLEAN", {"default": True,
-                    "tooltip": "【清缓存 · 全局】清空 ComfyUI 所有节点的中间输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。\n\n这是腾内存的主力（中间结果占的往往是内存里的大头）。代价：清掉后所有分支都得重算，缓存加速失效。\n\n与下面 clear_source_node_cache（只清连线指定的那一个节点）是一对：全清粗暴但彻底，定向清理精细但有前提。"}),
-                "clear_source_node_cache": ("BOOLEAN", {"default": True,
-                    "tooltip": "【清缓存 · 只清指定的】清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的内存/显存引用；代价是下次需要这个输出时该节点会重新执行。比上面的全局清理精细得多。\n\n注意：全局清理 clear_all_node_cache 开启时本开关会被跳过（全清已覆盖）。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"}),
+                io.Boolean.Input("clear_all_node_cache", default=True,
+                    tooltip="【清缓存 · 全局】清空 ComfyUI 所有节点的中间输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。\n\n这是腾内存的主力（中间结果占的往往是内存里的大头）。代价：清掉后所有分支都得重算，缓存加速失效。\n\n与下面 clear_source_node_cache（只清连线指定的那一个节点）是一对：全清粗暴但彻底，定向清理精细但有前提。"),
+                io.Boolean.Input("clear_source_node_cache", default=True,
+                    tooltip="【清缓存 · 只清指定的】清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的内存/显存引用；代价是下次需要这个输出时该节点会重新执行。比上面的全局清理精细得多。\n\n注意：全局清理 clear_all_node_cache 开启时本开关会被跳过（全清已覆盖）。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"),
                 # ===== 第二组：模型（全局卸 -> 只卸连线模型）=====
-                "unload_models": ("BOOLEAN", {"default": False,
-                    "tooltip": "【卸模型 · 全局】卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非内存/显存极度紧张。"}),
-                "unload_connected_models": ("BOOLEAN", {"default": False,
-                    "tooltip": "【卸模型 · 只卸指定的】只卸载右侧 model / clip / vae 三个可选端口连进来的那个模型，其余已加载模型保持不动。\n\n走 ComfyUI 内核的选择性卸载接口（comfy.model_management.unload_model_and_clones），按 clone_base_uuid 把目标模型本身、它的 clone（如 CLIPSetLastLayer 产生的副本、LoRA patch 过的副本）以及挂在它上面的附属模型一起卸掉（附属模型一定连带，所有设备上的残留也一并清理）。\n\n注意：必须至少连一个 model / clip / vae 端口才有效果，三者都不连时本开关不做事（会在 diag 里说明）。同时开启 unload_models 时以全卸为准，本开关自动跳过。\n\n前提：本节点必须位于通往「输出节点」的链路上才会被执行——用 passthrough 端口把它串在流程中间，或把它的输出连到后续节点，否则 ComfyUI 会直接跳过这个节点。\n\n典型用法：采样跑完后只卸 text_encoder（几 GB）给 VAE 解码腾地方，同时保留 checkpoint 不重载。"}),
+                io.Boolean.Input("unload_models", default=False,
+                    tooltip="【卸模型 · 全局】卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非内存/显存极度紧张。"),
+                io.Boolean.Input("unload_connected_models", default=False,
+                    tooltip="【卸模型 · 只卸指定的】只卸载右侧 model / clip / vae 三个可选端口连进来的那个模型，其余已加载模型保持不动。\n\n走 ComfyUI 内核的选择性卸载接口（comfy.model_management.unload_model_and_clones），按 clone_base_uuid 把目标模型本身、它的 clone（如 CLIPSetLastLayer 产生的副本、LoRA patch 过的副本）以及挂在它上面的附属模型一起卸掉（附属模型一定连带，所有设备上的残留也一并清理）。\n\n注意：必须至少连一个 model / clip / vae 端口才有效果，三者都不连时本开关不做事（会在 diag 里说明）。同时开启 unload_models 时以全卸为准，本开关自动跳过。\n\n前提：本节点必须位于通往「输出节点」的链路上才会被执行——用 passthrough 端口把它串在流程中间，或把它的输出连到后续节点，否则 ComfyUI 会直接跳过这个节点。\n\n典型用法：采样跑完后只卸 text_encoder（几 GB）给 VAE 解码腾地方，同时保留 checkpoint 不重载。"),
                 # ===== 第三组：收尾释放（显存池 / 堆里的残留引用）=====
-                "gc_empty_cache": ("BOOLEAN", {"default": True,
-                    "tooltip": "【收尾】执行 Python gc.collect() + torch.cuda.empty_cache()。释放 Python 层不再被引用的对象，并将 PyTorch CUDA 缓存池中已标记为空闲的内存归还给操作系统。"}),
-                "trim_cuda_pool": ("BOOLEAN", {"default": True,
-                    "tooltip": "【收尾】直接调用 CUDA Runtime 的 cudaMemPoolTrimTo(0)，强制将 cudaMallocAsync 内存池中所有未使用的内存归还给操作系统。\n\n这是对 torch.cuda.empty_cache() 的补充——在 CUDA 13.x + cudaMallocAsync 后端下，仅靠 empty_cache() 往往无法彻底释放 reserved 内存。此选项直接绕过 PyTorch 操作 CUDA 内存池。"}),
-                "purge_orphan_tensors": ("BOOLEAN", {"default": False,
-                    "tooltip": "【收尾 · 暴力模式】遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在以上清理都无效时作为最后手段使用。"}),
+                io.Boolean.Input("gc_empty_cache", default=True,
+                    tooltip="【收尾】执行 Python gc.collect() + torch.cuda.empty_cache()。释放 Python 层不再被引用的对象，并将 PyTorch CUDA 缓存池中已标记为空闲的内存归还给操作系统。"),
+                io.Boolean.Input("trim_cuda_pool", default=True,
+                    tooltip="【收尾】直接调用 CUDA Runtime 的 cudaMemPoolTrimTo(0)，强制将 cudaMallocAsync 内存池中所有未使用的内存归还给操作系统。\n\n这是对 torch.cuda.empty_cache() 的补充——在 CUDA 13.x + cudaMallocAsync 后端下，仅靠 empty_cache() 往往无法彻底释放 reserved 内存。此选项直接绕过 PyTorch 操作 CUDA 内存池。"),
+                io.Boolean.Input("purge_orphan_tensors", default=False,
+                    tooltip="【收尾 · 暴力模式】遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在以上清理都无效时作为最后手段使用。"),
                 # ===== 以下开关已按用户要求从 UI 移除（语义固定 / 停用），详见文件顶部注释：
                 #   offload_models_to_ram     —— 停用：目的在腾内存，而它把显存搬进内存（增加内存占用）
                 #   unload_additional_models  —— 固定 True（连带卸载附属模型）
                 #   unload_all_devices        —— 固定 True（所有设备上的残留一起清）
                 #   rife_backwarp_grid / rife_model_cache —— 移除：不再使用插帧节点
-            },
-            "optional": {
-                "passthrough1": ("*", {"default": None, "forceInput": False}),
-                "passthrough2": ("*", {"default": None, "forceInput": False}),
-                "passthrough3": ("*", {"default": None, "forceInput": False}),
-                "passthrough4": ("*", {"default": None, "forceInput": False}),
-                "model": ("MODEL", {"tooltip": "接在这里的 diffusion 模型（checkpoint / UNET）会被单独卸载，其它已加载模型不动。\n\n配合 unload_connected_models 开关使用。LoRA patch 会被一并 unpatch，下次用到时重新加载。"}),
-                "clip": ("CLIP", {"tooltip": "接在这里的 text encoder 会被单独卸载，不碰 diffusion 模型和 VAE。\n\n注意落点：显存不紧张时 ComfyUI 会把 TE 常驻在系统内存而不是显存（text_encoder_device() 在低显存/非 --gpu-only 时直接返回 cpu）。本节点会按目标自身所在的设备补卸，所以内存里的 TE 同样会被解下——但主机内存常驻时，基础权重要等执行缓存释放引用后才真正归还，diag 里会标注这一点。\n\n下次 CLIPTextEncode 执行时会重新从磁盘加载。"}),
-                "vae": ("VAE", {"tooltip": "接在这里的 VAE 会被单独卸载。\n\nVAE 体积小、重载快，跑完大分辨率解码后卸载它是纯赚的。"}),
-                "cache_source": ("*", {"tooltip": "把「要清运行缓存的节点」的任意一个输出接到这里。\n\n节点执行时只能拿到解析后的值，链接本身只存在于 prompt 图里——所以上游节点号是从隐藏输入 PROMPT 里按本节点 id 读回来的，这样不需要你手填节点号。\n\n作用对象是这一个节点在 outputs 缓存里的条目（含它缓存的 tensor / ModelPatcher 输出），不是全清。配合 clear_source_node_cache 开关使用。"}),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-                "prompt": "PROMPT",
-                "execution_list": "EXECUTION_LIST",
-            },
-        }
+                io.AnyType.Input("passthrough1", optional=True),
+                io.AnyType.Input("passthrough2", optional=True),
+                io.AnyType.Input("passthrough3", optional=True),
+                io.AnyType.Input("passthrough4", optional=True),
+                io.Model.Input("model", optional=True, tooltip="接在这里的 diffusion 模型（checkpoint / UNET）会被单独卸载，其它已加载模型不动。\n\n配合 unload_connected_models 开关使用。LoRA patch 会被一并 unpatch，下次用到时重新加载。"),
+                io.Clip.Input("clip", optional=True, tooltip="接在这里的 text encoder 会被单独卸载，不碰 diffusion 模型和 VAE。\n\n注意落点：显存不紧张时 ComfyUI 会把 TE 常驻在系统内存而不是显存（text_encoder_device() 在低显存/非 --gpu-only 时直接返回 cpu）。本节点会按目标自身所在的设备补卸，所以内存里的 TE 同样会被解下——但主机内存常驻时，基础权重要等执行缓存释放引用后才真正归还，diag 里会标注这一点。\n\n下次 CLIPTextEncode 执行时会重新从磁盘加载。"),
+                io.Vae.Input("vae", optional=True, tooltip="接在这里的 VAE 会被单独卸载。\n\nVAE 体积小、重载快，跑完大分辨率解码后卸载它是纯赚的。"),
+                io.AnyType.Input("cache_source", optional=True, tooltip="把「要清运行缓存的节点」的任意一个输出接到这里。\n\n节点执行时只能拿到解析后的值，链接本身只存在于 prompt 图里——所以上游节点号是从隐藏输入 PROMPT 里按本节点 id 读回来的，这样不需要你手填节点号。\n\n作用对象是这一个节点在 outputs 缓存里的条目（含它缓存的 tensor / ModelPatcher 输出），不是全清。配合 clear_source_node_cache 开关使用。"),
+            ],
+            outputs=[
+                io.AnyType.Output("passthrough1", display_name="passthrough1"),
+                io.AnyType.Output("passthrough2", display_name="passthrough2"),
+                io.AnyType.Output("passthrough3", display_name="passthrough3"),
+                io.AnyType.Output("passthrough4", display_name="passthrough4"),
+                io.Float.Output("used_gb", display_name="used_gb"),
+                io.Float.Output("total_gb", display_name="total_gb"),
+                io.Float.Output("freed_gb", display_name="freed_gb"),
+                io.String.Output("diag", display_name="diag"),
+            ],
+            hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.execution_list],
+        )
 
-    RETURN_TYPES = ("*", "*", "*", "*", "FLOAT", "FLOAT", "FLOAT", "STRING")
-    RETURN_NAMES = ("passthrough1", "passthrough2", "passthrough3", "passthrough4",  "used_gb", "total_gb", "freed_gb", "diag")
-    FUNCTION = "cleanup"
-    CATEGORY = "utils/VRAM"
-
-    def _vram(self, device: torch.device) -> Tuple[float, float]:
+    @classmethod
+    def _vram(cls, device: torch.device) -> Tuple[float, float]:
         if device.type != "cuda":
             return 0.0, 0.0
         gb = 1024**3
@@ -812,8 +815,9 @@ class DeepVRAMCleanup:
         r = torch.cuda.memory_reserved(device) / gb
         return max(a, r), torch.cuda.get_device_properties(device).total_memory / gb
 
-    def cleanup(
-        self,
+    @classmethod
+    def execute(
+        cls,
         # 第一组：运行缓存（全局 -> 指定节点）
         clear_all_node_cache: bool,
         clear_source_node_cache: bool,
@@ -832,12 +836,11 @@ class DeepVRAMCleanup:
         clip=None,
         vae=None,
         cache_source=None,
-        unique_id=None,
-        prompt=None,
-        execution_list=None,
-    ) -> Tuple[float, float, float, str]:
+    ):
+        # hidden 输入（unique_id / prompt / execution_list）由 V3 框架经
+        # PREPARE_CLASS_CLONE 挂到 cls.hidden 上，不再是 execute 的形参。
         device = mm.get_torch_device()
-        used_before, total = self._vram(device)
+        used_before, total = cls._vram(device)
 
         # ===================== 第一组：运行缓存 =====================
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
@@ -853,7 +856,8 @@ class DeepVRAMCleanup:
                 logging.info("[DeepVRAMCleanup] %s", msg)
                 cache_lines.append(msg)
             else:
-                source_id, why = _linked_source_node_id(unique_id, prompt)
+                hidden = cls.hidden
+                source_id, why = _linked_source_node_id(hidden.unique_id, hidden.prompt)
                 if source_id is None:
                     msg = f"指定节点缓存清理已开启，但没找到目标节点：{why}"
                     logging.warning("[DeepVRAMCleanup] %s", msg)
@@ -861,10 +865,10 @@ class DeepVRAMCleanup:
                 else:
                     logging.info(
                         "[DeepVRAMCleanup] 准备清理节点 #%s 的运行缓存（由 #%s 连线指定）",
-                        source_id, unique_id,
+                        source_id, hidden.unique_id,
                     )
                     cache_lines = _evict_node_output_cache(
-                        source_id, execution_list, unique_id, prompt
+                        source_id, hidden.execution_list, hidden.unique_id, hidden.prompt
                     )
         elif cache_source is not None:
             logging.info(
@@ -941,7 +945,7 @@ class DeepVRAMCleanup:
             _trim_cuda_mempool(device.index if hasattr(device, "index") else 0)
 
         # --- Diagnostics ---
-        used_after, _ = self._vram(device)
+        used_after, _ = cls._vram(device)
         freed = max(0.0, used_before - used_after)
 
         lines = [
@@ -961,7 +965,3 @@ class DeepVRAMCleanup:
 
         diag = "\n".join(lines)
         return (passthrough1, passthrough2, passthrough3, passthrough4, used_after, total, freed, diag)
-
-
-NODE_CLASS_MAPPINGS = {"DeepVRAMCleanup": DeepVRAMCleanup}
-NODE_DISPLAY_NAME_MAPPINGS = {"DeepVRAMCleanup": "Deep VRAM Cleanup"}

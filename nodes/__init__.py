@@ -1,10 +1,15 @@
-from . import deep_vram_cleanup
+from .deep_vram_cleanup import DeepVRAMCleanup
 
-_NODE_MODULES = (deep_vram_cleanup,)
+_NODE_CLASSES = (
+    DeepVRAMCleanup,
+)
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-for _mod in _NODE_MODULES:
-    NODE_CLASS_MAPPINGS.update(_mod.NODE_CLASS_MAPPINGS)
-    NODE_DISPLAY_NAME_MAPPINGS.update(_mod.NODE_DISPLAY_NAME_MAPPINGS)
+# GET_SCHEMA() 会顺带校验 schema，写错在加载时就炸，而不是等到运行节点时。
+# node_id 只由各类的 define_schema 决定，这里不再重复维护一份键名。
+for _cls in _NODE_CLASSES:
+    _schema = _cls.GET_SCHEMA()
+    NODE_CLASS_MAPPINGS[_schema.node_id] = _cls
+    NODE_DISPLAY_NAME_MAPPINGS[_schema.node_id] = _schema.display_name
