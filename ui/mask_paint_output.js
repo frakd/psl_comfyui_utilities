@@ -1,27 +1,26 @@
 import { app } from '../../scripts/app.js';
 
 // ============================================================
-//  Mask Paint Output — 粘贴底图 / 清除遮罩 / 底图预览
-//  把剪贴板里的图片上传后写进名为 image 的 widget，也就是官方遮罩编辑器
-//  保存时写入的同一个槽，所以 Python 侧的 execute 不需要任何改动。
+//  Mask Paint Output — 底图上传 / 清除遮罩
+//
+//  粘贴走官方机制：Vue 节点菜单里「粘贴图像」的判定只有
+//  typeof node.pasteFiles === 'function'（useImageMenuOptions.ts:18-20），
+//  菜单项本身由核心提供、读 navigator.clipboard 后调用 node.pasteFiles([file])。
+//  所以这里只实现 pasteFiles，不自己造按钮和剪贴板监听（否则会和核心重复上传）。
+//
+//  image widget 保持 STRING 而非 COMBO：遮罩编辑器保存时写入的值可能带
+//  " [input]" 后缀，COMBO 会按成员校验把它拒掉（execution.py:1059-1068 没有
+//  针对 image_upload 的豁免），而 STRING 不做成员校验，两种写法都收。
 // ============================================================
 
-// 按钮 widget 必须显式 serialize:false —— addWidget 不会自动加，
-// 否则按钮的名字和值会漏进 prompt，白白参与运行缓存签名。
 const BTN = { serialize: false };
-
-const UPSTREAM_ALERT =
-    '本节点已连接上游图像：IMAGE 输出以上游为权威，粘贴进来的图不会成为底图。\n\n'
-    + '想用粘贴的图当底图，请先断开上游连线。';
-
-const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 async function uploadBlob(blob, filename) {
     const fd = new FormData();
     fd.append('image', blob, filename);
     fd.append('overwrite', 'false');
-    // 故意不传 subfolder：上传到 input 根目录，widget 值就是 "<name> [input]"，
-    // 与遮罩编辑器自己保存时写入的格式逐字一致，编辑器一定能加载它。
+    // 不传 subfolder：上传到 input 根目录，widget 值与遮罩编辑器自己保存时的
+    // 格式一致，编辑器一定能加载它。
     fd.append('type', 'input');
     const r = await fetch('/upload/image', { method: 'POST', body: fd });
     if (!r.ok) throw new Error(`上传失败 HTTP ${r.status}: ${await r.text()}`);
@@ -37,13 +36,32 @@ function viewUrl(info) {
     return `/view?${q.toString()}`;
 }
 
-async function readImageFromClipboard() {
-    if (!navigator.clipboard?.read) return null;
-    for (const item of await navigator.clipboard.read()) {
-        const type = item.types.find((t) => t.startsWith('image/'));
-        if (type) return { blob: await item.getType(type), ext: type.split('/')[1] || 'png' };
-    }
-    return null;
+// widget 值形如 "[子目录/]文件名 [input]"，拆回 {name, subfolder, type}
+function parseWidgetValue(v) {
+    const type = (v.match(/\[(input|output|temp)\]$/) || [, 'input'])[1];
+    const bare = v.replace(/\s*\[(input|output|temp)\]$/, '');
+    const i = bare.lastIndexOf('/');
+    return i >= 0
+        ? { name: bare.slice(i + 1), subfolder: bare.slice(0, i), type }
+        : { name: bare, subfolder: '', type };
+}
+
+// 把当前底图重传一份 alpha 全不透明的副本：RGB 保留、遮罩归零。
+// 这样「清除遮罩」不会动底图 —— 遮罩与底图在编辑器保存的文件里是同一个
+// PNG 的 alpha 与 RGB，没法只删其一，只能换一份没有 alpha 的文件。
+async function stripAlphaToBlob(info) {
+    const im = new Image();
+    im.src = viewUrl(info);
+    await im.decode();
+    const c = document.createElement('canvas');
+    c.width = im.naturalWidth;
+    c.height = im.naturalHeight;
+    const g = c.getContext('2d');
+    g.drawImage(im, 0, 0);
+    const d = g.getImageData(0, 0, c.width, c.height);
+    for (let i = 3; i < d.data.length; i += 4) d.data[i] = 255;
+    g.putImageData(d, 0, 0);
+    return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('toBlob 失败'))), 'image/png'));
 }
 
 app.registerExtension({
@@ -54,128 +72,102 @@ app.registerExtension({
 
         const imageW = node.widgets?.find((w) => w.name === 'image');
         if (!imageW) {
-            console.error('[MaskPaintOutput] 找不到名为 image 的 widget，粘贴按钮不可用');
+            console.error('[MaskPaintOutput] 找不到名为 image 的 widget');
             return;
         }
-        // 这个 widget 是给遮罩编辑器/粘贴按钮写文件名用的，不该让用户手填
+        // 这个 widget 是给遮罩编辑器 / 粘贴 / 拖放写文件名用的，不该让用户手填
         imageW.hidden = true;
 
-        // ---------- 预览区 ----------
-        // 本节点没有 COMFYIMAGE widget，node.imgs 不会被渲染出来，
-        // 所以自己放一个 DOM widget 显示当前底图。
-        const wrap = document.createElement('div');
-        Object.assign(wrap.style, {
-            width: '100%',
-            background: '#161616',
-            borderRadius: '6px',
-            marginTop: '5px',
-            overflow: 'hidden',
-            boxSizing: 'border-box',
-        });
-        const img = document.createElement('img');
-        img.src = BLANK;
-        img.draggable = false;
-        Object.assign(img.style, {
-            display: 'block',
-            width: '100%',
-            height: '200px',
-            objectFit: 'contain',
-            background: '#101010',
-        });
-        wrap.appendChild(img);
-        node.addDOMWidget('mask_paint_preview', 'HTML', wrap, { serialize: false, hideOnZoom: false });
-
-        function setPreview(info) {
-            img.src = info ? viewUrl(info) : BLANK;
+        // Vue 模式下节点内预览读的是 output store（由运行结果填充），赋值 node.imgs
+        // 不会刷新；所以写入后对单个节点做一次部分执行，让预览如实更新。
+        // image_input 是可选输入，单节点 prompt 能过校验，且不会牵动下游。
+        async function refreshByRunning() {
+            try {
+                // 重载签名：queuePrompt(number, batchCount, queueNodeIds[])，
+                // 第三参传数组即部分执行，只跑本节点（app.ts:1796-1808）
+                await app.queuePrompt(1, 1, [node.id]);
+            } catch (e) {
+                console.warn('[MaskPaintOutput] 单节点刷新失败，预览将在下次运行时更新', e);
+                node.imgs = node.imgs || [];
+                node.graph?.setDirtyCanvas(true, true);
+            }
         }
 
-        function applyToNode(info) {
+        async function applyFile(file) {
+            const info = await uploadBlob(file, file.name || `pasted-${Date.now()}.png`);
             const sub = info.subfolder || '';
             imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
-            // 只更新预览图。不要碰 node.setSize —— 那会把节点强制重置回初始尺寸。
-            setPreview(info);
+            // 经典画布模式下的预览靠 node.imgs；Vue 模式靠下面的单节点执行
+            node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
+            node.previewMediaType = 'image';
+            node.graph?.setDirtyCanvas(true, true);
+            await refreshByRunning();
         }
 
-        // 上游已连接时 IMAGE 以上游为权威；运行后后端回传 ui.images（解析后的底图），
-        // 用它刷新预览，保证「看到的 = 会输出的」。
-        const prevOnExecuted = node.onExecuted;
-        node.onExecuted = function (output) {
-            prevOnExecuted?.apply(this, arguments);
-            const first = output?.images?.[0];
-            if (first) setPreview(first);
-        };
-
-        // 上游已连接时 IMAGE 以上游为权威，粘贴的图不会成为底图，得提前说清楚
+        // 上游已连接时 IMAGE 以上游为权威，粘贴/拖放进来的图不会成为底图，
+        // 静默无效比报错更糟，所以提前拦下说明。
         function upstreamLinked() {
             const slot = node.inputs?.findIndex((i) => i.name === 'image_input');
             return slot >= 0 && !!node.getInputLink?.(slot);
         }
 
-        async function pasteBase(label) {
+        // 官方「粘贴图像」菜单项的判定条件：存在 pasteFiles 函数。
+        // 注意核心会先调 pasteFile 再调 pasteFiles，两个都实现会重复上传，只实现后者。
+        node.pasteFiles = async (files) => {
             if (upstreamLinked()) {
-                window.alert(UPSTREAM_ALERT);
-                return;
+                window.alert('本节点已连接上游图像：IMAGE 输出以上游为权威，粘贴进来的图不会成为底图。\n\n想用粘贴的图当底图，请先断开上游连线。');
+                return true;
             }
-            let shot = null;
+            const img = [...(files || [])].find((f) => f.type && f.type.startsWith('image/'));
+            if (!img) return false;
             try {
-                shot = await readImageFromClipboard();
-            } catch (e) {
-                console.warn('[MaskPaintOutput] 剪贴板读取被拒绝，改用 Ctrl+V', e);
-            }
-            if (!shot) {
-                window.alert(
-                    `${label}：剪贴板里没有图片，或浏览器拒绝了读取。\n\n`
-                    + 'navigator.clipboard 需要安全上下文（localhost 可用，局域网 IP + http 会被拒）。\n'
-                    + '请改为选中本节点后按 Ctrl+V。'
-                );
-                return;
-            }
-            try {
-                applyToNode(await uploadBlob(shot.blob, `paste-${Date.now()}.${shot.ext}`));
+                await applyFile(img);
             } catch (e) {
                 console.error('[MaskPaintOutput] 粘贴上传失败', e);
-                window.alert(`${label}：上传失败 —— ${e.message}`);
+                window.alert(`粘贴上传失败 —— ${e.message}`);
             }
-        }
+            return true;
+        };
 
-        node.addWidget('button', '📋 粘贴底图', null, () => pasteBase('粘贴底图'), BTN);
-        // 清空 image widget = 丢弃绘制/粘贴进来的文件，MASK 退回全零；
-        // IMAGE 不受影响（连着上游就一直用上游）。
-        node.addWidget('button', '🧹 清除遮罩', null, () => {
-            if (!imageW.value) return;
-            if (!upstreamLinked() && !confirm(
-                '没有连接上游图像，清除后本节点将没有任何可输出的图片，运行会报错。仍要清除吗？'
-            )) return;
-            imageW.value = '';
-            setPreview(null);
-        }, BTN);
-
-        // Ctrl+V 兜底：仅当本节点被选中、且剪贴板里确实是图片时才接管，
-        // 免得抢走别的节点的粘贴或打断复制文本。
-        document.addEventListener('paste', async (e) => {
-            const selected = app.canvas?.selected_nodes || {};
-            const isTarget = node === app.canvas?.currentNode || Object.values(selected).includes(node);
-            if (!isTarget) return;
-
-            let file = null;
-            for (const it of e.clipboardData?.items || []) {
-                if (it.kind !== 'file' || !it.type.startsWith('image/')) continue;
-                file = it.getAsFile();
-                if (file) break;
-            }
-            if (!file) return;
-
+        // 拖图片文件到节点上 = 换底图，与官方 LoadImage 行为一致；
+        // 返回 true 以抑制全局的「每张图建一个 LoadImage」行为。
+        node.onDragOver = (e) => {
+            if (!e?.dataTransfer?.types?.includes('Files')) return false;
+            return [...e.dataTransfer.items].some((it) => it.type.startsWith('image/'));
+        };
+        node.onDragDrop = async (e) => {
+            const file = [...(e.dataTransfer?.files || [])].find((f) => f.type.startsWith('image/'));
+            if (!file) return false;
             e.preventDefault();
+            e.stopPropagation();
             if (upstreamLinked()) {
-                window.alert(UPSTREAM_ALERT);
-                return;
+                window.alert('本节点已连接上游图像：IMAGE 输出以上游为权威，拖进来的图不会成为底图。\n\n想用拖入的图当底图，请先断开上游连线。');
+                return true;
             }
             try {
-                applyToNode(await uploadBlob(file, file.name || `paste-${Date.now()}.png`));
+                await applyFile(file);
             } catch (err) {
-                console.error('[MaskPaintOutput] 粘贴上传失败', err);
-                window.alert(`粘贴上传失败 —— ${err.message}`);
+                console.error('[MaskPaintOutput] 拖放上传失败', err);
             }
-        });
+            return true;
+        };
+
+        // 清除遮罩：只把 alpha 抹掉重传一份，底图 RGB 原样保留。
+        node.addWidget('button', '🧹 清除遮罩', null, async () => {
+            const cur = imageW.value;
+            if (!cur) return;
+            try {
+                const blob = await stripAlphaToBlob(parseWidgetValue(cur));
+                const info = await uploadBlob(blob, `base-${Date.now()}.png`);
+                const sub = info.subfolder || '';
+                imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
+                node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
+                node.graph?.setDirtyCanvas(true, true);
+                await refreshByRunning();
+            } catch (e) {
+                console.error('[MaskPaintOutput] 清除遮罩失败', e);
+                window.alert(`清除遮罩失败 —— ${e.message}`);
+            }
+        }, BTN);
     },
 });
