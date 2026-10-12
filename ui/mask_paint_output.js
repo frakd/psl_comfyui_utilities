@@ -63,9 +63,9 @@ app.registerExtension({
             // 经典画布模式下的预览靠 node.imgs；Vue 模式靠下面的单节点执行
             node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
             node.previewMediaType = 'image';
-            // 手动传图等同于「已经接管过当前上游」，否则紧接着的刷新运行会把它当成
-            // 未接管的上游新图、又把刚写的 widget 清掉。
-            rememberUpstream();
+            // 手动传图视为「已对齐当前上游」：记下最近一次运行看到的上游指纹，
+            // 否则紧接着的刷新运行会把它当成未接管的上游新图、又把刚写的 widget 清掉。
+            node.properties[FP_BASE] = node.properties[FP_LAST] ?? null;
             node.graph?.setDirtyCanvas(true, true);
             await refreshByRunning();
         }
@@ -73,31 +73,25 @@ app.registerExtension({
         // ---------- 取图模式：什么时候作废当前绘制、改用上游图 ----------
         // 遮罩编辑器优先读 image widget（useMaskEditorLoader.ts:106-111），widget 不清空
         // 就会在旧图上画；后端也以 widget 为准，输出同样停在旧图旧遮罩上。
+        // 「上游是不是换了新图」用后端随 ui 发来的指纹 psl_fp（形状 + 抽样 crc32）判定：
+        // 前端拿不到张量，而 app.nodeOutputs 里的文件名对很多上游节点根本不存在
+        // （LoadImage、本包的 ImageContainer 都不往 ui 写图片）。
         // 两个触发点：
-        //   A. stop_here 由关到开（用户明确要重新取图）—— 见下面 serializeValue
-        //   B. 停在取图模式期间上游换了新图 —— 见下面 onExecuted
-        // 「上游是哪张图」用 app.nodeOutputs 里的文件名判定，记录存在 node.properties
-        // 上，随工作流 JSON 保存，所以刷新页面/切换工作流不会误清。
+        //   A. stop_here 由关到开（用户明确要重新取图），或排队时指纹已对不上
+        //   B. 停在取图模式期间上游出了新图 —— onExecuted 里比对本次运行的指纹
+        // 记录都存在 node.properties 上，随工作流 JSON 保存，刷新/切换工作流不会误清。
         const stopW = node.widgets?.find((w) => w.name === 'stop_here');
-        const ADOPTED = 'psl_adopted_upstream';
+        const FP_BASE = 'psl_adopted_fp';      // 当前 widget 对齐的上游指纹
+        const FP_LAST = 'psl_last_fp';         // 最近一次运行看到的上游指纹
         const LAST_STOP = 'psl_last_stop';
 
-        function upstreamRefKey() {
-            const idx = node.inputs?.findIndex((i) => i.name === 'image_input');
-            if (idx === undefined || idx < 0) return null;
-            const link = node.getInputLink?.(idx);
-            if (!link) return null;
-            const img = app.nodeOutputs?.[link.origin_id]?.images?.[link.origin_slot];
-            if (!img?.filename) return null;
-            return `${img.subfolder || ''}/${img.filename}|${img.type || 'output'}`;
+        function readFp(output) {
+            const fp = output?.psl_fp;
+            return Array.isArray(fp) ? (fp[0] ?? null) : (fp ?? null);
         }
 
-        function rememberUpstream() {
-            const key = upstreamRefKey();
-            if (key) node.properties[ADOPTED] = key;
-        }
-
-        function adoptUpstream() {
+        function adoptUpstream(fp) {
+            node.properties[FP_BASE] = fp;
             imageW.value = '';
             node.imgs = undefined;
         }
@@ -109,22 +103,23 @@ app.registerExtension({
             const taking = !!stopW?.value;
             const justEntered = taking && node.properties[LAST_STOP] === false;
             node.properties[LAST_STOP] = taking;
-            // 没连上游（或上游还没出过图）时无图可取，不作废当前绘制，免得白丢遮罩。
-            if (justEntered && upstreamRefKey()) {
-                rememberUpstream();
-                adoptUpstream();
+            const fp = node.properties[FP_LAST] ?? null;
+            // 没连上游（或上游还没跑过）时 fp 为 null，无图可取，不作废当前绘制。
+            if (taking && fp && (justEntered || fp !== node.properties[FP_BASE])) {
+                adoptUpstream(fp);
             }
             return imageW.value;
         };
 
-        // 触发点 B。
-        node.onExecuted = () => {
-            if (!stopW?.value) return;                 // 输出模式：当前图锁定，不动
-            const key = upstreamRefKey();
-            if (!key || key === node.properties[ADOPTED]) return;
-            node.properties[ADOPTED] = key;
-            if (!imageW.value) return;
-            adoptUpstream();
+        // 触发点 B：排队时还看不到本次运行上游会出什么图，运行后补一次接管。
+        node.onExecuted = (output) => {
+            const fp = readFp(output);
+            if (fp) node.properties[FP_LAST] = fp;
+            if (!stopW?.value) return;             // 输出模式：当前图锁定，不动
+            if (!fp || fp === node.properties[FP_BASE]) return;
+            const hadWidget = !!imageW.value;
+            adoptUpstream(fp);
+            if (!hadWidget) return;
             // 刚才那次运行用的还是旧 widget，预览停在旧图上；再跑一次本节点让预览
             // 换成接管后的上游图。stop_here 开着，下游不会被牵动。
             refreshByRunning();

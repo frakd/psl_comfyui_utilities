@@ -22,6 +22,7 @@ alpha -> MASK。只有 widget 为空时才退回上游 image_input（此时 MASK
 
 import os
 import random
+import zlib
 
 import numpy as np
 import torch
@@ -136,6 +137,22 @@ class MaskPaintOutput(io.ComfyNode):
         return results
 
     @classmethod
+    def _fingerprint(cls, images):
+        """上游图的指纹：形状 + 抽样字节的 crc32（跨进程稳定）。
+
+        前端靠它判断「上游是不是换了新图」——不能用 app.nodeOutputs 的文件名，
+        很多上游节点（LoadImage、本包的 ImageContainer 等）根本不往 ui 里写图片。
+        值包一层 list：execution.py:421-422 合并多个 ui 时按 key 把值当可迭代展开，
+        裸字符串会被拆成字符。
+        """
+        if images is None:
+            return [None]
+        flat = images.flatten()
+        stride = max(1, flat.shape[0] // 4096)
+        sample = flat[::stride].contiguous().cpu().numpy().tobytes()
+        return [f"{tuple(images.shape)}:{zlib.crc32(sample):08x}"]
+
+    @classmethod
     def execute(cls, image_input=None, image="", stop_here=True):
         painted = cls._load_painted(image) if image else None
 
@@ -163,7 +180,8 @@ class MaskPaintOutput(io.ComfyNode):
 
         # ui 与阻断值是两条独立通道（execution.py 里分别从 uis 与 results 收集），
         # 所以阻断下游的同时图片照样能显示出来，用户才有东西可画。
-        ui = {"images": cls._preview(images, mask)}
+        # psl_fp 随 executed 事件送到前端，用于判断上游是否换了新图。
+        ui = {"images": cls._preview(images, mask), "psl_fp": cls._fingerprint(image_input)}
 
         if stop_here:
             # message=None => execution_block_cb 不发 execution_error，下游静默跳过。
