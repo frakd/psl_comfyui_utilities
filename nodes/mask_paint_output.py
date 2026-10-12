@@ -9,11 +9,11 @@
 连线会用 [源节点, slot] 覆盖同名 widget，画好的遮罩文件名会被冲掉。插槽改叫
 image_input，把 image 这个名字让给编辑器。
 
-IMAGE 与 MASK 的来源是**拆开**的：IMAGE 以上游 image_input 为权威（没连上游才用
-绘制文件的 RGB），MASK 始终取绘制文件的 alpha。若让上游整体覆盖 image widget，
-遮罩就会在每次运行时被冲掉（RGB 和 alpha 存在同一个 PNG 里），节点将永远输出不了
-遮罩。拆开后上游换图会自动跟上，遮罩则跨运行保留；两者分辨率不一致时退回全零遮罩 —— 错位的遮罩比空遮罩更危险，
-而空遮罩在预览里一眼可见，不必打日志。
+IMAGE 与 MASK 的来源是**拆开**的：MASK 始终取绘制文件的 alpha；IMAGE 在 stop_here
+开启时以上游为权威（新一代图进来覆盖旧的，好接着画），关闭后保持当前绘制/粘贴的
+图像、不再被上游覆盖 —— 否则继续运行时会得到「遮罩还在、图却变回没画过的上游图」
+这种图与遮罩不配对的结果。两者分辨率不一致时 MASK 退回全零：错位的遮罩比空遮罩
+更危险，而空遮罩在预览里一眼可见，不必打日志。
 """
 
 import os
@@ -38,9 +38,10 @@ class MaskPaintOutput(io.ComfyNode):
             category="image/mask",
             description=(
                 "预览底图并在其上绘制遮罩，输出 IMAGE 与 MASK。"
-                "两个输出的来源是分开的：IMAGE 以上游输入为权威（没连上游才用粘贴/绘制文件的 RGB），"
-                "MASK 始终取绘制文件的 alpha，因此重跑不会被上游图冲掉。"
-                "右键本节点选 Open in MaskEditor（或图片工具栏的遮罩按钮）唤出官方绘制工具。"
+                "MASK 始终取绘制文件的 alpha；IMAGE 在 stop_here 开启时以上游为权威"
+                "（没连上游则用粘贴/绘制文件的 RGB），关闭后保持当前绘制/粘贴的图像"
+                "不被上游覆盖，保证输出的图与遮罩始终是同一对。"
+                "右键本节点选「用遮罩编辑器打开」（或图片工具栏的遮罩按钮）唤出官方绘制工具。"
                 "stop_here 开启时本节点会静默阻断下游：整条工作流跑到这里就停，画完遮罩再关掉它继续，"
                 "此时上游节点签名未变、命中缓存不会重算。"
             ),
@@ -71,8 +72,10 @@ class MaskPaintOutput(io.ComfyNode):
                     default=True,
                     tooltip=(
                         "开启时本节点静默阻断下游执行：整条工作流跑到这里就停下，"
-                        "不保存、不报错，方便你先画遮罩。画完关掉它再运行即可继续，"
-                        "上游因为签名未变会命中缓存、不会重算。"
+                        "不保存、不报错，方便你先画遮罩；同时上游图像为权威，"
+                        "新一代图进来会覆盖当前图像。\n"
+                        "画完关掉它再运行即可继续：此时当前图像（含你画的遮罩）不再被上游覆盖，"
+                        "图与遮罩保持同一对；上游因为签名未变会命中缓存、不会重算。"
                     ),
                 ),
             ],
@@ -127,9 +130,13 @@ class MaskPaintOutput(io.ComfyNode):
     def execute(cls, image_input=None, image="", stop_here=True):
         painted = cls._load_painted(image) if image else None
 
-        # IMAGE：上游为权威；没连上游才用绘制/粘贴文件的 RGB。
-        # 这样上游换了图会自动跟上，而遮罩存在另一个通道里不会被冲掉。
-        if image_input is not None:
+        # stop_here=False（继续运行）时不让上游覆盖当前图像：画完遮罩后图与遮罩
+        # 必须保持同一对，否则会出现「输出的遮罩还在、预览和输出的图却变回没画过的
+        # 上游图」这种反直觉状态。
+        # stop_here=True（暂停取图）时上游为权威，新一代图进来覆盖旧的，好接着画。
+        if painted is not None and not stop_here:
+            images = painted[0]
+        elif image_input is not None:
             images = image_input
         elif painted is not None:
             images = painted[0]

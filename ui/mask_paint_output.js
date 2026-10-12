@@ -104,20 +104,9 @@ app.registerExtension({
             await refreshByRunning();
         }
 
-        // 上游已连接时 IMAGE 以上游为权威，粘贴/拖放进来的图不会成为底图，
-        // 静默无效比报错更糟，所以提前拦下说明。
-        function upstreamLinked() {
-            const slot = node.inputs?.findIndex((i) => i.name === 'image_input');
-            return slot >= 0 && !!node.getInputLink?.(slot);
-        }
-
         // 官方「粘贴图像」菜单项的判定条件：存在 pasteFiles 函数。
         // 注意核心会先调 pasteFile 再调 pasteFiles，两个都实现会重复上传，只实现后者。
         node.pasteFiles = async (files) => {
-            if (upstreamLinked()) {
-                window.alert('本节点已连接上游图像：IMAGE 输出以上游为权威，粘贴进来的图不会成为底图。\n\n想用粘贴的图当底图，请先断开上游连线。');
-                return true;
-            }
             const img = [...(files || [])].find((f) => f.type && f.type.startsWith('image/'));
             if (!img) return false;
             try {
@@ -128,6 +117,40 @@ app.registerExtension({
             }
             return true;
         };
+
+        // 常驻粘贴按钮：右键再点三层菜单太慢。读剪贴板与官方菜单项同源
+        // （navigator.clipboard.read()）；不可用时提示走菜单或 Ctrl+V。
+        async function readImageFromClipboard() {
+            if (!navigator.clipboard?.read) return null;
+            for (const item of await navigator.clipboard.read()) {
+                const type = item.types.find((t) => t.startsWith('image/'));
+                if (type) return await item.getType(type);
+            }
+            return null;
+        }
+
+        node.addWidget('button', '📋 粘贴底图', null, async () => {
+            let blob = null;
+            try {
+                blob = await readImageFromClipboard();
+            } catch (e) {
+                console.warn('[MaskPaintOutput] 剪贴板读取被拒绝', e);
+            }
+            if (!blob) {
+                window.alert(
+                    '剪贴板里没有图片，或浏览器拒绝了读取。\n'
+                    + '（navigator.clipboard 需要安全上下文，局域网 IP + http 会被拒）\n\n'
+                    + '请改用右键菜单的「粘贴图像」，或选中本节点后按 Ctrl+V。'
+                );
+                return;
+            }
+            try {
+                await applyFile(new File([blob], `pasted-${Date.now()}.png`, { type: blob.type }));
+            } catch (e) {
+                console.error('[MaskPaintOutput] 粘贴上传失败', e);
+                window.alert(`粘贴上传失败 —— ${e.message}`);
+            }
+        }, BTN);
 
         // 拖图片文件到节点上 = 换底图，与官方 LoadImage 行为一致；
         // 返回 true 以抑制全局的「每张图建一个 LoadImage」行为。
@@ -140,10 +163,6 @@ app.registerExtension({
             if (!file) return false;
             e.preventDefault();
             e.stopPropagation();
-            if (upstreamLinked()) {
-                window.alert('本节点已连接上游图像：IMAGE 输出以上游为权威，拖进来的图不会成为底图。\n\n想用拖入的图当底图，请先断开上游连线。');
-                return true;
-            }
             try {
                 await applyFile(file);
             } catch (err) {
