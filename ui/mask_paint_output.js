@@ -1,12 +1,12 @@
 import { app } from '../../scripts/app.js';
 
 // ============================================================
-//  Mask Paint Output — 底图上传（粘贴 / 拖放）
+//  Mask Paint Output — 底图上传（粘贴 / 拖放）+ 取图模式接管上游
 //
-//  粘贴走官方机制：Vue 节点菜单里「粘贴图像」的判定只有
-//  typeof node.pasteFiles === 'function'（useImageMenuOptions.ts:18-20），
-//  菜单项本身由核心提供、读 navigator.clipboard 后调用 node.pasteFiles([file])。
-//  所以这里只实现 pasteFiles，不自己造按钮和剪贴板监听（否则会和核心重复上传）。
+//  粘贴有两条入口：官方菜单项「粘贴图像」的判定只有
+//  typeof node.pasteFiles === 'function'（useImageMenuOptions.ts:18-20），菜单项本身
+//  由核心提供、读 navigator.clipboard 后调用 node.pasteFiles([file])；常驻按钮
+//  「📋 粘贴底图」则自己读剪贴板（右键三层菜单太慢）。两者都只走 applyFile。
 //
 //  image widget 保持 STRING 而非 COMBO：遮罩编辑器保存时写入的值可能带
 //  " [input]" 后缀，COMBO 会按成员校验把它拒掉（execution.py:1059-1068 没有
@@ -63,9 +63,48 @@ app.registerExtension({
             // 经典画布模式下的预览靠 node.imgs；Vue 模式靠下面的单节点执行
             node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
             node.previewMediaType = 'image';
+            // 手动传图等同于「已经接管过当前上游」，否则紧接着的刷新运行会把它当成
+            // 未接管的上游新图、又把刚写的 widget 清掉。
+            rememberUpstream();
             node.graph?.setDirtyCanvas(true, true);
             await refreshByRunning();
         }
+
+        // ---------- 取图模式：上游换新图时作废当前绘制 ----------
+        // 遮罩编辑器优先读 image widget（useMaskEditorLoader.ts:106-111），widget 不清空
+        // 就会在旧图上画；后端也以 widget 为准，输出同样停在旧图旧遮罩上。
+        // 判定「上游变了」用 app.nodeOutputs 里的文件名，记录存在 node.properties 上，
+        // 随工作流 JSON 保存，所以刷新页面/切换工作流不会误清。
+        const stopW = node.widgets?.find((w) => w.name === 'stop_here');
+        const ADOPTED = 'psl_adopted_upstream';
+
+        function upstreamRefKey() {
+            const idx = node.inputs?.findIndex((i) => i.name === 'image_input');
+            if (idx === undefined || idx < 0) return null;
+            const link = node.getInputLink?.(idx);
+            if (!link) return null;
+            const img = app.nodeOutputs?.[link.origin_id]?.images?.[link.origin_slot];
+            if (!img?.filename) return null;
+            return `${img.subfolder || ''}/${img.filename}|${img.type || 'output'}`;
+        }
+
+        function rememberUpstream() {
+            const key = upstreamRefKey();
+            if (key) node.properties[ADOPTED] = key;
+        }
+
+        node.onExecuted = () => {
+            if (!stopW?.value) return;                 // 输出模式：当前图锁定，不动
+            const key = upstreamRefKey();
+            if (!key || key === node.properties[ADOPTED]) return;
+            node.properties[ADOPTED] = key;
+            if (!imageW.value) return;
+            imageW.value = '';
+            node.imgs = undefined;
+            // 刚才那次运行用的还是旧 widget，预览停在旧图上；再跑一次本节点让预览
+            // 换成接管后的上游图。stop_here 开着，下游不会被牵动。
+            refreshByRunning();
+        };
 
         // 官方「粘贴图像」菜单项的判定条件：存在 pasteFiles 函数。
         // 注意核心会先调 pasteFile 再调 pasteFiles，两个都实现会重复上传，只实现后者。
