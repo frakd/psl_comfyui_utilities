@@ -2,6 +2,7 @@ from .aspect_ratio_selector import AspectRatioSelectorNode
 from .audio_filter import AudioHarshnessSuppressor
 from .deep_vram_cleanup import DeepVRAMCleanup
 from .h3_av_lora import MiniMaxH3AVLoRAStack
+from .image_container import ImageContainer
 from .mask_paint_output import MaskPaintOutput
 from .model_reroute import ModelReroute
 from .refreshable_text_box import RefreshableTextBox
@@ -14,6 +15,7 @@ _NODE_CLASSES = (
     ModelReroute,
     MaskPaintOutput,
     RefreshableTextBox,
+    ImageContainer,
 )
 
 NODE_CLASS_MAPPINGS = {}
