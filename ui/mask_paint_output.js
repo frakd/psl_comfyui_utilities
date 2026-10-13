@@ -75,6 +75,7 @@ app.registerExtension({
         async function applyFile(file) {
             const info = await uploadBlob(file, file.name || `pasted-${Date.now()}.png`);
             const sub = info.subfolder || '';
+            discardEditorSession(imageW.value);
             imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
             // 经典画布模式下的预览靠 node.imgs；Vue 模式靠下面的单节点执行
             node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
@@ -101,6 +102,26 @@ app.registerExtension({
         const FP_LAST = 'psl_last_fp';         // 最近一次运行看到的上游指纹
         const LAST_STOP = 'psl_last_stop';
 
+        // ---- 旧会话作废：让遮罩编辑器不显示已被换掉的旧图 ----
+        // 编辑器加载器优先读 Vue widget store 里的 image 值；那个 store 扩展写不进
+        // （只有编辑器保存时核心才双写 store + LGraph widget），所以采纳上游或粘贴
+        // 换图后，store 里残留的上一个会话文件名会让编辑器显示旧图+旧遮罩。
+        // 加载器对 clipspace 会话有官方回退：图层文件加载失败就改用 node.images
+        // （节点当前预览）。这里调用后端路由删掉旧会话的两个图层文件来触发回退；
+        // clipspace-painted-masked 本体不动，其他节点可能还引用它。
+        const SESSION_RE = /^clipspace-painted-masked-(\d+)\.png/;
+
+        function discardEditorSession(value) {
+            if (typeof value !== 'string' || !SESSION_RE.test(value.trim())) return;
+            fetch('/psl/maskpaint/discard_session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: value }),
+            }).catch((e) => {
+                console.warn('[MaskPaintOutput] 作废旧遮罩会话图层失败（编辑器若显示旧图，重画一次即恢复）', e);
+            });
+        }
+
         function readFp(output) {
             const fp = output?.psl_fp;
             return Array.isArray(fp) ? (fp[0] ?? null) : (fp ?? null);
@@ -108,6 +129,7 @@ app.registerExtension({
 
         function adoptUpstream(fp) {
             node.properties[FP_BASE] = fp;
+            discardEditorSession(imageW.value);
             imageW.value = '';
             node.imgs = undefined;
         }

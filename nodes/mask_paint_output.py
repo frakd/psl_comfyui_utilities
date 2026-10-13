@@ -12,7 +12,11 @@ image_input，把 image 这个名字让给编辑器。
 IMAGE 与 MASK 永远取自**同一个文件**（image widget 指向的那张 PNG）：RGB -> IMAGE，
 alpha -> MASK。只有 widget 为空时才退回上游 image_input（此时 MASK 全零）。上游换了
 新图不会静默覆盖当前绘制结果 —— 接管由前端在 stop_here（取图模式）下清空 widget 完成，
-后端不猜。两者分辨率不一致时 MASK 退回全零：错位的遮罩比空遮罩更危险，而空遮罩在
+后端不猜。清空的同时前端会调用本模块的 discard_session 路由作废旧会话的图层文件：
+遮罩编辑器的加载器优先读 widget store（扩展拿不到写入通道，只有编辑器保存时才双写），
+残留的旧会话文件名会让它显示旧图+旧遮罩；删掉图层文件可触发它「图层 404 就回退到
+node.images」的官方路径，让编辑器如实显示当前预览。
+两者分辨率不一致时 MASK 退回全零：错位的遮罩比空遮罩更危险，而空遮罩在
 预览里一眼可见，不必打日志。
 
 预览 PNG 带 alpha（= 1 - MASK），所以运行前后节点显示的都是同一张「画过遮罩」的图；
@@ -20,9 +24,12 @@ alpha -> MASK。只有 widget 为空时才退回上游 image_input（此时 MASK
 遮罩走 MASK 插槽，合成由下游节点负责。
 """
 
+import logging
 import os
 import random
+import re
 import zlib
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -30,6 +37,8 @@ from PIL import Image
 
 import folder_paths
 import comfy.model_management
+from aiohttp import web
+from server import PromptServer
 from comfy_api.latest import io, InputImpl
 from comfy_execution.graph_utils import ExecutionBlocker
 
@@ -189,3 +198,58 @@ class MaskPaintOutput(io.ComfyNode):
             # 会弹一次 ExecutionBlocked 提示。
             return io.NodeOutput(ExecutionBlocker(None), ExecutionBlocker(None), ui=ui)
         return io.NodeOutput(images, mask, ui=ui)
+
+
+# ---------------------------------------------------------------------------
+# 遮罩编辑器会话失效路由
+#
+# 官方遮罩编辑器的加载器（useMaskEditorLoader）取图优先级：widget store 里的
+# image 值 > node.images（当前预览）。store 只有编辑器保存（setNodeWidgetValue
+# 双写 store + LGraph widget）和工作流加载会写，扩展侧拿不到写入通道；于是
+# 前端采纳上游/粘贴换图只改 LGraph widget 后，store 里残留的旧会话文件名会让
+# 编辑器显示旧图+旧遮罩。加载器对 clipspace 会话有一条官方回退：图层文件加载
+# 失败就改用 node.images。所以这里提供一条路由，把被作废会话的两个**图层文件**
+# 删掉以触发回退。只删 clipspace-mask-N / clipspace-paint-N，不删
+# clipspace-painted-masked-N 本体——加载器从不取它，而其他节点可能还引用着它。
+# ---------------------------------------------------------------------------
+_SESSION_NAME_RE = re.compile(r"^clipspace-painted-masked-(\d+)\.png(?:\s+\[[a-z]+\])?$")
+_SESSION_LAYER_TEMPLATES = ("clipspace-mask-{n}.png", "clipspace-paint-{n}.png")
+
+if PromptServer.instance is not None:
+
+    @PromptServer.instance.routes.post("/psl/maskpaint/discard_session")
+    async def discard_mask_editor_session(request):
+        """作废一个遮罩编辑器会话的图层文件，让编辑器回退到节点当前预览。"""
+        try:
+            body = await request.json()
+        except Exception as e:
+            return web.json_response({"error": f"请求体不是合法 JSON: {e}"}, status=400)
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return web.json_response({"error": "缺少 name 字段"}, status=400)
+        m = _SESSION_NAME_RE.match(name.strip())
+        if not m:
+            return web.json_response(
+                {"error": "不是 clipspace 遮罩会话文件名，拒绝处理", "name": name}, status=400)
+        n = m.group(1)
+        base = Path(folder_paths.get_input_directory()).resolve()
+        discarded, missing = [], []
+        for tpl in _SESSION_LAYER_TEMPLATES:
+            target = (base / tpl.format(n=n)).resolve()
+            # n 是纯正则捕获的数字串，本不含路径分隔符；这里再兜一层底防将来改动引入意外。
+            if base not in target.parents:
+                return web.json_response({"error": "解析路径越界"}, status=400)
+            if target.is_file():
+                try:
+                    target.unlink()
+                except OSError as e:
+                    logging.error("[MaskPaintOutput] 删除会话图层失败 %s: %s", target, e)
+                    return web.json_response({"error": f"删除 {target.name} 失败: {e}"}, status=500)
+                discarded.append(target.name)
+            else:
+                missing.append(target.name)
+        logging.info(
+            "[MaskPaintOutput] 已作废遮罩编辑器会话 n=%s（删除=%s，本就不存在=%s）",
+            n, discarded, missing,
+        )
+        return web.json_response({"discarded": discarded, "missing": missing})
