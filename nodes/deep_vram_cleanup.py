@@ -4,6 +4,7 @@ import ctypes
 import gc
 import logging
 import os
+import re
 import sys
 from typing import Tuple, List, Dict, Any
 
@@ -385,6 +386,19 @@ def _as_model_patcher(obj, label: str, lines: List[str]):
     return patcher
 
 
+def _collect_model_targets(models: dict = None, clips: dict = None, vaes: dict = None) -> List[Tuple[str, Any]]:
+    """把三组 autogrow dict（只含已连接项）整理成有序的 (标签, 端口对象) 列表。
+
+    键是 autogrow 展开名（model0 / models.model0 皆可能），标签里带上方便 diag 阅读与排重。
+    """
+    targets: List[Tuple[str, Any]] = []
+    for kind, values in (("MODEL", models or {}), ("CLIP", clips or {}), ("VAE", vaes or {})):
+        for key in sorted(values.keys(), key=str):
+            if values[key] is not None:
+                targets.append((f"{kind}[{key}]", values[key]))
+    return targets
+
+
 def _unload_selected_models(
     targets: List[Tuple[str, Any]],
     unload_additional_models: bool,
@@ -472,24 +486,35 @@ def _is_node_link(value) -> bool:
     )
 
 
-def _linked_source_node_id(unique_id, prompt) -> Tuple[Any, str]:
-    """从 prompt 图里读回本节点 cache_source 端口连的是哪个上游节点。
+# autogrow 展开后的 source 组键：source0..4 或 cache_sources.source0..4（序数一律取尾部）
+_SOURCE_KEY_RE = re.compile(r"(^|\.)source\d+$")
 
-    返回 (node_id 或 None, 失败原因)。节点执行时只能拿到解析后的值，链接本身只在 prompt 里。
+
+def _linked_source_node_ids(unique_id, prompt) -> Tuple[List[str], str]:
+    """从 prompt 图里读回 source 组全部端口连着的上游节点（去重、保序）。
+
+    返回 (node_id 列表, 失败原因)。节点执行时只能拿到解析后的值，
+    链接本身只在 prompt 里；autogrow 组的键名跨前端/后端有两种形态
+    （sourceN / cache_sources.sourceN），用正则统一匹配。
     """
     if unique_id is None:
-        return None, "拿不到本节点 id（hidden UNIQUE_ID 缺失）"
+        return [], "拿不到本节点 id（hidden UNIQUE_ID 缺失）"
     if not isinstance(prompt, dict) or not prompt:
-        return None, "拿不到 prompt 图（hidden PROMPT 缺失）"
+        return [], "拿不到 prompt 图（hidden PROMPT 缺失）"
     node = prompt.get(str(unique_id))
     if node is None:
         node = prompt.get(unique_id)
     if not isinstance(node, dict):
-        return None, f"prompt 图里找不到本节点 #{unique_id}"
-    link = (node.get("inputs") or {}).get("cache_source")
-    if not _is_node_link(link):
-        return None, "cache_source 端口没有连线"
-    return str(link[0]), ""
+        return [], f"prompt 图里找不到本节点 #{unique_id}"
+    ids: List[str] = []
+    for key, value in (node.get("inputs") or {}).items():
+        if not _SOURCE_KEY_RE.search(key):
+            continue
+        if _is_node_link(value):
+            sid = str(value[0])
+            if sid not in ids:
+                ids.append(sid)
+    return ids, ("" if ids else "source 端口没有连线")
 
 
 def _node_consumers(node_id, prompt) -> List[str]:
@@ -741,15 +766,18 @@ class DeepVRAMCleanup(io.ComfyNode):
     --------------------  --  ----------------------------------------------
     第一组 运行缓存
     clear_all_node_cache    清空所有中间节点输出缓存（全局）
-    clear_source_node_cache 只清 cache_source 连着的那个节点的缓存条目
+    clear_source_node_cache 只清 source 组可增长端口连着的那些节点的缓存条目
     第二组 模型
     unload_models            卸载所有已加载模型（全局）
-    unload_connected_models  只卸 model/clip/vae 端口连着的那个模型
+    unload_connected_models  只卸 models/clips/vaes 可增长端口连进来的全部模型
     第三组 收尾释放
     gc_empty_cache           gc.collect() + torch.cuda.empty_cache()
     trim_cuda_pool           Direct cudaMemPoolTrimTo(0) (cudaMallocAsync)
     purge_orphan_tensors     Hunt & detach stray CUDA tensors from heap
     --------------------  --  ----------------------------------------------
+    输入组是 io.Autogrow 可增长列表（同 AnySwitch）：每组初始 1 个口，
+    连满自动长出下一个（models/clips/vaes/cache_sources 各最多 5 个），
+    执行侧 dict 只含已连接项。
     """
 
     @classmethod
@@ -766,7 +794,7 @@ class DeepVRAMCleanup(io.ComfyNode):
                 io.Boolean.Input("clear_all_node_cache", default=True,
                     tooltip="【清缓存 · 全局】清空 ComfyUI 所有节点的中间输出缓存。每个节点跑完后的输出会被缓存以加速下次执行，但也因此持有大量中间 tensor 的引用。此开关清除所有已缓存的中间结果，不影响已加载的模型。\n\n这是腾内存的主力（中间结果占的往往是内存里的大头）。代价：清掉后所有分支都得重算，缓存加速失效。\n\n与下面 clear_source_node_cache（只清连线指定的那一个节点）是一对：全清粗暴但彻底，定向清理精细但有前提。"),
                 io.Boolean.Input("clear_source_node_cache", default=True,
-                    tooltip="【清缓存 · 只清指定的】清掉 cache_source 端口连着的那个节点在「运行缓存」里的输出条目（只清它一个，不动其它节点）。\n\n用途：把某个节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它占用的内存/显存引用；代价是下次需要这个输出时该节点会重新执行。比上面的全局清理精细得多。\n\n注意：全局清理 clear_all_node_cache 开启时本开关会被跳过（全清已覆盖）。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"),
+                    tooltip="【清缓存 · 只清指定的】清掉 source 组可增长端口连着的那些节点在「运行缓存」里的输出条目（只清它们，不动其它节点；可以接多个，逐一清理）。\n\n用途：把某些节点的中间结果（比如一整张 IMAGE、latent）从缓存里摘出来，解除它们占用的内存/显存引用；代价是下次需要这些输出时对应节点会重新执行。比上面的全局清理精细得多。\n\n注意：全局清理 clear_all_node_cache 开启时本开关会被跳过（全清已覆盖）。\n\n安全性（已读码确认）：只在目标节点没有「其它待执行的下游消费者」时才真正删条目。否则跳过并在 diag 里说明——因为下游是从边缓存读取的，删主缓存要么被它写回（引用没断），要么让它重新入队重算（两个消费者可能拿到不同的值）。\n\n注意：只作用于 outputs 缓存（节点输出）。objects 缓存里放的是节点实例本身（含它自己的内部状态，例如缓存好的 LoRA），故意不动。\n\n未连线时本开关不做事。"),
                 # ===== 第二组：模型（全局卸 -> 只卸连线模型）=====
                 io.Boolean.Input("unload_models", default=False,
                     tooltip="【卸模型 · 全局】卸载 ComfyUI 模型管理中所有已加载的模型（checkpoint / LoRA / VAE 等）。清理后再次生成图像需要重新加载模型，会有短暂延迟。日常不建议开启，除非内存/显存极度紧张。"),
@@ -788,10 +816,36 @@ class DeepVRAMCleanup(io.ComfyNode):
                 io.AnyType.Input("passthrough2", optional=True),
                 io.AnyType.Input("passthrough3", optional=True),
                 io.AnyType.Input("passthrough4", optional=True),
-                io.Model.Input("model", optional=True, tooltip="接在这里的 diffusion 模型（checkpoint / UNET）会被单独卸载，其它已加载模型不动。\n\n配合 unload_connected_models 开关使用。LoRA patch 会被一并 unpatch，下次用到时重新加载。"),
-                io.Clip.Input("clip", optional=True, tooltip="接在这里的 text encoder 会被单独卸载，不碰 diffusion 模型和 VAE。\n\n注意落点：显存不紧张时 ComfyUI 会把 TE 常驻在系统内存而不是显存（text_encoder_device() 在低显存/非 --gpu-only 时直接返回 cpu）。本节点会按目标自身所在的设备补卸，所以内存里的 TE 同样会被解下——但主机内存常驻时，基础权重要等执行缓存释放引用后才真正归还，diag 里会标注这一点。\n\n下次 CLIPTextEncode 执行时会重新从磁盘加载。"),
-                io.Vae.Input("vae", optional=True, tooltip="接在这里的 VAE 会被单独卸载。\n\nVAE 体积小、重载快，跑完大分辨率解码后卸载它是纯赚的。"),
-                io.AnyType.Input("cache_source", optional=True, tooltip="把「要清运行缓存的节点」的任意一个输出接到这里。\n\n节点执行时只能拿到解析后的值，链接本身只存在于 prompt 图里——所以上游节点号是从隐藏输入 PROMPT 里按本节点 id 读回来的，这样不需要你手填节点号。\n\n作用对象是这一个节点在 outputs 缓存里的条目（含它缓存的 tensor / ModelPatcher 输出），不是全清。配合 clear_source_node_cache 开关使用。"),
+                # ===== 可增长输入组（io.Autogrow，同 AnySwitch 机制：连满自动长、断开自动收）=====
+                # min=0：初始每组 1 个口，全部按 optional 展开；执行侧 dict 只含已连接项。
+                io.Autogrow.Input(
+                    "models",
+                    template=io.Autogrow.TemplatePrefix(
+                        io.Model.Input("model"), prefix="model", min=0, max=5),
+                    optional=True,
+                    tooltip="可增长的 diffusion 模型输入（model0…model4）。接进来的每一个都会被单独卸载，其它已加载模型不动。配合 unload_connected_models 开关使用。",
+                ),
+                io.Autogrow.Input(
+                    "clips",
+                    template=io.Autogrow.TemplatePrefix(
+                        io.Clip.Input("clip"), prefix="clip", min=0, max=5),
+                    optional=True,
+                    tooltip="可增长的 text encoder 输入（clip0…clip4）。接进来的每一个都会被单独卸载，不碰 diffusion 模型和 VAE。显存不紧张时 TE 常驻在系统内存——本节点会按目标自身所在设备补卸。",
+                ),
+                io.Autogrow.Input(
+                    "vaes",
+                    template=io.Autogrow.TemplatePrefix(
+                        io.Vae.Input("vae"), prefix="vae", min=0, max=5),
+                    optional=True,
+                    tooltip="可增长的 VAE 输入（vae0…vae4）。接进来的每一个都会被单独卸载。VAE 体积小、重载快，跑完大分辨率解码后卸载是纯赚的。",
+                ),
+                io.Autogrow.Input(
+                    "cache_sources",
+                    template=io.Autogrow.TemplatePrefix(
+                        io.AnyType.Input("source"), prefix="source", min=0, max=5),
+                    optional=True,
+                    tooltip="可增长的「要清运行缓存的节点」输入（source0…source4）：把要清的节点的任意输出接进来，可以接多个，逐一清理。\n\n节点执行时只能拿到解析后的值，链接本身只存在于 prompt 图里——所以上游节点号是从隐藏输入 PROMPT 里按本节点 id 读回来的（同一个上游接多个口会自动去重）。配合 clear_source_node_cache 开关使用。",
+                ),
             ],
             outputs=[
                 io.AnyType.Output("passthrough1", display_name="passthrough1"),
@@ -832,10 +886,10 @@ class DeepVRAMCleanup(io.ComfyNode):
         passthrough2=None,
         passthrough3=None,
         passthrough4=None,
-        model=None,
-        clip=None,
-        vae=None,
-        cache_source=None,
+        models: dict = None,
+        clips: dict = None,
+        vaes: dict = None,
+        cache_sources: dict = None,
     ):
         # hidden 输入（unique_id / prompt / execution_list）由 V3 框架经
         # PREPARE_CLASS_CLONE 挂到 cls.hidden 上，不再是 execute 的形参。
@@ -848,7 +902,7 @@ class DeepVRAMCleanup(io.ComfyNode):
             n = _find_and_clear_execution_caches()
             logging.info("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
 
-        # 指定节点的运行缓存（只清 cache_source 连着的那个节点）
+        # 指定节点的运行缓存（只清 source 组端口连着的那些节点，可多个、自动去重）
         cache_lines: List[str] = []
         if clear_source_node_cache:
             if clear_all_node_cache:
@@ -857,22 +911,23 @@ class DeepVRAMCleanup(io.ComfyNode):
                 cache_lines.append(msg)
             else:
                 hidden = cls.hidden
-                source_id, why = _linked_source_node_id(hidden.unique_id, hidden.prompt)
-                if source_id is None:
+                source_ids, why = _linked_source_node_ids(hidden.unique_id, hidden.prompt)
+                if not source_ids:
                     msg = f"指定节点缓存清理已开启，但没找到目标节点：{why}"
                     logging.warning("[DeepVRAMCleanup] %s", msg)
                     cache_lines.append(msg)
                 else:
                     logging.info(
-                        "[DeepVRAMCleanup] 准备清理节点 #%s 的运行缓存（由 #%s 连线指定）",
-                        source_id, hidden.unique_id,
+                        "[DeepVRAMCleanup] 准备清理 %d 个节点的运行缓存（由 source 连线指定）: %s",
+                        len(source_ids), source_ids,
                     )
-                    cache_lines = _evict_node_output_cache(
-                        source_id, hidden.execution_list, hidden.unique_id, hidden.prompt
-                    )
-        elif cache_source is not None:
+                    for source_id in source_ids:
+                        cache_lines.extend(_evict_node_output_cache(
+                            source_id, hidden.execution_list, hidden.unique_id, hidden.prompt
+                        ))
+        elif cache_sources:
             logging.info(
-                "[DeepVRAMCleanup] cache_source 已连线，但 clear_source_node_cache 未开启，保持不变"
+                "[DeepVRAMCleanup] source 端口已连线，但 clear_source_node_cache 未开启，保持不变"
             )
 
         # ===================== 第二组：模型 =====================
@@ -885,13 +940,9 @@ class DeepVRAMCleanup(io.ComfyNode):
                 logging.info("[DeepVRAMCleanup] %s", msg)
                 unload_lines.append(msg)
             else:
-                targets = [
-                    (label, obj)
-                    for label, obj in (("MODEL", model), ("CLIP", clip), ("VAE", vae))
-                    if obj is not None
-                ]
+                targets = _collect_model_targets(models, clips, vaes)
                 if not targets:
-                    msg = "指定卸载已开启，但 model / clip / vae 三个端口都没连线，未卸载任何模型"
+                    msg = "指定卸载已开启，但 model / clip / vae 组里没有任何连线，未卸载任何模型"
                     logging.warning("[DeepVRAMCleanup] %s", msg)
                     unload_lines.append(msg)
                 else:
@@ -900,9 +951,9 @@ class DeepVRAMCleanup(io.ComfyNode):
                         unload_additional_models=True,
                         all_devices=True,
                     )
-        elif model is not None or clip is not None or vae is not None:
+        elif any((models, clips, vaes)):
             logging.info(
-                "[DeepVRAMCleanup] model/clip/vae 端口已连线，但 unload_connected_models 未开启，保持不变"
+                "[DeepVRAMCleanup] model/clip/vae 组已连线，但 unload_connected_models 未开启，保持不变"
             )
 
         if unload_models:
