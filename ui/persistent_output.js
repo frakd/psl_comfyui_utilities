@@ -8,9 +8,14 @@ import { app } from '../../scripts/app.js';
 //       + 行尾「释放」按钮（整组释放：图像+音频一起）
 //    2. 释放按槽整组控制；节点从画布删除时自动全清，不留孤儿内存
 //  标注存 labels_json 隐藏 widget（serialize=false 不进 prompt，随工作流保存）。
+//
+//  释放按钮三态反馈：空闲（有内容才可点）→ 释放中…（请求期间）→
+//  ✓ 已释放（短暂成功反馈后回落）。行左侧色点+文本显示该槽概要，
+//  点击有没有生效一眼可见。
 // ============================================================
 
 const SLOT_COUNT = 3;
+const SUCCESS_FLASH_MS = 1400;
 
 let stylesInjected = false;
 
@@ -31,10 +36,11 @@ function injectStyles() {
         }
         .pi-row {
             display: flex;
-            align-items: stretch;
+            align-items: center;
             gap: 6px;
             flex: 1 1 0;
             min-height: 0;
+            min-width: 0;
         }
         /* 标注框 = 行首标题：占满剩余宽度，随节点拉宽变长 */
         .pi-label {
@@ -48,25 +54,47 @@ function injectStyles() {
             font-family: monospace;
             padding: 3px 7px;
             box-sizing: border-box;
+            height: 100%;
         }
         .pi-label::placeholder { color: #666; }
         .pi-label:focus { outline: 1px solid #4a7ab0; border-color: #4a7ab0; }
         /* 空槽的标注框压暗：一眼看出这组没内容 */
         .pi-row.empty .pi-label { color: #556; border-color: #2a2a2a; }
         .pi-row.empty .pi-label::placeholder { color: #4a4a4a; }
+        /* 释放按钮：固定宽度不收缩，保证每行的按钮列对齐 */
         .pi-release {
             flex: 0 0 auto;
+            width: 62px;
+            height: 100%;
             background: #3d3d3d;
             color: #e5e5e5;
             border: 1px solid #555;
             border-radius: 4px;
             font-size: 12px;
-            padding: 3px 10px;
+            padding: 3px 0;
             cursor: pointer;
             white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            transition: background 0.25s, border-color 0.25s, color 0.25s;
         }
-        .pi-release:hover { filter: brightness(1.18); }
-        .pi-release:disabled { opacity: 0.35; cursor: default; filter: none; }
+        .pi-release:hover:not(:disabled) { filter: brightness(1.18); }
+        .pi-release:disabled { cursor: default; filter: none; }
+        .pi-row.empty .pi-release { opacity: 0.35; }
+        /* 释放中：按钮变暗蓝，文字换成 释放中… */
+        .pi-release.busy {
+            background: #2c5d8f;
+            border-color: #3f79ad;
+            color: #fff;
+            opacity: 1;
+        }
+        /* 成功：绿色一闪 */
+        .pi-release.done {
+            background: #2c7a4b;
+            border-color: #3f9a63;
+            color: #fff;
+            opacity: 1;
+        }
     `;
     document.head.appendChild(s);
 }
@@ -89,6 +117,7 @@ function releaseRequest(nodeId, target) {
         body: JSON.stringify({ node_id: nodeId, target }),
     }).catch((e) => {
         console.warn('[PersistentOutput] 释放请求失败', e);
+        return null;
     });
 }
 
@@ -154,10 +183,25 @@ app.registerExtension({
             releaseBtn.addEventListener('click', async (e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                if (releaseBtn.disabled) return;
                 releaseBtn.disabled = true;
-                await releaseRequest(node.id, `slot${i + 1}`);
-                releaseBtn.disabled = false;
-                refreshStatus();
+                releaseBtn.classList.remove('done');
+                releaseBtn.classList.add('busy');
+                releaseBtn.textContent = '释放中…';
+                try {
+                    await releaseRequest(node.id, `slot${i + 1}`);
+                    releaseBtn.classList.remove('busy');
+                    releaseBtn.classList.add('done');
+                    releaseBtn.textContent = '✓ 已释放';
+                } finally {
+                    refreshStatus();
+                    // 成功反馈停留片刻后回落（期间按钮保持禁用，防连点）
+                    setTimeout(() => {
+                        releaseBtn.classList.remove('done');
+                        releaseBtn.disabled = false;
+                        refreshStatus();
+                    }, SUCCESS_FLASH_MS);
+                }
             });
 
             row.append(label, releaseBtn);
@@ -172,10 +216,15 @@ app.registerExtension({
                 const held = typeof slots?.[i] === 'string' && slots[i] !== '未保留';
                 rows[i].row.classList.toggle('empty', !held);
                 const summary = held ? slots[i] : '';
-                rows[i].releaseBtn.disabled = !held;
-                rows[i].releaseBtn.title = held
-                    ? `释放槽 ${i + 1} 保留的全部内容（${summary}），内存立即回收`
-                    : `槽 ${i + 1} 当前没有保留内容`;
+                const btn = rows[i].releaseBtn;
+                // busy/done 两态的文案不被刷新覆盖；只有空闲态才同步文案与禁用
+                if (!btn.classList.contains('busy') && !btn.classList.contains('done')) {
+                    btn.disabled = !held;
+                    btn.textContent = '释放';
+                    btn.title = held
+                        ? `释放槽 ${i + 1} 保留的全部内容（${summary}），内存立即回收`
+                        : `槽 ${i + 1} 当前没有保留内容`;
+                }
             }
         }
 

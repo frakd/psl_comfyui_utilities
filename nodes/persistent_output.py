@@ -124,23 +124,24 @@ class PersistentOutput(io.ComfyNode):
             # 回放路径才真的跑得起来；也让「运行到此节点」可用。
             is_output_node=True,
             inputs=[
+                # 交错排列：图像1,音频1,图像2,音频2,… 与每组语义对应，视觉上一组紧挨一组
                 *[
-                    io.Image.Input(
-                        f"image_{i}",
-                        display_name=f"图像 {i}",
-                        optional=True,
-                        tooltip=f"槽 {i} 的图像批次（视频帧）。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
-                    )
+                    inp
                     for i in range(1, SLOT_COUNT + 1)
-                ],
-                *[
-                    io.Audio.Input(
-                        f"audio_{i}",
-                        display_name=f"音频 {i}",
-                        optional=True,
-                        tooltip=f"槽 {i} 的音频。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
+                    for inp in (
+                        io.Image.Input(
+                            f"image_{i}",
+                            display_name=f"图像 {i}",
+                            optional=True,
+                            tooltip=f"槽 {i} 的图像批次（视频帧）。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
+                        ),
+                        io.Audio.Input(
+                            f"audio_{i}",
+                            display_name=f"音频 {i}",
+                            optional=True,
+                            tooltip=f"槽 {i} 的音频。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
+                        ),
                     )
-                    for i in range(1, SLOT_COUNT + 1)
                 ],
                 io.String.Input(
                     "labels_json",
