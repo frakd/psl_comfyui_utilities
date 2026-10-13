@@ -292,8 +292,12 @@ app.registerExtension({
         // ---------- DOM ----------
         const root = document.createElement('div');
         root.className = 'ic-root';
+        // 只给下限、不给上限：核心布局分配（_arrangeWidgets -> distributeSpace）里
+        // widget 的 maxSize = maxHeight ?? Infinity，读不到 --comfy-widget-max-height
+        // 时容器会吃掉节点拉高腾出的全部剩余空间——元素由 Vue 渲染器挂成 h-full，
+        // 高度严格跟随外围节点尺寸。之前写死的 620px 上限就是「节点拉高后
+        // 容器不跟着长、下方留一大片空白」的原因；节点缩小时回落到 240px 下限。
         root.style.setProperty('--comfy-widget-min-height', '240px');
-        root.style.setProperty('--comfy-widget-max-height', '620px');
 
         const header = document.createElement('div');
         header.className = 'ic-header';
