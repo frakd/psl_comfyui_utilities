@@ -139,14 +139,20 @@ app.registerExtension({
         labelsW.options = labelsW.options || {};
         labelsW.options.serialize = false;   // 不进 prompt（缓存不受标注影响），随工作流文件保存
 
-        // gen widget：存储代数。前端在 serializeValue 里把后端告知的最新代数写进
-        // prompt —— release 递增代数（经 onExecuted 的 psl_gen 送达前端）后，下一次
-        // 排队的缓存签名必然变化，节点重跑并产出新鲜 ui（否则缓存命中会重放上一轮
-        // 旧快照，把前端状态盖暗——实测踩过：亮→暗→亮）。
+        // gen widget：排队序号。serializeValue 每次排队自增——本节点的缓存签名
+        // 每轮必变 ⇒ **每轮必重跑**，彻底消灭"缓存命中重放旧 ui 快照"（前端被旧
+        // 状态盖暗的根因，实测亮→暗→亮）。本节点是输出节点、无下游计算依赖，
+        // 重跑成本≈0（只是从内存存储读引用组装输出），这是"让 comfyui 知道
+        // 节点状态变了"的最可靠答案：不靠任何事件同步，签名必然不同。
+        // 后端的 not_idempotent=True 与代数机制保留作纵深防御。
         const genW = node.widgets?.find((w) => w.name === 'gen');
         if (genW) {
             genW.hidden = true;
-            genW.serializeValue = () => String(node.properties?.psl_gen ?? '');
+            genW.serializeValue = () => {
+                const next = (parseInt(node.properties?.psl_gen ?? '0', 10) || 0) + 1;
+                node.properties.psl_gen = String(next);
+                return String(next);
+            };
         }
 
         let labels = ['', '', ''];

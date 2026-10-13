@@ -270,6 +270,13 @@ class PersistentOutput(io.ComfyNode):
             )
         del labels_json   # UI-only，后端不消费；形参仅防前端脚本未生效时报多余 kwarg
 
+        # 临时探针：确认本轮 execute 真的在跑（缓存命中时根本不会进到这里）。
+        logging.info(
+            "[PersistentOutput] execute uid=%s gen_in=%r 有输入=%s",
+            uid, gen, [img is not None or aud is not None for img, aud in
+                       ((image_1, audio_1), (image_2, audio_2), (image_3, audio_3))],
+        )
+
         inputs = [(image_1, audio_1), (image_2, audio_2), (image_3, audio_3)]
         outs = []
         for i, (img, aud) in enumerate(inputs):
