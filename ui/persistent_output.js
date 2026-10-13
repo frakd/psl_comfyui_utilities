@@ -139,6 +139,16 @@ app.registerExtension({
         labelsW.options = labelsW.options || {};
         labelsW.options.serialize = false;   // 不进 prompt（缓存不受标注影响），随工作流文件保存
 
+        // gen widget：存储代数。前端在 serializeValue 里把后端告知的最新代数写进
+        // prompt —— release 递增代数（经 onExecuted 的 psl_gen 送达前端）后，下一次
+        // 排队的缓存签名必然变化，节点重跑并产出新鲜 ui（否则缓存命中会重放上一轮
+        // 旧快照，把前端状态盖暗——实测踩过：亮→暗→亮）。
+        const genW = node.widgets?.find((w) => w.name === 'gen');
+        if (genW) {
+            genW.hidden = true;
+            genW.serializeValue = () => String(node.properties?.psl_gen ?? '');
+        }
+
         let labels = ['', '', ''];
 
         function readLabels() {
@@ -192,10 +202,14 @@ app.registerExtension({
                 releaseBtn.classList.add('busy');
                 releaseBtn.textContent = '释放中…';
                 try {
-                    await releaseRequest(node.id, `slot${i + 1}`);
+                    const resp = await releaseRequest(node.id, `slot${i + 1}`);
                     releaseBtn.classList.remove('busy');
                     releaseBtn.classList.add('done');
                     releaseBtn.textContent = '✓ 已释放';
+                    // 释放已递增后端存储代数：立即记下，下次排队写入 prompt 保证缓存必 miss
+                    if (resp?.gen !== undefined && resp?.gen !== null) {
+                        node.properties.psl_gen = String(resp.gen);
+                    }
                 } finally {
                     refreshStatus();
                     // 成功反馈停留片刻后回落（期间按钮保持禁用，防连点）
@@ -255,6 +269,11 @@ app.registerExtension({
             prevOnExecuted?.apply(this, arguments);
             const slots = output?.psl_slots;
             if (Array.isArray(slots) && slots.length === SLOT_COUNT) applySlots(slots);
+            const gen = output?.psl_gen;
+            if (gen !== undefined && gen !== null) {
+                // 后端告知当前存储代数；下次排队写入 prompt，保证 release 后必 miss
+                node.properties.psl_gen = String(gen);
+            }
             scheduleRefresh(0);
             scheduleRefresh(600);
         };

@@ -37,6 +37,15 @@ SLOT_COUNT = 3
 # 只存内存：不序列化、不落盘，进程退出随进程消失。
 _STORE: dict[str, list[dict]] = {}
 
+# 存储代数：每次 release 递增。进入缓存签名（见 execute 的 gen widget），
+# 让「release 之后的第一轮」缓存必然 miss 重跑，前端拿到新鲜 ui 而不是
+# 上一轮的旧快照（缓存命中重放旧 ui 是实测踩过的坑）。
+_GENERATION: dict[str, int] = {}
+
+
+def _bump_generation(uid: str) -> None:
+    _GENERATION[uid] = _GENERATION.get(uid, 0) + 1
+
 # unique_id -> 本节点最近一次执行时的 outputs 缓存对象（全局 CacheSet 的成员，
 # 跨运行长期存活）。释放路由没有 hidden 上下文，只能靠这里存的句柄去摘
 # 本节点自己的缓存条目。
@@ -131,6 +140,9 @@ def release(uid: str, target: str = "all") -> bool:
             _STORE.pop(uid, None)
     if had_any:
         _evict_own_cache_entry(uid)
+        # 释放改变了槽状态：递增代数让下一轮缓存签名必变（见 execute 的 gen widget），
+        # 防止缓存命中重放旧 ui 快照把前端盖暗。
+        _bump_generation(uid)
     if key_gone:
         # 键已删，句柄失去存在意义（下次 execute 会重新存），一并清掉
         _CACHE_HANDLES.pop(uid, None)
@@ -172,6 +184,12 @@ class PersistentOutput(io.ComfyNode):
             node_id="PersistentOutput",
             search_aliases=["persist", "保留", "记忆", "回放", "桥接", "跨运行", "对比", "replay"],
             display_name="Persistent Output",
+            # 缓存命中时核心会重放上一轮的 ui 快照（emit_cached_output，execution.py:449）——
+            # 槽状态在此期间被 release 改过的话，前端就被旧快照盖暗（用户实测踩过：
+            # 亮→暗→亮）。声明 not_idempotent 把 unique_id 纳入缓存签名还不够；
+            # 真正的对策是让缓存签名里带上"存储代数"：release 递增代数 → 签名变 →
+            # 必然 miss 重跑 → ui 新鲜。见 _bump_generation 与 execute 的 selection 注入。
+            not_idempotent=True,
             category="utils/compare",
             description=(
                 "跨运行保留输入（3 组槽位，每组=图像批次+音频）：某槽本轮有输入则桥接"
@@ -216,6 +234,16 @@ class PersistentOutput(io.ComfyNode):
                         "仅作兼容保留。"
                     ),
                 ),
+                io.String.Input(
+                    "gen",
+                    default="",
+                    optional=True,
+                    tooltip=(
+                        "存储代数（内部防缓存机制）：release 会递增它，使下一轮缓存签名"
+                        "必然变化、节点重跑并产出新鲜 ui（否则缓存命中会重放上一轮的旧"
+                        "ui 快照，把前端状态盖暗）。由前端 serializeValue 写入，不要手填。"
+                    ),
+                ),
             ],
             hidden=[io.Hidden.unique_id],
             outputs=[
@@ -233,7 +261,7 @@ class PersistentOutput(io.ComfyNode):
     @classmethod
     def execute(cls, image_1=None, audio_1=None,
                 image_2=None, audio_2=None,
-                image_3=None, audio_3=None, labels_json="[]"):
+                image_3=None, audio_3=None, labels_json="[]", gen=""):
         uid = cls.hidden.unique_id
         if uid is None:
             raise ValueError(
@@ -261,7 +289,7 @@ class PersistentOutput(io.ComfyNode):
         out_cache = getattr(el, "output_cache", None)
         if out_cache is not None:
             _CACHE_HANDLES[uid] = out_cache
-        return io.NodeOutput(*outs, ui={"psl_slots": describe(uid)})
+        return io.NodeOutput(*outs, ui={"psl_slots": describe(uid), "psl_gen": _GENERATION.get(uid, 0)})
 
 
 # ---------------------------------------------------------------------------
@@ -298,4 +326,4 @@ if getattr(PromptServer, "instance", None) is not None:
             return web.json_response({"error": f"未知 target: {target!r}"}, status=400)
         had = release(uid, target)
         logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
-        return web.json_response({"released": had, "slots": describe(uid)})
+        return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
