@@ -219,7 +219,9 @@ class MaskPaintOutput(io.ComfyNode):
 _SESSION_NAME_RE = re.compile(r"^clipspace-painted-masked-(\d+)\.png(?:\s+\[[a-z]+\])?$")
 _SESSION_LAYER_TEMPLATES = ("clipspace-mask-{n}.png", "clipspace-paint-{n}.png")
 
-if PromptServer.instance is not None:
+# getattr 而非 PromptServer.instance：instance 只在服务器 __init__ 里赋值、
+# 没有类级默认，服务器未起时直接访问会 AttributeError 而不是得到 None。
+if getattr(PromptServer, "instance", None) is not None:
 
     @PromptServer.instance.routes.post("/psl/maskpaint/discard_session")
     async def discard_mask_editor_session(request):
