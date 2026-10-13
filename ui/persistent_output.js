@@ -269,7 +269,8 @@ app.registerExtension({
             prevOnExecuted?.apply(this, arguments);
             const slots = output?.psl_slots;
             if (Array.isArray(slots) && slots.length === SLOT_COUNT) applySlots(slots);
-            const gen = output?.psl_gen;
+            // psl_gen 后端包了一层 list（ui 标量必须包 list，见后端注释）
+            const gen = Array.isArray(output?.psl_gen) ? output.psl_gen[0] : output?.psl_gen;
             if (gen !== undefined && gen !== null) {
                 // 后端告知当前存储代数；下次排队写入 prompt，保证 release 后必 miss
                 node.properties.psl_gen = String(gen);

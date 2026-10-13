@@ -289,7 +289,10 @@ class PersistentOutput(io.ComfyNode):
         out_cache = getattr(el, "output_cache", None)
         if out_cache is not None:
             _CACHE_HANDLES[uid] = out_cache
-        return io.NodeOutput(*outs, ui={"psl_slots": describe(uid), "psl_gen": _GENERATION.get(uid, 0)})
+        # ui 值一律包一层 list：execution.py:422 合并多个 ui 时按 key 把值当可迭代
+        # 展开（{k: [y for x in uis for y in x[k]]}），裸标量（int/str）会直接炸
+        # "'int' object is not iterable"（实测踩过）。
+        return io.NodeOutput(*outs, ui={"psl_slots": describe(uid), "psl_gen": [_GENERATION.get(uid, 0)]})
 
 
 # ---------------------------------------------------------------------------
@@ -327,3 +330,4 @@ if getattr(PromptServer, "instance", None) is not None:
         had = release(uid, target)
         logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
+
