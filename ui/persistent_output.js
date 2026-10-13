@@ -28,18 +28,19 @@ function injectStyles() {
         .pi-root {
             display: flex;
             flex-direction: column;
-            gap: 4px;
-            padding: 4px 6px;
+            gap: 5px;
+            padding: 5px 6px;
             box-sizing: border-box;
             width: 100%;
             height: 100%;
         }
+        /* 行高由内容决定（26px），不被容器均分压缩——之前 flex:1 均分 84px 容器，
+           每行只剩 ~22px，按钮文字被上下裁掉；钉死行高后字完整、按钮也更好点 */
         .pi-row {
             display: flex;
-            align-items: center;
+            align-items: stretch;
             gap: 6px;
-            flex: 1 1 0;
-            min-height: 0;
+            flex: 0 0 26px;
             min-width: 0;
         }
         /* 标注框 = 行首标题：占满剩余宽度，随节点拉宽变长 */
@@ -52,16 +53,15 @@ function injectStyles() {
             color: #9ecbe8;
             font-size: 12px;
             font-family: monospace;
-            padding: 3px 7px;
+            padding: 0 7px;
             box-sizing: border-box;
-            height: 100%;
         }
         .pi-label::placeholder { color: #666; }
         .pi-label:focus { outline: 1px solid #4a7ab0; border-color: #4a7ab0; }
         /* 空槽的标注框压暗：一眼看出这组没内容 */
         .pi-row.empty .pi-label { color: #556; border-color: #2a2a2a; }
         .pi-row.empty .pi-label::placeholder { color: #4a4a4a; }
-        /* 释放按钮：固定宽度不收缩，保证每行的按钮列对齐 */
+        /* 释放按钮：固定宽度不收缩，保证每行的按钮列对齐；行高 26px 全高 */
         .pi-release {
             flex: 0 0 auto;
             width: 62px;
@@ -71,7 +71,8 @@ function injectStyles() {
             border: 1px solid #555;
             border-radius: 4px;
             font-size: 12px;
-            padding: 3px 0;
+            padding: 0;
+            line-height: 1;
             cursor: pointer;
             white-space: nowrap;
             overflow: hidden;
@@ -154,9 +155,10 @@ app.registerExtension({
 
         const root = document.createElement('div');
         root.className = 'pi-root';
-        // 三行行高固定，整体钉死（不设 max 会被节点拉高撑开，无意义）
-        root.style.setProperty('--comfy-widget-min-height', '84px');
-        root.style.setProperty('--comfy-widget-max-height', '84px');
+        // 高度钉死 = 3 行 x 26px + 2 gap x 5px + 上下 padding 10px = 98px。
+        // 行高是内容决定不再均分，容器必须给足，否则又会裁字。
+        root.style.setProperty('--comfy-widget-min-height', '98px');
+        root.style.setProperty('--comfy-widget-max-height', '98px');
 
         const rows = [];
         for (let i = 0; i < SLOT_COUNT; i++) {
