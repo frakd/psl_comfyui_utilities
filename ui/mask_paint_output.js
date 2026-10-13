@@ -76,6 +76,7 @@ app.registerExtension({
             const info = await uploadBlob(file, file.name || `pasted-${Date.now()}.png`);
             const sub = info.subfolder || '';
             discardEditorSession(imageW.value);
+            pendingOverwrite = true;   // 运行完成后用粘贴图覆写 store 残留会话的 composite
             imageW.value = `${sub ? sub + '/' : ''}${info.name} [${info.type || 'input'}]`;
             // 经典画布模式下的预览靠 node.imgs；Vue 模式靠下面的单节点执行
             node.imgs = [{ filename: info.name, subfolder: sub, type: info.type || 'input' }];
@@ -105,11 +106,46 @@ app.registerExtension({
         // ---- 旧会话作废：让遮罩编辑器不显示已被换掉的旧图 ----
         // 编辑器加载器优先读 Vue widget store 里的 image 值；那个 store 扩展写不进
         // （只有编辑器保存时核心才双写 store + LGraph widget），所以采纳上游或粘贴
-        // 换图后，store 里残留的上一个会话文件名会让编辑器显示旧图+旧遮罩。
-        // 加载器对 clipspace 会话有官方回退：图层文件加载失败就改用 node.images
-        // （节点当前预览）。这里调用后端路由删掉旧会话的两个图层文件来触发回退；
-        // clipspace-painted-masked 本体不动，其他节点可能还引用它。
-        const SESSION_RE = /^clipspace-painted-masked-(\d+)\.png/;
+        // 换图后，store 里残留的上一个会话文件名仍会被编辑器采用。它的主路径加载
+        // 会话的 mask/paint 图层文件（discard 路由已删，必然 404）；关键在回退分支：
+        // 它加载的是 **widget 会话的 composite 本体**（clipspace-painted-masked-N.png），
+        // 不是节点当前预览——所以光删图层不够，还得把 composite 的内容也换成当前
+        // 预览。编辑器每次保存都会把会话名同步写进 node.properties['image']（store
+        // 的镜像、扩展可读），就用它定位要覆写的 composite。
+        // 时机：覆写需要"改显示后的新预览字节"，而预览由运行产生，所以挂到
+        // onExecuted：adoptUpstream / applyFile 置 pendingOverwrite，运行完成后用
+        // 本次运行输出的预览覆写。之后每次显示变化都会再覆写，store 残留的名字
+        // 永远指向"当前显示内容"。
+        const SESSION_RE = /^clipspace-painted-masked-\d+\.png/;
+        let pendingOverwrite = false;
+
+        async function overwriteSessionComposite(output) {
+            pendingOverwrite = false;
+            const saved = typeof node.properties?.image === 'string' ? node.properties.image : '';
+            const m = saved.trim().match(SESSION_RE);
+            if (!m) return;   // 没有旧编辑器会话（store 为空）=> 编辑器本就走 node.images
+            const entry = (output?.images || [])[0];
+            if (!entry?.filename) return;
+            try {
+                const q = new URLSearchParams({
+                    filename: entry.filename,
+                    subfolder: entry.subfolder || '',
+                    type: entry.type || 'temp',
+                });
+                const blob = await fetch(`/view?${q.toString()}`).then((r) => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.blob();
+                });
+                const fd = new FormData();
+                fd.append('image', blob, m[0]);
+                fd.append('overwrite', 'true');
+                fd.append('type', 'input');
+                const r = await fetch('/upload/image', { method: 'POST', body: fd });
+                if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            } catch (e) {
+                console.warn('[MaskPaintOutput] 覆写旧会话底图失败（编辑器可能显示旧图，再运行一次即恢复）', e);
+            }
+        }
 
         function discardEditorSession(value) {
             if (typeof value !== 'string' || !SESSION_RE.test(value.trim())) return;
@@ -150,6 +186,7 @@ app.registerExtension({
         function adoptUpstream(fp) {
             node.properties[FP_BASE] = fp;
             discardEditorSession(imageW.value);
+            pendingOverwrite = true;   // 运行完成后用新预览覆写 store 残留会话的 composite
             imageW.value = '';
             node.imgs = undefined;
         }
@@ -173,6 +210,7 @@ app.registerExtension({
         node.onExecuted = (output) => {
             const fp = readFp(output);
             if (fp) node.properties[FP_LAST] = fp;
+            if (pendingOverwrite) overwriteSessionComposite(output);
             if (!stopW?.value) return;             // 输出模式：当前图锁定，不动
             if (!fp || fp === node.properties[FP_BASE]) return;
             const hadWidget = !!imageW.value;

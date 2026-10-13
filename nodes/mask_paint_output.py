@@ -12,10 +12,12 @@ image_input，把 image 这个名字让给编辑器。
 IMAGE 与 MASK 永远取自**同一个文件**（image widget 指向的那张 PNG）：RGB -> IMAGE，
 alpha -> MASK。只有 widget 为空时才退回上游 image_input（此时 MASK 全零）。上游换了
 新图不会静默覆盖当前绘制结果 —— 接管由前端在 stop_here（取图模式）下清空 widget 完成，
-后端不猜。清空的同时前端会调用本模块的 discard_session 路由作废旧会话的图层文件：
-遮罩编辑器的加载器优先读 widget store（扩展拿不到写入通道，只有编辑器保存时才双写），
-残留的旧会话文件名会让它显示旧图+旧遮罩；删掉图层文件可触发它「图层 404 就回退到
-node.images」的官方路径，让编辑器如实显示当前预览。
+后端不猜。清空的同时前端会调用本模块的 discard_session 路由作废旧会话的图层文件，
+并在运行完成后用当前预览覆写旧会话的 composite 本体：遮罩编辑器的加载器优先读
+widget store（扩展拿不到写入通道，只有编辑器保存时才双写），残留的旧会话文件名
+会让它走旧会话；主路径的图层文件被删后它回退到 widget 会话的 composite
+（clipspace-painted-masked-N.png 本体，不是节点预览），把 composite 内容换成当前
+预览后，编辑器显示的就是新图+空遮罩。
 两者分辨率不一致时 MASK 退回全零：错位的遮罩比空遮罩更危险，而空遮罩在
 预览里一眼可见，不必打日志。
 
@@ -207,10 +209,12 @@ class MaskPaintOutput(io.ComfyNode):
 # image 值 > node.images（当前预览）。store 只有编辑器保存（setNodeWidgetValue
 # 双写 store + LGraph widget）和工作流加载会写，扩展侧拿不到写入通道；于是
 # 前端采纳上游/粘贴换图只改 LGraph widget 后，store 里残留的旧会话文件名会让
-# 编辑器显示旧图+旧遮罩。加载器对 clipspace 会话有一条官方回退：图层文件加载
-# 失败就改用 node.images。所以这里提供一条路由，把被作废会话的两个**图层文件**
-# 删掉以触发回退。只删 clipspace-mask-N / clipspace-paint-N，不删
-# clipspace-painted-masked-N 本体——加载器从不取它，而其他节点可能还引用着它。
+# 编辑器显示旧图+旧遮罩。加载器主路径取会话的 mask/paint 图层文件，图层 404
+# 会走它的官方回退——但回退加载的是 widget 会话的 composite 本体
+# （clipspace-painted-masked-N.png），不是节点当前预览。所以这里的路由只负责
+# 删两个**图层文件**逼出回退；composite 本体由前端在采纳/粘贴的运行完成后用
+# 当前预览覆写（overwrite 上传同名文件），回退加载到的就是新图+空遮罩。
+# 本体也不能删：删了回退本身会 404，编辑器直接报错关闭。
 # ---------------------------------------------------------------------------
 _SESSION_NAME_RE = re.compile(r"^clipspace-painted-masked-(\d+)\.png(?:\s+\[[a-z]+\])?$")
 _SESSION_LAYER_TEMPLATES = ("clipspace-mask-{n}.png", "clipspace-paint-{n}.png")
