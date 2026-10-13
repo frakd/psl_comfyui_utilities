@@ -15,9 +15,13 @@
   _STORE 与缓存条目持有同一批张量对象，释放 _STORE 后缓存条目仍攥着它们，
   内存纹丝不动（"霸占"）。
 - 所以：存入时 clone 一份节点独占的副本；释放时除清 _STORE 外，还把**本节点自己**
-  的输出缓存条目一并摘除（execute 时把 execution_list.output_cache 句柄存下来供
-  释放路由用）。上游节点自己的缓存完全不碰——那份原件由 ComfyUI 自己的缓存
-  策略（或 DeepVRAMCleanup）管辖。
+  的输出缓存条目一并摘除。上游节点自己的缓存完全不碰——那份原件由 ComfyUI 自己的
+  缓存策略（或 DeepVRAMCleanup）管辖。
+- 摘缓存有两个前提（实测踩坑后补齐）：① schema 必须声明 io.Hidden.execution_list，
+  否则内核不注入执行列表，句柄永远是 None，摘除沦为空转（HiddenHolder 对未声明的
+  hidden 一律返回 None）；② gen widget 让签名每轮必变 ⇒ 每轮产生一个**新 data key**
+  的缓存条目，而内核默认 RAM pressure 缓存只在系统内存告急时才回收旧条目——所以
+  必须自己记账历轮 key：execute 时清掉旧轮条目，release 时全数摘除。
 - 代价：桥接期间内容在内存里存两份（本节点副本 + 上游缓存原件），这是隔离
   的必要成本；换来的释放是真正的干净。
 - 其余不变：只存内存不落盘，进程退出即释放；键是节点 unique_id；三槽全空
@@ -48,8 +52,16 @@ def _bump_generation(uid: str) -> None:
 
 # unique_id -> 本节点最近一次执行时的 outputs 缓存对象（全局 CacheSet 的成员，
 # 跨运行长期存活）。释放路由没有 hidden 上下文，只能靠这里存的句柄去摘
-# 本节点自己的缓存条目。
+# 本节点自己的缓存条目。句柄来自 hidden.execution_list——schema 里**必须声明**
+# io.Hidden.execution_list，否则内核不注入，这里永远是 None（踩过的坑）。
 _CACHE_HANDLES: dict[str, object] = {}
+
+# unique_id -> 本节点历轮写入 outputs 缓存的全部 data key。
+# gen widget 让签名每轮必变 ⇒ 每轮都会产生一个**新 key** 的缓存条目；内核默认
+# RAM pressure 缓存只在系统内存告急时才回收旧条目，平时任由旧条目攥着上游原图/
+# 回放副本——这是"反复导入后内存持续上涨"的根源。这里记账历轮 key：
+# execute 时清掉旧轮条目，release 时全数摘除。
+_CACHE_KEYS: dict[str, set] = {}
 
 
 def _slots(uid: str) -> list[dict]:
@@ -80,37 +92,78 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
         s["audio"] = _clone_value("audio", audio)
 
 
-def _evict_own_cache_entry(uid: str) -> bool:
-    """把本节点自己的输出缓存条目从全局 CacheSet 里摘掉（镜像内核删除动作）。
+def _resolve_cache_target(cache, uid: str):
+    """子图节点要先解析到所属层级缓存；顶层节点返回 cache 本身。"""
+    resolve = getattr(cache, "_get_cache_for", None)
+    if callable(resolve):
+        try:
+            resolved = resolve(uid)
+            if resolved is not None:
+                return resolved
+        except Exception as e:
+            logging.warning("[PersistentOutput] 解析缓存层级失败 uid=%s: %s", uid, e)
+    return cache
 
-    回放场景下节点输出的是存储副本，会被写进 caches.outputs[uid]——只清 _STORE
-    不清这里，副本仍被缓存攥着，释放就不是真的。桥接场景下条目里是上游原件，
-    但上游自己的缓存条目仍持有同一对象，摘我们的条目不损失任何数据。
-    运行中途释放的极端情况：下游可能拿到 None——与"未保留输出 None"同语义。
+
+def _evict_cache_entries(uid: str, keys) -> int:
+    """从内核 outputs 缓存里摘掉指定 data key 的条目（镜像内核删除动作）。
+
+    回放场景下条目里是存储副本——只清 _STORE 不清缓存，副本仍被缓存攥着，
+    释放就不是真的；桥接场景下条目里是上游原件，但上游自己的缓存条目仍持有
+    同一对象，摘我们的条目不损失任何数据。运行中途释放的极端情况：下游可能
+    拿到 None——与"未保留输出 None"同语义。返回实际摘掉的条目数。
     """
     cache = _CACHE_HANDLES.get(uid)
-    if cache is None:
-        return False
-    removed = False
+    if cache is None or not keys:
+        return 0
+    removed = 0
     try:
-        target = cache
-        resolve = getattr(cache, "_get_cache_for", None)
-        if callable(resolve):
-            target = resolve(uid)
-        key_set = getattr(target, "cache_key_set", None)
-        key = key_set.get_data_key(uid) if key_set is not None else None
+        target = _resolve_cache_target(cache, uid)
         store = getattr(target, "cache", None)
-        if key is not None and isinstance(store, dict) and key in store:
+        if not isinstance(store, dict):
+            return 0
+        for key in keys:
+            if key not in store:
+                continue
             del store[key]
-            removed = True
+            removed += 1
             # 镜像内核自己的删除：LRU/RAM 缓存的 side dict 不清会留残键
             for side in ("used_generation", "timestamps", "children"):
                 sd = getattr(target, side, None)
                 if isinstance(sd, dict):
                     sd.pop(key, None)
     except Exception as e:
-        logging.warning("[PersistentOutput] 摘除自身输出缓存条目失败: %s", e)
+        logging.warning("[PersistentOutput] 摘除输出缓存条目失败 uid=%s keys=%d: %s",
+                        uid, len(tuple(keys)), e)
     return removed
+
+
+def _record_cache_key(uid: str, out_cache) -> None:
+    """execute 时调用：存句柄 + 记账本轮 data key + 清掉以前各轮的旧缓存条目。
+
+    本轮的条目要等 execute 返回后才由内核写入（execution.py:616-618），因此
+    此刻缓存里凡是我们记过账的 key 都属于以前的轮次；gen widget 保证本节点
+    每轮必重跑，旧条目不可能再被命中，是纯死重，直接摘除。
+    """
+    if out_cache is None:
+        return
+    _CACHE_HANDLES[uid] = out_cache
+    try:
+        target = _resolve_cache_target(out_cache, uid)
+        key_set = getattr(target, "cache_key_set", None)
+        key = key_set.get_data_key(uid) if key_set is not None else None
+    except Exception as e:
+        logging.warning("[PersistentOutput] 记录缓存键失败 uid=%s: %s", uid, e)
+        return
+    if key is None:
+        return
+    keys = _CACHE_KEYS.setdefault(uid, set())
+    stale = keys - {key}
+    if stale:
+        removed = _evict_cache_entries(uid, stale)
+        logging.info("[PersistentOutput] 清理旧轮缓存条目 %d 条 uid=%s", removed, uid)
+        keys -= stale
+    keys.add(key)
 
 
 def release(uid: str, target: str = "all") -> bool:
@@ -139,7 +192,9 @@ def release(uid: str, target: str = "all") -> bool:
         if key_gone:
             _STORE.pop(uid, None)
     if had_any:
-        _evict_own_cache_entry(uid)
+        removed = _evict_cache_entries(uid, _CACHE_KEYS.get(uid, ()))
+        _CACHE_KEYS.pop(uid, None)
+        logging.info("[PersistentOutput] 释放时摘除自身缓存条目 %d 条 uid=%s", removed, uid)
         # 释放改变了槽状态：递增代数让下一轮缓存签名必变（见 execute 的 gen widget），
         # 防止缓存命中重放旧 ui 快照把前端盖暗。
         _bump_generation(uid)
@@ -245,7 +300,10 @@ class PersistentOutput(io.ComfyNode):
                     ),
                 ),
             ],
-            hidden=[io.Hidden.unique_id],
+            # execution_list 必须显式声明：内核只对声明了的 hidden 注入执行列表
+            # （execution.py:213-214），HiddenHolder 对未声明的 hidden 返回 None——
+            # 漏了它释放路由就拿不到 outputs 缓存句柄，摘除永远空转（实测踩坑）。
+            hidden=[io.Hidden.unique_id, io.Hidden.execution_list],
             outputs=[
                 *[
                     out
@@ -290,12 +348,11 @@ class PersistentOutput(io.ComfyNode):
         # ui 必须有：executed 事件只在本节点有 ui 输出时才发送（execution.py:567），
         # 没有它前端 onExecuted 永远不触发、状态行永远不刷新（用户实测踩过）。
         # 把各槽概要直接随事件送出去，前端免二次 HTTP。
-        # 同时存下 outputs 缓存句柄：释放路由没有 hidden 上下文，靠它摘除本节点
-        # 自己的缓存条目（回放副本才会真正释放，见模块 docstring）。
+        # 同时记账 outputs 缓存：释放路由没有 hidden 上下文，靠 hidden.execution_list
+        # 拿句柄、记 data key，才能摘除本节点自己的缓存条目（回放副本才会真正释放）。
         el = getattr(cls.hidden, "execution_list", None)
-        out_cache = getattr(el, "output_cache", None)
-        if out_cache is not None:
-            _CACHE_HANDLES[uid] = out_cache
+        out_cache = getattr(el, "output_cache", None) if el is not None else None
+        _record_cache_key(uid, out_cache)
         # ui 值一律包一层 list：execution.py:422 合并多个 ui 时按 key 把值当可迭代
         # 展开（{k: [y for x in uis for y in x[k]]}），裸标量（int/str）会直接炸
         # "'int' object is not iterable"（实测踩过）。
