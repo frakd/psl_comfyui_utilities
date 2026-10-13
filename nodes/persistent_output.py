@@ -189,7 +189,10 @@ class PersistentOutput(io.ComfyNode):
                 img if img is not None else slot["image"],
                 aud if aud is not None else slot["audio"],
             ])
-        return io.NodeOutput(*outs)
+        # ui 必须有：executed 事件只在本节点有 ui 输出时才发送（execution.py:567），
+        # 没有它前端 onExecuted 永远不触发、状态行永远不刷新（用户实测踩过）。
+        # 把各槽概要直接随事件送出去，前端免二次 HTTP。
+        return io.NodeOutput(*outs, ui={"psl_slots": describe(uid)})
 
 
 # ---------------------------------------------------------------------------

@@ -212,15 +212,14 @@ app.registerExtension({
             rows.push({ row, label, releaseBtn });
         }
 
-        async function refreshStatus() {
-            const d = await fetchStatus(node.id);
-            const slots = d?.slots;
+        // DOM 更新抽出来：事件数据与 HTTP 数据走同一条应用路径。
+        // busy/done 两态的文案不被覆盖；只有空闲态才同步文案与禁用。
+        function applySlots(slots) {
             for (let i = 0; i < SLOT_COUNT; i++) {
                 const held = typeof slots?.[i] === 'string' && slots[i] !== '未保留';
                 rows[i].row.classList.toggle('empty', !held);
                 const summary = held ? slots[i] : '';
                 const btn = rows[i].releaseBtn;
-                // busy/done 两态的文案不被刷新覆盖；只有空闲态才同步文案与禁用
                 if (!btn.classList.contains('busy') && !btn.classList.contains('done')) {
                     btn.disabled = !held;
                     btn.textContent = '释放';
@@ -229,6 +228,11 @@ app.registerExtension({
                         : `槽 ${i + 1} 当前没有保留内容`;
                 }
             }
+        }
+
+        async function refreshStatus() {
+            const d = await fetchStatus(node.id);
+            applySlots(d?.slots);
         }
 
         // 状态刷新加去重窗口：onExecuted 与 status 事件可能几乎同时到达，
@@ -241,24 +245,30 @@ app.registerExtension({
 
         node.addDOMWidget('persist_view', 'HTML', root, { serialize: false, hideOnZoom: false });
 
-        // 每次运行后保留内容可能被替换，状态同步一次。
-        // 立即刷一次 + 延迟再刷一次：立即那次可能跑在后端把输入写进存储之前
-        // （executed 事件发出 ≠ 存储写入对后续 HTTP 可见之后的时序已被用户实测踩过），
-        // 延迟那次兜底。刷新不覆盖 busy/done 两态的按钮反馈。
+        // 运行后同步状态，三保险：
+        // 1) onExecuted：后端现在带 ui 输出（psl_slots），executed 事件必然发出——
+        //    直接用事件里的数据更新（零延迟零 HTTP），再 fetch 对账一次
+        // 2) status 事件（队列排空）兜底
+        // 3) 3 秒轮询兜底：不依赖任何事件，覆盖一切未知时序；后台标签页暂停
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
+            const slots = output?.psl_slots;
+            if (Array.isArray(slots) && slots.length === SLOT_COUNT) applySlots(slots);
             scheduleRefresh(0);
             scheduleRefresh(600);
         };
 
-        // 兜底第二层：任何一次运行结束（队列排空）都同步状态。覆盖缓存命中
-        // （不触发 onExecuted）与「运行到此处」部分执行结束后事件顺序的任何变化。
         api.addEventListener('status', ({ detail }) => {
             if ((detail?.status?.exec_info?.queue_remaining ?? 1) !== 0) return;
             if (!node.graph) return;
             scheduleRefresh(200);
         });
+
+        setInterval(() => {
+            if (!node.graph || document.hidden) return;
+            refreshStatus();
+        }, 3000);
 
         // 节点删除 = 垃圾清理：全部释放，不留孤儿内存
         const prevOnRemoved = node.onRemoved;
