@@ -1,4 +1,5 @@
 import { app } from '../../scripts/app.js';
+import { api } from '../../scripts/api.js';
 
 // ============================================================
 //  Mask Paint Output — 底图上传（粘贴 / 拖放）+ 取图模式接管上游
@@ -44,15 +45,30 @@ app.registerExtension({
         // Vue 模式下节点内预览读的是 output store（由运行结果填充），赋值 node.imgs
         // 不会刷新；所以写入后对单个节点做一次部分执行，让预览如实更新。
         // image_input 是可选输入，单节点 prompt 能过校验，且不会牵动下游。
+        // 注意：onExecuted 回调发生在队列尚未排空时，此刻 queuePrompt 会因
+        // processingQueue 直接返回 false（app.ts:1830-1832）——被丢弃的刷新要等队列
+        // 空闲（status 事件 queue_remaining=0）再补，否则预览会停在旧图上。
+        let pendingRefresh = false;
+        api.addEventListener('status', ({ detail }) => {
+            if (!pendingRefresh) return;
+            if (!node.graph) { pendingRefresh = false; return; }   // 节点已删除就别再排队
+            if ((detail?.status?.exec_info?.queue_remaining ?? 1) !== 0) return;
+            pendingRefresh = false;
+            refreshByRunning();
+        });
+
         async function refreshByRunning() {
             try {
                 // 重载签名：queuePrompt(number, batchCount, queueNodeIds[])，
                 // 第三参传数组即部分执行，只跑本节点（app.ts:1796-1808）
-                await app.queuePrompt(1, 1, [node.id]);
+                const queued = await app.queuePrompt(1, 1, [node.id]);
+                if (queued === false) pendingRefresh = true;
+                return queued;
             } catch (e) {
                 console.warn('[MaskPaintOutput] 单节点刷新失败，预览将在下次运行时更新', e);
                 node.imgs = node.imgs || [];
                 node.graph?.setDirtyCanvas(true, true);
+                return false;
             }
         }
 
