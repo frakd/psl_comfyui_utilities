@@ -1,4 +1,5 @@
 from .ab_audio_compare import AudioABCompare
+from .any_switch import AnySwitch
 from .aspect_ratio_selector import AspectRatioSelectorNode
 from .audio_filter import AudioHarshnessSuppressor
 from .deep_vram_cleanup import DeepVRAMCleanup
@@ -13,6 +14,7 @@ _NODE_CLASSES = (
     DeepVRAMCleanup,
     AudioHarshnessSuppressor,
     AudioABCompare,
+    AnySwitch,
     MiniMaxH3AVLoRAStack,
     AspectRatioSelectorNode,
     ModelReroute,
