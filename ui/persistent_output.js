@@ -1,4 +1,5 @@
 import { app } from '../../scripts/app.js';
+import { api } from '../../scripts/api.js';
 
 // ============================================================
 //  Persistent Output — 跨运行保留输入的桥接/回放节点（3 组槽位）
@@ -230,14 +231,34 @@ app.registerExtension({
             }
         }
 
+        // 状态刷新加去重窗口：onExecuted 与 status 事件可能几乎同时到达，
+        // 连续拉两次浪费且可能与释放请求竞态。
+        let refreshTimer = null;
+        function scheduleRefresh(delay = 0) {
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(() => { refreshStatus(); }, delay);
+        }
+
         node.addDOMWidget('persist_view', 'HTML', root, { serialize: false, hideOnZoom: false });
 
-        // 每次运行后保留内容可能被替换，状态同步一次
+        // 每次运行后保留内容可能被替换，状态同步一次。
+        // 立即刷一次 + 延迟再刷一次：立即那次可能跑在后端把输入写进存储之前
+        // （executed 事件发出 ≠ 存储写入对后续 HTTP 可见之后的时序已被用户实测踩过），
+        // 延迟那次兜底。刷新不覆盖 busy/done 两态的按钮反馈。
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
-            refreshStatus();
+            scheduleRefresh(0);
+            scheduleRefresh(600);
         };
+
+        // 兜底第二层：任何一次运行结束（队列排空）都同步状态。覆盖缓存命中
+        // （不触发 onExecuted）与「运行到此处」部分执行结束后事件顺序的任何变化。
+        api.addEventListener('status', ({ detail }) => {
+            if ((detail?.status?.exec_info?.queue_remaining ?? 1) !== 0) return;
+            if (!node.graph) return;
+            scheduleRefresh(200);
+        });
 
         // 节点删除 = 垃圾清理：全部释放，不留孤儿内存
         const prevOnRemoved = node.onRemoved;
