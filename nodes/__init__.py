@@ -6,6 +6,7 @@ from .h3_av_lora import MiniMaxH3AVLoRAStack
 from .image_container import ImageContainer
 from .mask_paint_output import MaskPaintOutput
 from .model_reroute import ModelReroute
+from .persistent_output import PersistentOutput
 from .refreshable_text_box import RefreshableTextBox
 
 _NODE_CLASSES = (
@@ -16,6 +17,7 @@ _NODE_CLASSES = (
     AspectRatioSelectorNode,
     ModelReroute,
     MaskPaintOutput,
+    PersistentOutput,
     RefreshableTextBox,
     ImageContainer,
 )
