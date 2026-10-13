@@ -165,11 +165,20 @@ app.registerExtension({
         randomBtn.addEventListener('click', (e) => { e.stopPropagation(); setMode('random'); });
 
         // ---- 随机掷骰子：排队时写入 selection，签名每跑必变 ----
+        // 排除上一轮的选择避免连续重复：上一轮结果就是掷骰前的 selW.value
+        // （selection 随工作流持久化，刷新页面后由 onConfigure 恢复，跨刷新也有效）。
+        // 只约束相邻两次；候选里没有上一轮选择（首轮/上一路刚断开）时不排除，照常随机。
         selW.serializeValue = () => {
             if (isRandom()) {
                 const connected = autogrowSlots(node).filter((s) => s.link != null);
                 if (connected.length) {
-                    const pick = connected[Math.floor(Math.random() * connected.length)];
+                    let candidates = connected;
+                    if (connected.length > 1) {
+                        const prev = selW.value;
+                        const filtered = connected.filter((s) => String(slotOrdinal(s.name)) !== prev);
+                        if (filtered.length) candidates = filtered;
+                    }
+                    const pick = candidates[Math.floor(Math.random() * candidates.length)];
                     selW.value = String(slotOrdinal(pick.name));
                 }
             }
