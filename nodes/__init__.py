@@ -1,3 +1,4 @@
+from .ab_audio_compare import AudioABCompare
 from .aspect_ratio_selector import AspectRatioSelectorNode
 from .audio_filter import AudioHarshnessSuppressor
 from .deep_vram_cleanup import DeepVRAMCleanup
@@ -10,6 +11,7 @@ from .refreshable_text_box import RefreshableTextBox
 _NODE_CLASSES = (
     DeepVRAMCleanup,
     AudioHarshnessSuppressor,
+    AudioABCompare,
     MiniMaxH3AVLoRAStack,
     AspectRatioSelectorNode,
     ModelReroute,
