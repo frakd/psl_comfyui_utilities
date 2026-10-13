@@ -252,8 +252,6 @@ if PromptServer.instance is not None:
                 discarded.append(target.name)
             else:
                 missing.append(target.name)
-        logging.info(
-            "[MaskPaintOutput] 已作废遮罩编辑器会话 n=%s（删除=%s，本就不存在=%s）",
-            n, discarded, missing,
-        )
+        # 成功路径不打日志：每次采纳/粘贴都会调用，info 级别纯属刷屏；
+        # 结果（discarded/missing）已在 HTTP 响应里，需要排查时抓包即可。
         return web.json_response({"discarded": discarded, "missing": missing})
