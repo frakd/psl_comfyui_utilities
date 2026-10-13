@@ -127,6 +127,26 @@ app.registerExtension({
             return Array.isArray(fp) ? (fp[0] ?? null) : (fp ?? null);
         }
 
+        // ---- 关→开切换即取图：不再要求用户再手动点一次运行 ----
+        // 采纳只发生在运行钩子里（serializeValue / onExecuted）；用户切到取图模式后
+        // 若不运行就打开遮罩编辑器，编辑器如实加载的还是节点画布上的旧图（编辑器
+        // 内容 = 节点当前预览）。所以在开关 false→true 时立即单节点跑一轮：
+        // serializeValue 里 justEntered 命中 → 作废当前图 → 本次运行直接取上游图。
+        // 仅在上游确有连线时才跑；工作流加载直设 value 不走 callback，onConfigure 同步基准。
+        let prevStop = stopW?.value;
+        if (stopW) {
+            const prevStopCb = stopW.callback;
+            stopW.callback = function (value) {
+                prevStopCb?.apply(this, arguments);
+                const was = prevStop;
+                prevStop = value;
+                const hasUpstream = node.inputs?.some((inp) => inp.name === 'image_input' && inp.link != null);
+                if (value === true && was === false && node.graph && hasUpstream) {
+                    refreshByRunning();
+                }
+            };
+        }
+
         function adoptUpstream(fp) {
             node.properties[FP_BASE] = fp;
             discardEditorSession(imageW.value);
@@ -228,6 +248,15 @@ app.registerExtension({
                 console.error('[MaskPaintOutput] 拖放上传失败', err);
             }
             return true;
+        };
+
+        // 工作流加载恢复 widget 值时不走 callback，prevStop 基准在这里同步，
+        // 避免加载后第一次手动切换时把陈旧基准当成 false→true 误触发取图运行。
+        const prevConfigure = node.onConfigure;
+        node.onConfigure = function (info) {
+            const r = prevConfigure?.apply(this, arguments);
+            prevStop = stopW?.value;
+            return r;
         };
     },
 });
