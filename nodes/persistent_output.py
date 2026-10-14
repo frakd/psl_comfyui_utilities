@@ -516,10 +516,11 @@ if getattr(PromptServer, "instance", None) is not None:
         had = release(uid, target)
         logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
         logging.info("[PersistentOutput] 释放前内存: %s", mem_before)
+        gc.collect()
+        logging.info("[PersistentOutput] 释放后立即内存: %s", _mem_snapshot())
 
         async def _report_after():
             await asyncio.sleep(3)
-            gc.collect()
             logging.info("[PersistentOutput] 释放后3s内存: %s", _mem_snapshot())
 
         asyncio.create_task(_report_after())
