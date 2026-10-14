@@ -222,10 +222,15 @@ def _log_tensor_freed(ptr: int) -> None:
     logging.info("[PersistentOutput] 副本已真正销毁 ptr=%s RSS=%s", hex(ptr), _rss_gb())
 
 
+_watched_refs: list = []
+
+
 def _watch_tensor(v) -> None:
     if isinstance(v, torch.Tensor):
         ptr = v.untyped_storage().data_ptr()
-        weakref.ref(v, lambda _r, ptr=ptr: _log_tensor_freed(ptr))
+        ref = weakref.ref(v, lambda _r, ptr=ptr: _log_tensor_freed(ptr))
+        _watched_refs.append(ref)
+        _watched_refs[:] = [w for w in _watched_refs if w() is not None]
 
 
 def store_input(uid: str, slot: int, image=None, audio=None) -> None:
@@ -273,10 +278,31 @@ def release(uid: str, target: str = "all") -> bool:
         v = s.get("image")
         if isinstance(v, torch.Tensor):
             referrers = gc.get_referrers(v)
-            ref_desc = [f"{type(r).__name__}({len(r) if hasattr(r, '__len__') else '?'})"
-                        for r in referrers]
-            logging.info("[PersistentOutput] 副本引用者诊断: ptr=%s refcount=%d 引用者=%s",
-                         _ptr_of(v), sys.getrefcount(v), ref_desc)
+            logging.info("[PersistentOutput] 副本引用者诊断: ptr=%s refcount=%d 引用者数=%d",
+                         _ptr_of(v), sys.getrefcount(v), len(referrers))
+            for r in referrers:
+                if isinstance(r, dict):
+                    items = []
+                    for k, val in list(r.items())[:6]:
+                        if isinstance(val, torch.Tensor):
+                            items.append(f"{k!r}->tensor@{hex(val.untyped_storage().data_ptr())}")
+                        else:
+                            items.append(f"{k!r}->{type(val).__name__}")
+                    is_slot = any(r is vd for vd in _STORE.get(uid, []))
+                    logging.info("[PersistentOutput] 引用者 dict id=%s 是本节点槽位=%s 内容=[%s]",
+                                 hex(id(r)), is_slot, ", ".join(items))
+                    holders = gc.get_referrers(r)
+                    holder_desc = []
+                    for h in holders[:10]:
+                        if isinstance(h, dict):
+                            holder_desc.append(f"dict(keys={list(h.keys())[:4]})")
+                        elif isinstance(h, (list, tuple)):
+                            holder_desc.append(f"{type(h).__name__}(len={len(h)})")
+                        else:
+                            holder_desc.append(f"{type(h).__name__}@{hex(id(h))}")
+                    logging.info("[PersistentOutput] 该 dict 的持有者(%d 个): %s", len(holders), holder_desc)
+                else:
+                    logging.info("[PersistentOutput] 引用者 %s@%s", type(r).__name__, hex(id(r)))
             _watch_tensor(v)
 
     if slot_idx is None:
