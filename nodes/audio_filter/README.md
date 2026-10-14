@@ -4,6 +4,17 @@ ComfyUI 音频处理节点。目前包含一个节点。
 
 ## Audio Harshness Suppressor
 
+> **状态：实验性，效果尚未调好。** 目前没有找到可靠的调参办法——判别量在真实素材上
+> 分不开「刺耳段」与「正常人声」（见下文「一个已知的失效模式」），所以默认参数取的是
+> **不把事情弄坏**的一组，而不是**能解决问题**的一组。请把它当作一个方向尚存、实现
+> 未成熟的尝试，而不是一个即插即用的去刺耳工具。
+
+> **Status: experimental, not tuned to a satisfactory result.** There is no reliable
+> tuning procedure yet — the decision value cannot separate genuinely harsh material
+> from ordinary vocals on real audio (see the known failure mode below), so the
+> defaults are chosen to *avoid damage*, not to *solve the problem*. Treat this as a
+> promising direction with an immature implementation rather than a drop-in de-harsher.
+
 针对音频里扎耳朵的高频——齿音嘶声、镲片飞溅、过亮的"存在感"。
 
 **它不是静态 EQ。** 固定高架衰减会把整条轨道变闷；这个节点逐帧测量目标频段，
@@ -34,7 +45,7 @@ tilt_dB = 10*log10(频段密度 / 全谱密度)
 | `harsh_low_hz` | 2500 | 关注频段下沿。2500 Hz 覆盖存在感与齿音 |
 | `harsh_high_hz` | 9000 | 关注频段上沿。刺耳感偏最高频时可提到 14000 |
 | `sensitivity_db` | -6.0 | 频段要比全谱密多少 dB 才动手。平坦信号为 0 dB，越小越激进 |
-| `max_reduction_db` | 12.0 | 最刺耳处的最深衰减。设 0 即完全不处理 |
+| `max_reduction_db` | 18.0 | 最刺耳处的最深衰减。设 0 即完全不处理 |
 | `attack_ms` | 5.0 | 衰减淡入速度。保持短，才能抓住刺耳的起始 |
 | `release_ms` | 120.0 | 衰减淡出速度。太短会听出抽吸感（pumping） |
 | `mix` | 1.0 | 干湿比，用来 A/B 对比 |
@@ -42,7 +53,7 @@ tilt_dB = 10*log10(频段密度 / 全谱密度)
 ### 调参建议
 
 - 刺耳感听起来偏最高频（嘶嘶声）→ `harsh_high_hz` 提到 14000，`harsh_low_hz` 提到 5500
-- 觉得压得不够 → 先把 `max_reduction_db` 提到 18，再考虑动 `sensitivity_db`
+- 觉得压得不够 → 先把 `max_reduction_db` 从默认 18 再往上提，或把频段收窄到真正刺耳的那一段，再考虑动 `sensitivity_db`
 - 觉得正常内容被压暗 → `sensitivity_db` 提到 -3，或收窄频段
 - 听到呼吸/抽吸感 → `release_ms` 提到 250
 - 拿不准就先设 `mix=0.5` 对比，再决定
@@ -54,7 +65,7 @@ tilt_dB = 10*log10(频段密度 / 全谱密度)
 在一段真实的 32 kHz 生成音乐上，把默认调到看上去最对症的一组
 （频段 5500–14000、阈值 -12、上限 18 dB）后实测各片段的副作用：
 
-| 片段 | 5500–14000 / -12 / 18 | 2500–9000 / -6 / 12（默认） |
+| 片段 | 5500–14000 / -12 / 18 | 2500–9000 / -6 / 12 |
 | --- | --- | --- |
 | 0–6 s | -1.75 dB | -1.31 dB |
 | **6–9 s（男声）** | **-17.69 dB** | -2.03 dB |
@@ -62,8 +73,10 @@ tilt_dB = 10*log10(频段密度 / 全谱密度)
 | 12.85–13.45 s（听者指认的刺耳段） | -16.20 dB | -2.27 dB |
 | 13.5–15 s | -2.56 dB | -1.56 dB |
 
-第一组**把男声压得比刺耳段还多**。原因见下节。默认因此退回第二组：
-各片段衰减均匀、量级温和，不针对任何一段。
+第一组**把男声压得比刺耳段还多**。原因见下节。默认因此退回第二组的**频段与阈值**
+（2500–9000 / -6）。上限后来从该组的 12 提到了现在的 18，但这张表量的是
+**频段 + 阈值 + 上限三者同时改动**的联合副作用，单独把上限从 12 提到 18 并未重新实测过，
+所以上表读作「频段与阈值的选择才是主要风险来源」，不要读成「18 这个上限被否掉了」。
 
 ### 一个已知的失效模式（重要）
 
