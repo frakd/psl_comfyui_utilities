@@ -240,9 +240,15 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     s = _slots(uid)[slot]
     if image is not None:
         s["image"] = _clone_value("image", image)
-        logging.info("[PersistentOutput] 槽%d 存图: %s ptr=%s RSS=%s",
-                     slot + 1, _mem_brief("image", image, s["image"]),
-                     _ptr_of(s["image"]), _rss_gb())
+        stored = s["image"]
+        if isinstance(stored, torch.Tensor):
+            logging.info("[PersistentOutput] 槽%d 存图: %s ptr=%s 输入pinned=%s 副本pinned=%s "
+                         "输入storage字节=%s RSS=%s",
+                         slot + 1, _mem_brief("image", image, stored), _ptr_of(stored),
+                         image.is_pinned() if isinstance(image, torch.Tensor) else "?",
+                         stored.is_pinned(),
+                         f"{image.untyped_storage().nbytes():,}" if isinstance(image, torch.Tensor) else "?",
+                         _rss_gb())
     if audio is not None:
         s["audio"] = _clone_value("audio", audio)
         logging.info("[PersistentOutput] 槽%d 存音: %s RSS=%s",
@@ -571,7 +577,6 @@ if getattr(PromptServer, "instance", None) is not None:
 
             gc.collect()
             stages = {"baseline": rss_gb()}
-            # 复刻工作流分配模式：7.2GB 原件 + inference_mode 内 clone
             t = torch.zeros(211, 2112, 1344, 3, dtype=torch.float32)
             stages["alloc_orig_7g"] = rss_gb()
             with torch.inference_mode():
@@ -583,14 +588,20 @@ if getattr(PromptServer, "instance", None) is not None:
             del t
             gc.collect()
             stages["orig_freed"] = rss_gb()
-            # 对照组：小尺寸
-            t2 = torch.zeros(500, 1000, 1000, dtype=torch.float32)
-            stages["alloc_2g"] = rss_gb()
-            del t2
+            # 嫌疑变量一：pinned（页锁定）内存——CachingHostAllocator 是缓存型分配器
+            tp = torch.zeros(1200, 1000, 1000, dtype=torch.float32).pin_memory()
+            stages["alloc_pinned_4g"] = rss_gb()
+            with torch.inference_mode():
+                ap = tp.clone()
+            stages["alloc_pinned_clone"] = rss_gb()
+            del ap
             gc.collect()
-            stages["free_2g"] = rss_gb()
+            stages["pinned_clone_freed"] = rss_gb()
+            del tp
+            gc.collect()
+            stages["pinned_orig_freed"] = rss_gb()
             return web.json_response({
-                "verdict_hint": "clone_freed/orig_freed 未回落 => 在本进程复刻了泄漏，再按尺寸/模式二分",
+                "verdict_hint": "pinned_clone_freed 未回落 => pinned 内存进缓存分配器池，实锤",
                 "stages": stages})
         except Exception as e:
             return web.json_response({"error": f"探针失败: {e}"}, status=500)
