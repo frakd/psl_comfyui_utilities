@@ -33,6 +33,8 @@
   （A + 临时克隆）——这是"A 永不出节点"的必要成本；换来 release 的无条件生效。
 """
 
+import asyncio
+import gc
 import logging
 
 import torch
@@ -425,6 +427,24 @@ def _parse_uid(raw) -> str | None:
     return s or None
 
 
+def _mem_snapshot() -> str:
+    """系统内存快照（与任务管理器口径对照：系统可用≈内存Available，
+    进程RSS≈工作集，进程USS≈进程独占）。psutil 缺失时给出明确提示。"""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        proc = psutil.Process()
+        parts = [f"系统可用={vm.available / 1024 ** 3:.2f}GB",
+                 f"进程RSS={proc.memory_info().rss / 1024 ** 3:.2f}GB"]
+        try:
+            parts.append(f"进程USS={proc.memory_full_info().uss / 1024 ** 3:.2f}GB")
+        except Exception:
+            pass
+        return " ".join(parts)
+    except Exception as e:
+        return f"内存监控不可用: {e}"
+
+
 if getattr(PromptServer, "instance", None) is not None:
 
     @PromptServer.instance.routes.get("/psl/persist/status")
@@ -481,7 +501,16 @@ if getattr(PromptServer, "instance", None) is not None:
             return web.json_response({"error": "缺少 node_id"}, status=400)
         if target not in ("slot1", "slot2", "slot3", "all"):
             return web.json_response({"error": f"未知 target: {target!r}"}, status=400)
+        mem_before = _mem_snapshot()
         had = release(uid, target)
         logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
+        logging.info("[PersistentOutput] 释放前内存: %s", mem_before)
+
+        async def _report_after():
+            await asyncio.sleep(3)
+            gc.collect()
+            logging.info("[PersistentOutput] 释放后3s内存: %s", _mem_snapshot())
+
+        asyncio.create_task(_report_after())
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
 
