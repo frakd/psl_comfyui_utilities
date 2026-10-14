@@ -124,7 +124,13 @@ def _find_and_clear_execution_caches() -> int:
     cleared = 0
     for obj in gc.get_objects():
         cls_name = type(obj).__name__
-        if cls_name in ("BasicCache", "HierarchicalCache", "LRUCache", "RAMPressureCache"):
+        if cls_name in _CACHE_CLASS_NAMES:
+            # 只清 outputs 缓存（key_class=CacheKeySetInputSignature）。
+            # objects 缓存（CacheKeySetID）里是节点实例本身（含内部状态，例如
+            # 缓存好的 LoRA），与定向清理的语义保持一致，故意不动。
+            key_cls = getattr(getattr(obj, "key_class", None), "__name__", "")
+            if key_cls != "CacheKeySetInputSignature":
+                continue
             n = _clear_all_caches_recursive(obj, 0)
             cleared += n
     return cleared
@@ -348,6 +354,46 @@ def _free_leftovers(patcher, all_devices: bool) -> List[str]:
         lines.append(f"still loaded: {devs}（已尝试所有设备，仍未释放，请看日志里的报错）")
         logging.warning("[DeepVRAMCleanup] 目标模型仍驻留在 %s", devs)
     return lines
+
+
+def _trim_working_set() -> Tuple[bool, str]:
+    """EmptyWorkingSet：强制修剪工作集，促使堆把"已 free 但未去提交"的大块落地。
+
+    背景（PersistentOutput 事故实测，2026-10-14）：Windows 堆对已 free 的脏大块
+    惰性归还——引用清干净后 RSS 不降，已提交（commit）更是只有在堆真正去提交时
+    才会回落。修剪工作集把驻留页挪去 standby（使用中/立即可见下降），模型页软缺
+    页恢复（RAM 速度）。注意：commit 是否回落取决于 torch 分配层的去提交行为，
+    修剪本身不保证。
+    """
+    try:
+        import psutil
+        gb = 1024 ** 3
+        proc = psutil.Process()
+        rss_before = proc.memory_info().rss
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+        k32.SetProcessWorkingSetSize.restype = ctypes.c_int
+        ok = k32.SetProcessWorkingSetSize(ctypes.c_void_p(-1), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+        err = ctypes.get_last_error()
+        rss_after = proc.memory_info().rss
+        line = (f"EmptyWorkingSet ok={ok} err={err}: "
+                f"RSS {rss_before / gb:.2f}GB -> {rss_after / gb:.2f}GB")
+        if ok != 1:
+            logging.warning("[DeepVRAMCleanup] %s", line)
+        return ok == 1, line
+    except Exception as exc:
+        return False, f"EmptyWorkingSet FAILED: {type(exc).__name__}: {exc}"
+
+
+def _sysmem_line() -> str:
+    """系统内存一行速览（RSS + 已提交），与任务管理器口径对照。"""
+    try:
+        import psutil
+        gb = 1024 ** 3
+        mi = psutil.Process().memory_info()
+        return f"sysRAM: RSS={mi.rss / gb:.2f}GB COMMIT={mi.vms / gb:.2f}GB"
+    except Exception:
+        return "sysRAM: (psutil 不可用)"
 
 
 def _describe_patcher(patcher) -> str:
@@ -895,6 +941,7 @@ class DeepVRAMCleanup(io.ComfyNode):
         # PREPARE_CLASS_CLONE 挂到 cls.hidden 上，不再是 execute 的形参。
         device = mm.get_torch_device()
         used_before, total = cls._vram(device)
+        sysmem_before = _sysmem_line()
 
         # ===================== 第一组：运行缓存 =====================
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
@@ -995,6 +1042,14 @@ class DeepVRAMCleanup(io.ComfyNode):
         if trim_cuda_pool and device.type == "cuda":
             _trim_cuda_mempool(device.index if hasattr(device, "index") else 0)
 
+        # 系统内存归还：Windows 堆对已 free 的脏大块惰性归还（PersistentOutput
+        # 事故实测），引用清干净后 RSS 也不降——修剪工作集促其落地并如实上报。
+        ws_line = ""
+        if gc_empty_cache:
+            ws_ok, ws_line = _trim_working_set()
+            if not ws_ok:
+                logging.warning("[DeepVRAMCleanup] %s", ws_line)
+
         # --- Diagnostics ---
         used_after, _ = cls._vram(device)
         freed = max(0.0, used_before - used_after)
@@ -1002,8 +1057,13 @@ class DeepVRAMCleanup(io.ComfyNode):
         lines = [
             f"used: {used_before:.3f} -> {used_after:.3f} GB  (freed {freed:.3f})",
             f"total: {total:.2f} GB",
+            f"sysRAM before: {sysmem_before}",
+            _sysmem_line(),
             "",
         ]
+        if ws_line:
+            lines.append(ws_line)
+            lines.append("")
         lines.extend(_inspect_comfy_caches())
         if unload_lines:
             lines.append("")
