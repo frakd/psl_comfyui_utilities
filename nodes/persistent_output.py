@@ -569,19 +569,29 @@ if getattr(PromptServer, "instance", None) is not None:
             def rss_gb():
                 return round(proc.memory_info().rss / 1024 ** 3, 2)
 
+            gc.collect()
             stages = {"baseline": rss_gb()}
-            t = torch.zeros(500, 1000, 1000, dtype=torch.float32)   # ~2GB
-            stages["torch_alloc_2gb"] = rss_gb()
+            # 复刻工作流分配模式：7.2GB 原件 + inference_mode 内 clone
+            t = torch.zeros(211, 2112, 1344, 3, dtype=torch.float32)
+            stages["alloc_orig_7g"] = rss_gb()
+            with torch.inference_mode():
+                a = t.clone()
+            stages["alloc_clone_7g_infer"] = rss_gb()
+            del a
+            gc.collect()
+            stages["clone_freed"] = rss_gb()
             del t
             gc.collect()
-            stages["torch_freed"] = rss_gb()
-            arr = np.zeros((500, 1000, 1000), dtype=np.float32)     # ~2GB
-            stages["numpy_alloc_2gb"] = rss_gb()
-            del arr
+            stages["orig_freed"] = rss_gb()
+            # 对照组：小尺寸
+            t2 = torch.zeros(500, 1000, 1000, dtype=torch.float32)
+            stages["alloc_2g"] = rss_gb()
+            del t2
             gc.collect()
-            stages["numpy_freed"] = rss_gb()
-            return web.json_response({"verdict_hint": "alloc 后 freed 未回落 => 该分配器在此进程滞留",
-                                      "stages": stages})
+            stages["free_2g"] = rss_gb()
+            return web.json_response({
+                "verdict_hint": "clone_freed/orig_freed 未回落 => 在本进程复刻了泄漏，再按尺寸/模式二分",
+                "stages": stages})
         except Exception as e:
             return web.json_response({"error": f"探针失败: {e}"}, status=500)
 
