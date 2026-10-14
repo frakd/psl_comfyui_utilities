@@ -38,11 +38,18 @@
 
 import gc
 import logging
+import os
 
 import torch
 from aiohttp import web
 from server import PromptServer
 from comfy_api.latest import io
+
+# 调试开关（纯后端）：环境变量 PSL_DEBUG=1 时输出运行轨迹日志（存图/输出/释放
+# 的 RSS 轨迹），默认完全静默。warning/error 不受开关影响，始终可见。
+log = logging.getLogger("psl_comfyui_utilities.persistent_output")
+if os.environ.get("PSL_DEBUG", "").lower() in ("1", "true", "yes"):
+    log.setLevel(logging.DEBUG)
 
 SLOT_COUNT = 3
 
@@ -130,7 +137,7 @@ def _evict_keys(cache, uid: str, keys) -> int:
                 if isinstance(sd, dict):
                     sd.pop(key, None)
     except Exception as e:
-        logging.warning("[PersistentOutput] 摘除缓存条目失败 uid=%s: %s", uid, e)
+        log.warning("[PersistentOutput] 摘除缓存条目失败 uid=%s: %s", uid, e)
     return removed
 
 
@@ -150,7 +157,7 @@ def _prune_stale_cache_entries(uid: str, out_cache) -> None:
         key_set = getattr(out_cache, "cache_key_set", None)
         key = key_set.get_data_key(uid) if key_set is not None else None
     except Exception as e:
-        logging.warning("[PersistentOutput] 记录缓存键失败 uid=%s: %s", uid, e)
+        log.warning("[PersistentOutput] 记录缓存键失败 uid=%s: %s", uid, e)
         return
     if key is None:
         return
@@ -158,7 +165,7 @@ def _prune_stale_cache_entries(uid: str, out_cache) -> None:
     stale = keys - {key}
     if stale:
         removed = _evict_keys(out_cache, uid, stale)
-        logging.info("[PersistentOutput] 清理旧轮缓存条目 %d 条 uid=%s", removed, uid)
+        log.debug("[PersistentOutput] 清理旧轮缓存条目 %d 条 uid=%s", removed, uid)
         keys -= stale
     keys.add(key)
 
@@ -235,12 +242,12 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     s = _slots(uid)[slot]
     if image is not None:
         s["image"] = _clone_value("image", image)
-        logging.info("[PersistentOutput] 槽%d 存图: %s ptr=%s RSS=%s",
+        log.debug("[PersistentOutput] 槽%d 存图: %s ptr=%s RSS=%s",
                      slot + 1, _mem_brief("image", image, s["image"]),
                      _ptr_of(s["image"]), _rss_gb())
     if audio is not None:
         s["audio"] = _clone_value("audio", audio)
-        logging.info("[PersistentOutput] 槽%d 存音: %s RSS=%s",
+        log.debug("[PersistentOutput] 槽%d 存音: %s RSS=%s",
                      slot + 1, _mem_brief("audio", audio, s["audio"]), _rss_gb())
 
 
@@ -268,7 +275,7 @@ def release(uid: str, target: str = "all") -> bool:
     dropped = sum(_slot_bytes(s) for s in victims)
     # 副本由 numpy 承载（见 _clone_value），就地销毁即可——numpy 的 free 实测
     # 完整归还 commit，不需要 EmptyWorkingSet 兜底。
-    logging.info("[PersistentOutput] 释放 %s: 副本字节=%s RSS=%s",
+    log.debug("[PersistentOutput] 释放 %s: 副本字节=%s RSS=%s",
                  target, f"{dropped:,}", _rss_gb())
 
     if slot_idx is None:
@@ -283,7 +290,7 @@ def release(uid: str, target: str = "all") -> bool:
     if had_any:
         removed_own = _evict_keys(_CACHE_HANDLE.get(uid), uid, _CACHE_KEYS.get(uid, ()))
         _CACHE_KEYS.pop(uid, None)
-        logging.info("[PersistentOutput] 释放 %s: 副本字节=%s 摘自身缓存条目=%d",
+        log.debug("[PersistentOutput] 释放 %s: 副本字节=%s 摘自身缓存条目=%d",
                      target, f"{dropped:,}", removed_own)
         # 释放改变了槽状态：递增代数让下一轮缓存签名必变（gen widget 按需自增），
         # 下一轮重放的是释放后的新状态，不会命中释放前的旧输出。
@@ -415,7 +422,7 @@ class PersistentOutput(io.ComfyNode):
         del labels_json   # UI-only，后端不消费；形参仅防前端脚本未生效时报多余 kwarg
 
         # 临时探针：确认本轮 execute 真的在跑（缓存命中时根本不会进到这里）。
-        logging.info(
+        log.debug(
             "[PersistentOutput] execute uid=%s gen_in=%r 有输入=%s",
             uid, gen, [img is not None or aud is not None for img, aud in
                        ((image_1, audio_1), (image_2, audio_2), (image_3, audio_3))],
@@ -442,7 +449,7 @@ class PersistentOutput(io.ComfyNode):
         el = getattr(cls.hidden, "execution_list", None)
         out_cache = getattr(el, "output_cache", None) if el is not None else None
         _prune_stale_cache_entries(uid, out_cache)
-        logging.info("[PersistentOutput] 本轮输出 ptr=%s RSS=%s",
+        log.debug("[PersistentOutput] 本轮输出 ptr=%s RSS=%s",
                      _ptr_of(outs[0]) if outs else "None", _rss_gb())
         # ui 值一律包一层 list：execution.py:422 合并多个 ui 时按 key 把值当可迭代
         # 展开（{k: [y for x in uis for y in x[k]]}），裸标量（int/str）会直接炸
@@ -579,9 +586,9 @@ if getattr(PromptServer, "instance", None) is not None:
             return web.json_response({"error": f"未知 target: {target!r}"}, status=400)
         mem_before = _mem_snapshot()
         had = release(uid, target)
-        logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
-        logging.info("[PersistentOutput] 释放前内存: %s", mem_before)
+        log.debug("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
+        log.debug("[PersistentOutput] 释放前内存: %s", mem_before)
         gc.collect()
-        logging.info("[PersistentOutput] 释放后内存: %s（已提交应回落 ~7GB/槽）", _mem_snapshot())
+        log.debug("[PersistentOutput] 释放后内存: %s（已提交应回落 ~7GB/槽）", _mem_snapshot())
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
 

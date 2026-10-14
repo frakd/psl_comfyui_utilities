@@ -18,12 +18,18 @@ from comfy.model_management import (
     cleanup_models_gc,
 )
 
+# 调试开关（纯后端）：环境变量 PSL_DEBUG=1 时输出运行轨迹日志，默认静默。
+# warning/error 不受开关影响，始终可见。
+log = logging.getLogger("psl_comfyui_utilities.deep_vram_cleanup")
+if os.environ.get("PSL_DEBUG", "").lower() in ("1", "true", "yes"):
+    log.setLevel(logging.DEBUG)
+
 # 内核的选择性卸载接口（较新的 ComfyUI 才有）。缺失时退回本文件内置的 keep_loaded 实现。
 try:
     from comfy.model_management import unload_model_and_clones as _unload_model_and_clones
 except ImportError:
     _unload_model_and_clones = None
-    logging.info(
+    log.debug(
         "[DeepVRAMCleanup] comfy.model_management.unload_model_and_clones 不可用，"
         "指定模型卸载将使用内置 keep_loaded 回退实现"
     )
@@ -180,7 +186,7 @@ def _find_and_clear_execution_caches() -> int:
 #                 pass
 #
 #     for k, v in result.items():
-#         logging.info("[DeepVRAMCleanup] Cleared %s: %d entries", k, v)
+#         log.debug("[DeepVRAMCleanup] Cleared %s: %d entries", k, v)
 #
 #     return result
 
@@ -249,7 +255,7 @@ def _purge_cuda_orphans() -> int:
 #         freed = patcher.partially_unload(patcher.offload_device, 1e32)
 #         name = patcher.model.__class__.__name__
 #         lines.append(f"offloaded {name}: {freed / gb:.3f} GB VRAM -> {patcher.offload_device} (was {resident / gb:.3f} GB)")
-#         logging.info("[DeepVRAMCleanup] Offloaded %s: %.1f MB VRAM -> %s", name, freed / (1024 ** 2), patcher.offload_device)
+#         log.debug("[DeepVRAMCleanup] Offloaded %s: %.1f MB VRAM -> %s", name, freed / (1024 ** 2), patcher.offload_device)
 #     return lines
 
 
@@ -289,7 +295,7 @@ def _selective_unload_one(patcher, unload_additional_models: bool, all_devices: 
             )
             return
         except TypeError as exc:
-            logging.warning(
+            log.warning(
                 "[DeepVRAMCleanup] unload_model_and_clones 调用签名不兼容(%s)，改用内置回退实现", exc
             )
     _fallback_unload_model_and_clones(patcher, all_devices=all_devices)
@@ -340,19 +346,19 @@ def _free_leftovers(patcher, all_devices: bool) -> List[str]:
         try:
             freed = mm.free_memory(1e30, dev, keep_loaded)
         except Exception as exc:
-            logging.error(
+            log.error(
                 "[DeepVRAMCleanup] 在 %s 上补卸目标失败: %s", dev, exc, exc_info=True
             )
             lines.append(f"sweep FAILED on {dev}: {type(exc).__name__}: {exc}")
             continue
-        logging.info("[DeepVRAMCleanup] 补卸 %s 上的目标模型 %d 个", dev, len(freed))
+        log.debug("[DeepVRAMCleanup] 补卸 %s 上的目标模型 %d 个", dev, len(freed))
         lines.append(f"swept {len(freed)} on {dev}")
 
     remaining = _target_loaded_models(patcher)
     if remaining:
         devs = sorted({str(getattr(lm, "device", "?")) for lm in remaining})
         lines.append(f"still loaded: {devs}（已尝试所有设备，仍未释放，请看日志里的报错）")
-        logging.warning("[DeepVRAMCleanup] 目标模型仍驻留在 %s", devs)
+        log.warning("[DeepVRAMCleanup] 目标模型仍驻留在 %s", devs)
     return lines
 
 
@@ -379,7 +385,7 @@ def _trim_working_set() -> Tuple[bool, str]:
         line = (f"EmptyWorkingSet ok={ok} err={err}: "
                 f"RSS {rss_before / gb:.2f}GB -> {rss_after / gb:.2f}GB")
         if ok != 1:
-            logging.warning("[DeepVRAMCleanup] %s", line)
+            log.warning("[DeepVRAMCleanup] %s", line)
         return ok == 1, line
     except Exception as exc:
         return False, f"EmptyWorkingSet FAILED: {type(exc).__name__}: {exc}"
@@ -421,12 +427,12 @@ def _as_model_patcher(obj, label: str, lines: List[str]):
         patcher = None
     if patcher is None:
         msg = f"skip {label}: {type(obj).__name__} 上找不到 patcher（可能未加载权重）"
-        logging.warning("[DeepVRAMCleanup] %s", msg)
+        log.warning("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
         return None
     if not hasattr(patcher, "clone_base_uuid") or not hasattr(patcher, "loaded_size"):
         msg = f"skip {label}: {type(patcher).__name__} 不是可识别的 ModelPatcher"
-        logging.warning("[DeepVRAMCleanup] %s", msg)
+        log.warning("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
         return None
     return patcher
@@ -464,12 +470,12 @@ def _unload_selected_models(
             resident = patcher.loaded_size()
         except Exception as exc:
             resident = -1
-            logging.warning("[DeepVRAMCleanup] 读取 %s 的 loaded_size 失败: %s", name, exc)
+            log.warning("[DeepVRAMCleanup] 读取 %s 的 loaded_size 失败: %s", name, exc)
 
         try:
             _selective_unload_one(patcher, unload_additional_models, all_devices)
         except Exception as exc:
-            logging.error(
+            log.error(
                 "[DeepVRAMCleanup] 卸载 %s(%s) 失败: %s", label, name, exc, exc_info=True
             )
             lines.append(f"FAILED unload {label} {name}: {type(exc).__name__}: {exc}")
@@ -481,14 +487,14 @@ def _unload_selected_models(
         remaining = _target_loaded_models(patcher)
         if not before:
             lines.append(f"{label} {name}: 内核未登记为已加载，无需释放")
-            logging.info("[DeepVRAMCleanup] %s %s: 未驻留", label, name)
+            log.debug("[DeepVRAMCleanup] %s %s: 未驻留", label, name)
         elif remaining:
             still = sorted({str(getattr(lm, "device", "?")) for lm in remaining})
             lines.append(f"partial {label} {name}: 已处理，但仍驻留 {still}")
         else:
             host_note = "（主机内存常驻：已解下登记与 patch，基础权重待引用释放后才真正归还）" if "cpu" in devs else ""
             lines.append(f"unloaded {label} {name}: {max(resident, 0) / gb:.3f} GB @ {','.join(devs)}{host_note}")
-            logging.info(
+            log.debug(
                 "[DeepVRAMCleanup] Unloaded %s %s: %.1f MB @ %s", label, name, max(resident, 0) / (1024 ** 2), devs
             )
     return lines
@@ -616,7 +622,7 @@ def _size_cache_entry(entry) -> float:
     try:
         walk(getattr(entry, "outputs", None))
     except Exception as exc:
-        logging.warning("[DeepVRAMCleanup] 估算缓存条目体积失败: %s", exc)
+        log.warning("[DeepVRAMCleanup] 估算缓存条目体积失败: %s", exc)
     return float(total)
 
 
@@ -640,7 +646,7 @@ def _lookup_cache_entry(cache, node_id):
         try:
             target = resolve(node_id)
         except Exception as exc:
-            logging.warning(
+            log.warning(
                 "[DeepVRAMCleanup] 在 %s 上定位子缓存失败: %s", type(cache).__name__, exc, exc_info=True
             )
             return None, None
@@ -653,6 +659,27 @@ def _lookup_cache_entry(cache, node_id):
     if key is None:
         return None, None
     return target, key
+
+
+def _measure_node_output_cache(node_id, execution_list) -> str:
+    """只测不清理：报告 node_id 当前输出缓存条目数与 tensor 体量（dry-run）。"""
+    caches = _cache_objects_for_eviction(execution_list)
+    if not caches:
+        return f"node {node_id}: 找不到输出缓存对象"
+    found = 0
+    freed = 0.0
+    for cache in caches:
+        target, key = _lookup_cache_entry(cache, node_id)
+        if target is None or key is None:
+            continue
+        store = getattr(target, "cache", None)
+        if not isinstance(store, dict) or key not in store:
+            continue
+        found += 1
+        freed += _size_cache_entry(store[key])
+    if found == 0:
+        return f"node {node_id}: 输出缓存里没有条目（未执行或已被释放）"
+    return f"node {node_id}: 可释放 {found} 个缓存条目, ~{freed / (1024 ** 2):.1f} MB tensor"
 
 
 def _drop_edge_refs(execution_list, node_id) -> int:
@@ -681,7 +708,7 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
     caches = _cache_objects_for_eviction(execution_list)
     if not caches:
         msg = f"无法清理节点 {node_id}：找不到输出缓存对象（execution_list 与 gc 扫描都没有）"
-        logging.error("[DeepVRAMCleanup] %s", msg)
+        log.error("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
         return lines
 
@@ -696,7 +723,7 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
         reason = f"仍有下游待执行: {sorted(blockers)}"
     if blockers:
         msg = f"skip clear node {node_id}: {reason}（清了会被写回或让它们重算，可能取到不同结果）"
-        logging.warning("[DeepVRAMCleanup] %s", msg)
+        log.warning("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
         return lines
 
@@ -714,7 +741,7 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
         try:
             del store[key]
         except Exception as exc:
-            logging.error(
+            log.error(
                 "[DeepVRAMCleanup] 删除 %s 中的节点 %s 缓存条目失败: %s",
                 type(cache).__name__, node_id, exc, exc_info=True,
             )
@@ -731,14 +758,14 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
     if removed == 0:
         msg = f"node {node_id}: 输出缓存里没有条目（未执行或已被释放）"
         lines.append(msg)
-        logging.info("[DeepVRAMCleanup] %s", msg)
+        log.debug("[DeepVRAMCleanup] %s", msg)
     else:
         msg = (
             f"cleared node {node_id}: {removed} 个缓存条目, "
             f"{freed / (1024 ** 2):.1f} MB tensor, 边引用 {edge_dropped} 处"
         )
         lines.append(msg)
-        logging.info("[DeepVRAMCleanup] %s", msg)
+        log.debug("[DeepVRAMCleanup] %s", msg)
     return lines
 
 
@@ -947,24 +974,24 @@ class DeepVRAMCleanup(io.ComfyNode):
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
         if clear_all_node_cache:
             n = _find_and_clear_execution_caches()
-            logging.info("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
+            log.debug("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
 
         # 指定节点的运行缓存（只清 source 组端口连着的那些节点，可多个、自动去重）
         cache_lines: List[str] = []
         if clear_source_node_cache:
             if clear_all_node_cache:
                 msg = "skip 指定节点缓存清理: clear_all_node_cache 已开启，全清已覆盖"
-                logging.info("[DeepVRAMCleanup] %s", msg)
+                log.debug("[DeepVRAMCleanup] %s", msg)
                 cache_lines.append(msg)
             else:
                 hidden = cls.hidden
                 source_ids, why = _linked_source_node_ids(hidden.unique_id, hidden.prompt)
                 if not source_ids:
                     msg = f"指定节点缓存清理已开启，但没找到目标节点：{why}"
-                    logging.warning("[DeepVRAMCleanup] %s", msg)
+                    log.warning("[DeepVRAMCleanup] %s", msg)
                     cache_lines.append(msg)
                 else:
-                    logging.info(
+                    log.debug(
                         "[DeepVRAMCleanup] 准备清理 %d 个节点的运行缓存（由 source 连线指定）: %s",
                         len(source_ids), source_ids,
                     )
@@ -973,9 +1000,20 @@ class DeepVRAMCleanup(io.ComfyNode):
                             source_id, hidden.execution_list, hidden.unique_id, hidden.prompt
                         ))
         elif cache_sources:
-            logging.info(
-                "[DeepVRAMCleanup] source 端口已连线，但 clear_source_node_cache 未开启，保持不变"
-            )
+            # 干跑模式：只统计各 source 节点当前可释放的缓存量，不动任何条目。
+            # 结果进 diag（前端上屏），供决定是否开启 clear_source_node_cache。
+            hidden = cls.hidden
+            source_ids, why = _linked_source_node_ids(hidden.unique_id, hidden.prompt)
+            if not source_ids:
+                msg = f"source 已连线但没找到目标节点：{why}"
+                log.warning("[DeepVRAMCleanup] %s", msg)
+                cache_lines.append(msg)
+            else:
+                cache_lines.append("dry-run 未开启清理，各 source 节点当前可释放的缓存：")
+                for source_id in source_ids:
+                    cache_lines.append(_measure_node_output_cache(
+                        source_id, hidden.execution_list
+                    ))
 
         # ===================== 第二组：模型 =====================
         # 指定卸载：只卸指定端口连进来的模型（可与全卸同时勾选，此时以全卸为准）
@@ -984,13 +1022,13 @@ class DeepVRAMCleanup(io.ComfyNode):
         if unload_connected_models:
             if unload_models:
                 msg = "skip 指定卸载: unload_models 已开启，全卸覆盖本次选择性卸载"
-                logging.info("[DeepVRAMCleanup] %s", msg)
+                log.debug("[DeepVRAMCleanup] %s", msg)
                 unload_lines.append(msg)
             else:
                 targets = _collect_model_targets(models, clips, vaes)
                 if not targets:
                     msg = "指定卸载已开启，但 model / clip / vae 组里没有任何连线，未卸载任何模型"
-                    logging.warning("[DeepVRAMCleanup] %s", msg)
+                    log.warning("[DeepVRAMCleanup] %s", msg)
                     unload_lines.append(msg)
                 else:
                     unload_lines = _unload_selected_models(
@@ -999,7 +1037,7 @@ class DeepVRAMCleanup(io.ComfyNode):
                         all_devices=True,
                     )
         elif any((models, clips, vaes)):
-            logging.info(
+            log.debug(
                 "[DeepVRAMCleanup] model/clip/vae 组已连线，但 unload_connected_models 未开启，保持不变"
             )
 
@@ -1031,7 +1069,7 @@ class DeepVRAMCleanup(io.ComfyNode):
 
         if purge_orphan_tensors:
             n = _purge_cuda_orphans()
-            logging.info("[DeepVRAMCleanup] Purged %d orphan CUDA tensors", n)
+            log.debug("[DeepVRAMCleanup] Purged %d orphan CUDA tensors", n)
 
         # Final GC + cache flush
         for _ in range(3):
@@ -1048,7 +1086,7 @@ class DeepVRAMCleanup(io.ComfyNode):
         if gc_empty_cache:
             ws_ok, ws_line = _trim_working_set()
             if not ws_ok:
-                logging.warning("[DeepVRAMCleanup] %s", ws_line)
+                log.warning("[DeepVRAMCleanup] %s", ws_line)
 
         # --- Diagnostics ---
         used_after, _ = cls._vram(device)
