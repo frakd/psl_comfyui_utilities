@@ -536,33 +536,31 @@ if getattr(PromptServer, "instance", None) is not None:
             def rss_gb():
                 return round(proc.memory_info().rss / 1024 ** 3, 2)
 
+            def commit_gb():
+                # vms 在 Windows 上 = PageFileUsage，与任务管理器"已提交"同源
+                return round(proc.memory_info().vms / 1024 ** 3, 2)
+
+            def snap(tag):
+                stages[tag] = f"RSS={rss_gb()} COMMIT={commit_gb()}"
+
             gc.collect()
-            stages = {"baseline": rss_gb()}
+            snap("baseline")
+            # torch 路径：7.2GB zeros → free，观察 commit 是否回落
             t = torch.zeros(211, 2112, 1344, 3, dtype=torch.float32)
-            stages["alloc_orig_7g"] = rss_gb()
-            with torch.inference_mode():
-                a = t.clone()
-            stages["alloc_clone_7g_infer"] = rss_gb()
-            del a
-            gc.collect()
-            stages["clone_freed"] = rss_gb()
+            snap("torch_alloc_7g")
             del t
             gc.collect()
-            stages["orig_freed"] = rss_gb()
-            # 嫌疑变量一：pinned（页锁定）内存——CachingHostAllocator 是缓存型分配器
-            tp = torch.zeros(1200, 1000, 1000, dtype=torch.float32).pin_memory()
-            stages["alloc_pinned_4g"] = rss_gb()
-            with torch.inference_mode():
-                ap = tp.clone()
-            stages["alloc_pinned_clone"] = rss_gb()
-            del ap
+            snap("torch_free_7g")
+            # numpy 路径：同样 7.2GB，走 numpy 自己的分配器（绕开 torch 层）
+            import numpy as np
+            arr = np.zeros((211, 2112, 1344, 3), dtype=np.float32)
+            snap("numpy_alloc_7g")
+            del arr
             gc.collect()
-            stages["pinned_clone_freed"] = rss_gb()
-            del tp
-            gc.collect()
-            stages["pinned_orig_freed"] = rss_gb()
+            snap("numpy_free_7g")
             return web.json_response({
-                "verdict_hint": "pinned_clone_freed 未回落 => pinned 内存进缓存分配器池，实锤",
+                "verdict_hint": "某路径 free 后 COMMIT 不回落 => 该路径就是泄漏点；"
+                                "numpy 回落而 torch 不回落 => 私有副本改由 numpy 承载",
                 "stages": stages})
         except Exception as e:
             return web.json_response({"error": f"探针失败: {e}"}, status=500)
