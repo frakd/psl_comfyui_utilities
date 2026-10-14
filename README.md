@@ -2,8 +2,8 @@
 
 个人用的 ComfyUI 自定义节点合集 / A personal collection of ComfyUI custom nodes.
 
-所有节点均为 V3 节点（`comfy_api.latest` 的 `io.ComfyNode`），只依赖 ComfyUI 自带能力与 PyTorch，无额外第三方依赖。
-All nodes are V3 nodes (`io.ComfyNode` from `comfy_api.latest`). They rely only on what ships with ComfyUI plus PyTorch — no extra third-party dependencies.
+所有节点均为 V3 节点（`comfy_api.latest` 的 `io.ComfyNode`），只依赖 ComfyUI 自带能力与 PyTorch，无额外第三方依赖。唯一例外：Video Combine (Memory) 需要系统 PATH 上有 ffmpeg（外部子进程，非 Python 依赖）。
+All nodes are V3 nodes (`io.ComfyNode` from `comfy_api.latest`). They rely only on what ships with ComfyUI plus PyTorch — no extra third-party dependencies. The one exception: Video Combine (Memory) needs `ffmpeg` on the system PATH (an external subprocess, not a Python dependency).
 
 ---
 
@@ -32,6 +32,7 @@ Typing `psl` or `personal` in the node search box filters out every node in this
 | [Persistent Output](#persistent-output) | 三槽位记住前几趟运行的图/音频，断线后仍可复现做对比 |
 | [Refreshable Text Box](#refreshable-text-box) | 文本框自动刷新显示上游文本，且不污染运行缓存 |
 | [Image Container (6 Outputs)](#image-container-6-outputs) | 图片池 + 点选排序，输出 6 路单图与 1 个 batch |
+| [Video Combine (Memory)](#video-combine-memory) | 帧+音频直接在内存合成 MP4 不落盘（NVENC 加速引擎），合并/落盘接官方节点 |
 
 ---
 
@@ -160,6 +161,16 @@ Typical loop: leave "allow overwrite" on → run up to this node → edit the te
 
 **EN** — A multi-image container: collect a pool of images on the node, then click to decide which ones get output and in what order. Three ways in: the upload button, dragging image files onto the node, or Ctrl+V from the clipboard. A single click selects a thumbnail and it takes the next free output slot 1..6 in click order, with its slot number shown as a corner badge; click again to drop it and the badges renumber; long-press-drag only reorders what's displayed inside the container and doesn't touch badge numbers; the × on a thumbnail removes it from the pool. Outputs are 6 single-image slots plus one batch slot that concatenates the selected images — skipped when sizes don't match, which leaves the single-image slots untouched.
 `unselected_output` picks what an unselected slot yields, and the three options differ in how downstream reacts: `none` (default) outputs None so downstream still runs with one fewer image — good when several lines converge on the same multi-image node, provided that input is optional and None-checked; `block` returns an ExecutionBlocker, silently skipping the node it feeds (no error, no popup) and propagating further downstream — good when each slot drives its own branch and an unselected branch simply shouldn't run, but note that if several slots converge on one node, any single unselected slot stops that whole node; `placeholder` emits a black image matching the first selected image's size, so downstream definitely runs but treats black frames as real content with no warning — use it only when downstream tolerates neither None nor blocking.
+
+---
+
+### Video Combine (Memory)
+
+`nodes/psl_video_memory.py` · 分类 Category：`video/psl`
+
+**中** —— 帧 + 可选音频直接在内存中合成 MP4，全程不落盘：ffmpeg 以 fragmented MP4 写 stdout，Python 侧用 BytesIO 接住后包成官方 VIDEO 类型（`VideoFromFile(BytesIO)`），可无缝接官方一切 VIDEO 下游。编码引擎复刻本机优化过的 VHS VideoCombine，三项加速机制全保留：① GPU 往返量化——CPU 大帧搬上 GPU 做乘/clamp/量化，只把小体积 uint8 传回，转换耗时约为纯 CPU 的 1/3 且显存峰值恒定；② 有界队列流水线——帧转换在 daemon 线程经 maxsize=4 的队列与 NVENC 编码重叠，队列满自动背压；③ NVENC 硬编 + fake_trc 色彩参数——输入按 sRGB 谎报为 BT.709 传递函数，输出侧 `scale=out_color_matrix=bt709` 消除 gamma 漂移。默认参数 `nvenc_h264-mp4 / yuv420p / 15 Mbps`，另有 `nvenc_hevc-mp4` 与 libx264 软编（crf/preset 可调）备选。与 VHS 的结构差异除输出内存化外还有音频：VHS 先落盘无声视频再用第二个 ffmpeg 进程 mux，本节点把音频写成临时 f32le 裸流文件与视频在**同一条命令**里完成编码合成；顺带修掉 VHS 流水线"转换线程异常被静默、产出残缺文件"的隐患（异常经队列回传主线程显式报错）。多段合并接官方 ConcatenateVideo、落盘接官方 SaveVideo——编码参数一致时都是纯 remux 零重编码。注意两点：① 需要系统 PATH 上有 ffmpeg（full build）；② 中间视频驻留内存（15 Mbps 约 112 MB/分钟/段，输出缓存会持有引用），长会话多段拼接注意内存余量。
+
+**EN** — Turns frames plus optional audio into an MP4 entirely in memory, never touching disk: ffmpeg writes a fragmented MP4 to stdout, Python collects it into a BytesIO and wraps it as the official VIDEO type (`VideoFromFile(BytesIO)`), so it plugs into any official VIDEO downstream. The encoding engine replicates the locally-tuned VHS VideoCombine, keeping all three speedups: (1) GPU round-trip quantization — large CPU-resident frames are moved onto the GPU for scale/clamp/cast and only the small uint8 result travels back, cutting conversion time to about a third with a flat VRAM ceiling; (2) a bounded-queue pipeline — frame conversion runs on a daemon thread and overlaps NVENC encoding through a maxsize=4 queue with natural back-pressure; (3) NVENC hardware encoding with fake_trc color args — input is labelled BT.709 (a benign lie for sRGB data) and the output side uses `scale=out_color_matrix=bt709` to kill the gamma drift. Defaults are `nvenc_h264-mp4 / yuv420p / 15 Mbps`, with `nvenc_hevc-mp4` and libx264 software encoding (crf/preset) as alternates. Two structural differences from VHS besides the in-memory output: audio — VHS writes a silent video first and muxes with a second ffmpeg process, while this node feeds audio as a temporary raw f32le file so one single command encodes and muxes everything; and a fixed hazard — VHS's conversion thread fails silently on error, producing truncated files, while here the exception travels back through the queue and fails loudly. For multi-segment merging wire it into the official ConcatenateVideo and SaveVideo — with matching encode parameters both are pure remux with zero re-encoding. Two caveats: `ffmpeg` must be on the system PATH (full build), and the intermediate video lives in RAM (about 112 MB per minute per segment at 15 Mbps; the output cache holds a reference), so mind memory on long sessions with many segments.
 
 ---
 
