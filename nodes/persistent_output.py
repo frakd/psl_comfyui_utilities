@@ -238,6 +238,17 @@ def release(uid: str, target: str = "all") -> bool:
         slot_idx = idx
     had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
     dropped = sum(_slot_bytes(s) for s in victims)
+    # 引用者诊断：副本理应只有 _STORE 一处引用；若 release 后 RSS 不降，
+    # 这里打印的名字就是真凶。
+    import sys
+    for s in victims:
+        v = s.get("image")
+        if isinstance(v, torch.Tensor):
+            referrers = gc.get_referrers(v)
+            ref_desc = [f"{type(r).__name__}({len(r) if hasattr(r, '__len__') else '?'})"
+                        for r in referrers]
+            logging.info("[PersistentOutput] 副本引用者诊断: refcount=%d 引用者=%s",
+                         sys.getrefcount(v), ref_desc)
 
     if slot_idx is None:
         del _STORE[uid]
