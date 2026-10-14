@@ -227,6 +227,9 @@ def _log_tensor_freed(ptr: int) -> None:
 
 
 _watched_refs: list = []
+# 延迟释放队列：release 后副本不立刻销毁，转入此队列由后台任务在数秒后释放——
+# 判决"free 的时机/上下文"是否影响内存归还。
+_KEEPALIVE: list = []
 
 
 def _watch_tensor(v) -> None:
@@ -283,13 +286,16 @@ def release(uid: str, target: str = "all") -> bool:
         slot_idx = idx
     had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
     dropped = sum(_slot_bytes(s) for s in victims)
+    # 延迟释放实验：副本不再于 release 内销毁，转入 _KEEPALIVE，由路由的
+    # 后台任务在 3s 后从另一上下文释放——对照 RSS 是否回落。
     global _LAST_FREED
     _LAST_FREED = None
     for s in victims:
         v = s.get("image")
         if isinstance(v, torch.Tensor):
+            _KEEPALIVE.append(v)
             _LAST_FREED = {"shape": tuple(v.shape), "ptr": v.untyped_storage().data_ptr()}
-            break
+    logging.info("[PersistentOutput] 副本转入延迟释放队列(%d 个) RSS=%s", len(_KEEPALIVE), _rss_gb())
     # 引用者诊断 + 销毁监控：副本理应只有 _STORE 一处引用；release 后必须看到
     # 「副本已真正销毁」日志，否则对象仍被未发现的引用攥着。
     import sys
@@ -653,7 +659,18 @@ if getattr(PromptServer, "instance", None) is not None:
 
         async def _report_after():
             await asyncio.sleep(3)
-            logging.info("[PersistentOutput] 释放后3s内存: %s", _mem_snapshot())
+            logging.info("[PersistentOutput] 释放后3s内存（副本仍在延迟队列）: %s", _mem_snapshot())
+            n = len(_KEEPALIVE)
+            _KEEPALIVE.clear()
+            gc.collect()
+            logging.info("[PersistentOutput] 延迟释放 %d 个副本后 RSS=%s", n, _rss_gb())
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), -1, -1)
+                logging.info("[PersistentOutput] EmptyWorkingSet 后 RSS=%s（诊断工作集记账口径）", _rss_gb())
+            except Exception as e:
+                logging.warning("[PersistentOutput] EmptyWorkingSet 失败: %s", e)
 
         asyncio.create_task(_report_after())
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
