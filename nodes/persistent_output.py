@@ -543,6 +543,7 @@ if getattr(PromptServer, "instance", None) is not None:
             def snap(tag):
                 stages[tag] = f"RSS={rss_gb()} COMMIT={commit_gb()}"
 
+            stages = {}
             gc.collect()
             snap("baseline")
             # torch 路径：7.2GB zeros → free，观察 commit 是否回落
