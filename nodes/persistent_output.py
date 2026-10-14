@@ -86,6 +86,31 @@ def _clone_value(kind: str, value):
     return out
 
 
+def _tensor_bytes(t) -> int:
+    return t.numel() * t.element_size() if isinstance(t, torch.Tensor) else 0
+
+
+def _mem_brief(kind: str, original, stored) -> str:
+    """存入诊断：确认副本真的新建了独立存储。device 决定内存落在 RAM 还是显存，
+    data_ptr 相同则说明没拷贝（与输入共享存储）——内存不涨的判决性证据。"""
+    if kind == "image":
+        if isinstance(original, torch.Tensor) and isinstance(stored, torch.Tensor):
+            shared = original.data_ptr() == stored.data_ptr()
+            return (f"tensor dev={stored.device} dtype={stored.dtype} "
+                    f"shape={tuple(stored.shape)} bytes={_tensor_bytes(stored):,}"
+                    + (" ⚠与输入共享存储，未真正拷贝!" if shared else ""))
+        return f"⚠非张量 original={type(original).__name__} stored={type(stored).__name__}"
+    wf = stored.get("waveform") if isinstance(stored, dict) else None
+    if isinstance(wf, torch.Tensor):
+        return f"audio dict waveform dev={wf.device} shape={tuple(wf.shape)} bytes={_tensor_bytes(wf):,}"
+    return f"⚠audio 非 dict/无波形: {type(stored).__name__}"
+
+
+def _slot_bytes(s: dict) -> int:
+    return _tensor_bytes(s.get("image")) + (
+        _tensor_bytes(s["audio"].get("waveform")) if isinstance(s.get("audio"), dict) else 0)
+
+
 def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     """本轮该槽有输入：把**深拷贝副本**存进保留区（原件留给上游缓存与桥接输出）。"""
     if uid is None or not (0 <= slot < SLOT_COUNT):
@@ -93,8 +118,10 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     s = _slots(uid)[slot]
     if image is not None:
         s["image"] = _clone_value("image", image)
+        logging.info("[PersistentOutput] 槽%d 存图: %s", slot + 1, _mem_brief("image", image, s["image"]))
     if audio is not None:
         s["audio"] = _clone_value("audio", audio)
+        logging.info("[PersistentOutput] 槽%d 存音: %s", slot + 1, _mem_brief("audio", audio, s["audio"]))
 
 
 def _resolve_cache_target(cache, uid: str):
@@ -180,9 +207,11 @@ def release(uid: str, target: str = "all") -> bool:
     if uid is None or uid not in _STORE:
         return False
     if target == "all":
+        dropped = sum(_slot_bytes(s) for s in _STORE[uid])
         del _STORE[uid]
         had_any = True
         key_gone = True
+        logging.info("[PersistentOutput] 释放 all: 移除副本字节=%s", f"{dropped:,}")
     else:
         idx = {"slot1": 0, "slot2": 1, "slot3": 2}.get(target)
         if idx is None:
@@ -191,6 +220,8 @@ def release(uid: str, target: str = "all") -> bool:
         if slots is None:
             return False
         had_any = slots[idx]["image"] is not None or slots[idx]["audio"] is not None
+        logging.info("[PersistentOutput] 释放 %s: 移除副本字节=%s",
+                     target, f"{_slot_bytes(slots[idx]):,}")
         slots[idx] = {"image": None, "audio": None}
         # 三槽全空就把整个键删掉，不留空壳
         key_gone = all(s["image"] is None and s["audio"] is None for s in slots)
