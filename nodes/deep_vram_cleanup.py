@@ -702,15 +702,16 @@ def _drop_edge_refs(execution_list, node_id) -> int:
     return dropped
 
 
-def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[str]:
-    """清掉 node_id 在输出缓存里的条目，返回诊断行。"""
+def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> Tuple[List[str], int]:
+    """清掉 node_id 在输出缓存里的条目，返回 (诊断行, 实际删除的条目数)。"""
     lines: List[str] = []
+    removed_total = 0
     caches = _cache_objects_for_eviction(execution_list)
     if not caches:
         msg = f"无法清理节点 {node_id}：找不到输出缓存对象（execution_list 与 gc 扫描都没有）"
         log.error("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
-        return lines
+        return lines, 0
 
     # 安全判据：目标还有别的待执行消费者时不动手
     consumers = [c for c in _node_consumers(node_id, prompt) if our_id is None or c != str(our_id)]
@@ -725,7 +726,7 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
         msg = f"skip clear node {node_id}: {reason}（清了会被写回或让它们重算，可能取到不同结果）"
         log.warning("[DeepVRAMCleanup] %s", msg)
         lines.append(msg)
-        return lines
+        return lines, 0
 
     removed = 0
     freed = 0.0
@@ -766,7 +767,7 @@ def _evict_node_output_cache(node_id, execution_list, our_id, prompt) -> List[st
         )
         lines.append(msg)
         log.debug("[DeepVRAMCleanup] %s", msg)
-    return lines
+    return lines, removed
 
 
 # ---------------------------------------------------------------------------
@@ -972,9 +973,11 @@ class DeepVRAMCleanup(io.ComfyNode):
 
         # ===================== 第一组：运行缓存 =====================
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
+        need_trim = False
         if clear_all_node_cache:
             n = _find_and_clear_execution_caches()
             log.debug("[DeepVRAMCleanup] Cleared %d execution-cache entries", n)
+            need_trim = need_trim or n > 0
 
         # 指定节点的运行缓存（只清 source 组端口连着的那些节点，可多个、自动去重）
         cache_lines: List[str] = []
@@ -996,9 +999,11 @@ class DeepVRAMCleanup(io.ComfyNode):
                         len(source_ids), source_ids,
                     )
                     for source_id in source_ids:
-                        cache_lines.extend(_evict_node_output_cache(
+                        lines, removed = _evict_node_output_cache(
                             source_id, hidden.execution_list, hidden.unique_id, hidden.prompt
-                        ))
+                        )
+                        cache_lines.extend(lines)
+                        need_trim = need_trim or removed > 0
         elif cache_sources:
             # 干跑模式：只统计各 source 节点当前可释放的缓存量，不动任何条目。
             # 结果进 diag（前端上屏），供决定是否开启 clear_source_node_cache。
@@ -1045,6 +1050,7 @@ class DeepVRAMCleanup(io.ComfyNode):
             cleanup_models()
             cleanup_models_gc()
             unload_all_models()
+            need_trim = True
 
         # ===== 显存 -> 内存 offload 已停用（用户不要；ComfyUI 自身处理得很好）=====
         # offload_lines: List[str] = []
@@ -1081,9 +1087,11 @@ class DeepVRAMCleanup(io.ComfyNode):
             _trim_cuda_mempool(device.index if hasattr(device, "index") else 0)
 
         # 系统内存归还：Windows 堆对已 free 的脏大块惰性归还（PersistentOutput
-        # 事故实测），引用清干净后 RSS 也不降——修剪工作集促其落地并如实上报。
+        # 事故实测）——引用清干净后 RSS 也不降，且每次重新分配都提交全新内存。
+        # 只要本轮发生过成功的清理/卸载就强制修剪工作集，让归还确定性落地
+        # （不再依赖 gc_empty_cache 开关——实测不修剪时第二次清理就会失效）。
         ws_line = ""
-        if gc_empty_cache:
+        if need_trim or gc_empty_cache:
             ws_ok, ws_line = _trim_working_set()
             if not ws_ok:
                 log.warning("[DeepVRAMCleanup] %s", ws_line)
