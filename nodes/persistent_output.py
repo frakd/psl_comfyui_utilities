@@ -17,6 +17,11 @@
 - 所以：存入时 clone 一份节点独占的副本；释放时除清 _STORE 外，还把**本节点自己**
   的输出缓存条目一并摘除。上游节点自己的缓存完全不碰——那份原件由 ComfyUI 自己的
   缓存策略（或 DeepVRAMCleanup）管辖。
+- 输出恒等于存储副本：桥接时也不直出上游原件。否则本节点的输出缓存条目会 pin 住
+  上游对象——内核 RAM pressure 缓存按条目大小记账驱逐（caching.py ram_release），
+  上游条目被驱逐时原件仍被我们的条目攥着，实际释放不掉，内核以为已释放、压力不解除
+  就加码驱逐，把上游节点（VHS）自己的缓存也反复清掉重算——这就是"独立缓存与内核
+  缓存严重冲突"的根源（实测踩坑：VHS 反复重解码、释放后内存不动直到压满）。
 - 摘缓存有两个前提（实测踩坑后补齐）：① schema 必须声明 io.Hidden.execution_list，
   否则内核不注入执行列表，句柄永远是 None，摘除沦为空转（HiddenHolder 对未声明的
   hidden 一律返回 None）；② gen widget 让签名每轮必变 ⇒ 每轮产生一个**新 data key**
@@ -269,13 +274,13 @@ class PersistentOutput(io.ComfyNode):
                             f"image_{i}",
                             display_name=f"图像 {i}",
                             optional=True,
-                            tooltip=f"槽 {i} 的图像批次（视频帧）。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
+                            tooltip=f"槽 {i} 的图像批次（视频帧）。有输入则替换保留并输出存储副本；断开后输出该槽保留内容。",
                         ),
                         io.Audio.Input(
                             f"audio_{i}",
                             display_name=f"音频 {i}",
                             optional=True,
-                            tooltip=f"槽 {i} 的音频。有输入则替换保留并原样输出；断开后输出该槽保留内容。",
+                            tooltip=f"槽 {i} 的音频。有输入则替换保留并输出存储副本；断开后输出该槽保留内容。",
                         ),
                     )
                 ],
@@ -340,11 +345,10 @@ class PersistentOutput(io.ComfyNode):
         for i, (img, aud) in enumerate(inputs):
             store_input(uid, i, image=img, audio=aud)
             slot = _slots(uid)[i]
-            # 桥接 + 回放：有输入出输入，没输入出保留，都没有出 None
-            outs.extend([
-                img if img is not None else slot["image"],
-                aud if aud is not None else slot["audio"],
-            ])
+            # 桥接 + 回放统一为「输出恒等于存储副本」：有输入时 store_input 已把
+            # 深拷贝副本放进槽里，输出副本而不是上游原件——所有权隔离，绝不让我们
+            # 的缓存条目 pin 住上游对象（见模块 docstring）。没输入出保留，都没有出 None。
+            outs.extend([slot["image"], slot["audio"]])
         # ui 必须有：executed 事件只在本节点有 ui 输出时才发送（execution.py:567），
         # 没有它前端 onExecuted 永远不触发、状态行永远不刷新（用户实测踩过）。
         # 把各槽概要直接随事件送出去，前端免二次 HTTP。

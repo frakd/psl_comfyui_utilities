@@ -144,6 +144,9 @@ app.registerExtension({
         // 状态盖暗的根因，实测亮→暗→亮）。本节点是输出节点、无下游计算依赖，
         // 重跑成本≈0（只是从内存存储读引用组装输出），这是"让 comfyui 知道
         // 节点状态变了"的最可靠答案：不靠任何事件同步，签名必然不同。
+        // psl_gen 是**唯一计数源**：只在这里自增，绝不接受后端回写——后端
+        // _GENERATION 是独立计数器，两套计数器互相覆盖会让签名出现重复
+        // （实测 gen_in 在 2↔1 之间振荡），缓存命中重放/重复 key 随之而来。
         // 后端的 not_idempotent=True 与代数机制保留作纵深防御。
         const genW = node.widgets?.find((w) => w.name === 'gen');
         if (genW) {
@@ -212,10 +215,8 @@ app.registerExtension({
                     releaseBtn.classList.remove('busy');
                     releaseBtn.classList.add('done');
                     releaseBtn.textContent = '✓ 已释放';
-                    // 释放已递增后端存储代数：立即记下，下次排队写入 prompt 保证缓存必 miss
-                    if (resp?.gen !== undefined && resp?.gen !== null) {
-                        node.properties.psl_gen = String(resp.gen);
-                    }
+                    // 注意：不用后端返回的 gen 回写 psl_gen——前端计数器是唯一
+                    // 计数源（见 genW 注释），回写会造成签名重复。
                 } finally {
                     refreshStatus();
                     // 成功反馈停留片刻后回落（期间按钮保持禁用，防连点）
@@ -275,12 +276,7 @@ app.registerExtension({
             prevOnExecuted?.apply(this, arguments);
             const slots = output?.psl_slots;
             if (Array.isArray(slots) && slots.length === SLOT_COUNT) applySlots(slots);
-            // psl_gen 后端包了一层 list（ui 标量必须包 list，见后端注释）
-            const gen = Array.isArray(output?.psl_gen) ? output.psl_gen[0] : output?.psl_gen;
-            if (gen !== undefined && gen !== null) {
-                // 后端告知当前存储代数；下次排队写入 prompt，保证 release 后必 miss
-                node.properties.psl_gen = String(gen);
-            }
+            // 不回写 psl_gen（后端 ui 里的 psl_gen 是另一套计数器，见 genW 注释）
             scheduleRefresh(0);
             scheduleRefresh(600);
         };
