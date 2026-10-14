@@ -250,13 +250,15 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
         stored = s["image"]
         if isinstance(stored, torch.Tensor):
             logging.info("[PersistentOutput] 槽%d 存图: %s 来源类型=%s ptr=%s 输入pinned=%s 副本pinned=%s "
-                         "输入storage字节=%s RSS=%s",
+                         "输入storage字节=%s 输入连续=%s 输入offset=%s RSS=%s",
                          slot + 1, _mem_brief("image", image, stored),
                          type(image).__module__ + "." + type(image).__qualname__,
                          _ptr_of(stored),
                          image.is_pinned() if isinstance(image, torch.Tensor) else "?",
                          stored.is_pinned(),
                          f"{image.untyped_storage().nbytes():,}" if isinstance(image, torch.Tensor) else "?",
+                         image.is_contiguous() if isinstance(image, torch.Tensor) else "?",
+                         image.storage_offset() if isinstance(image, torch.Tensor) else "?",
                          _rss_gb())
     if audio is not None:
         s["audio"] = _clone_value("audio", audio)
@@ -666,11 +668,16 @@ if getattr(PromptServer, "instance", None) is not None:
             logging.info("[PersistentOutput] 延迟释放 %d 个副本后 RSS=%s", n, _rss_gb())
             try:
                 import ctypes
-                k32 = ctypes.windll.kernel32
-                k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), -1, -1)
-                logging.info("[PersistentOutput] EmptyWorkingSet 后 RSS=%s（诊断工作集记账口径）", _rss_gb())
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+                k32.SetProcessWorkingSetSize.restype = ctypes.c_int
+                ok = k32.SetProcessWorkingSetSize(ctypes.c_void_p(-1), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+                err = ctypes.get_last_error()
+                logging.info("[PersistentOutput] EmptyWorkingSet 调用 ok=%s err=%s RSS=%s", ok, err, _rss_gb())
             except Exception as e:
                 logging.warning("[PersistentOutput] EmptyWorkingSet 失败: %s", e)
+            await asyncio.sleep(30)
+            logging.info("[PersistentOutput] 释放后33s内存（观察延迟归还）: %s", _mem_snapshot())
 
         asyncio.create_task(_report_after())
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
