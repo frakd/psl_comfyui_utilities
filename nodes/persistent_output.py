@@ -500,6 +500,34 @@ if getattr(PromptServer, "instance", None) is not None:
             "kernel_total_bytes": total,
         })
 
+    @PromptServer.instance.routes.get("/psl/persist/mem_probe")
+    async def persist_mem_probe(request):
+        """进程内分配器探针：在本服务器进程里做 torch/numpy 的大块分配→释放对照，
+        判定这个进程还不把内存还给 OS。浏览器/curl 访问即可，返回各阶段 RSS。"""
+        try:
+            import numpy as np
+            import psutil
+            proc = psutil.Process()
+
+            def rss_gb():
+                return round(proc.memory_info().rss / 1024 ** 3, 2)
+
+            stages = {"baseline": rss_gb()}
+            t = torch.zeros(500, 1000, 1000, dtype=torch.float32)   # ~2GB
+            stages["torch_alloc_2gb"] = rss_gb()
+            del t
+            gc.collect()
+            stages["torch_freed"] = rss_gb()
+            arr = np.zeros((500, 1000, 1000), dtype=np.float32)     # ~2GB
+            stages["numpy_alloc_2gb"] = rss_gb()
+            del arr
+            gc.collect()
+            stages["numpy_freed"] = rss_gb()
+            return web.json_response({"verdict_hint": "alloc 后 freed 未回落 => 该分配器在此进程滞留",
+                                      "stages": stages})
+        except Exception as e:
+            return web.json_response({"error": f"探针失败: {e}"}, status=500)
+
     @PromptServer.instance.routes.post("/psl/persist/release")
     async def persist_release(request):
         try:
