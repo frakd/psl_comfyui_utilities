@@ -179,6 +179,10 @@ def _clone_value(kind: str, value):
     return out
 
 
+# 最近一次释放的副本信息（形状/指针），供释放路由做分配器复用探针。
+_LAST_FREED: dict | None = None
+
+
 def _tensor_bytes(t) -> int:
     return t.numel() * t.element_size() if isinstance(t, torch.Tensor) else 0
 
@@ -242,9 +246,11 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
         s["image"] = _clone_value("image", image)
         stored = s["image"]
         if isinstance(stored, torch.Tensor):
-            logging.info("[PersistentOutput] 槽%d 存图: %s ptr=%s 输入pinned=%s 副本pinned=%s "
+            logging.info("[PersistentOutput] 槽%d 存图: %s 来源类型=%s ptr=%s 输入pinned=%s 副本pinned=%s "
                          "输入storage字节=%s RSS=%s",
-                         slot + 1, _mem_brief("image", image, stored), _ptr_of(stored),
+                         slot + 1, _mem_brief("image", image, stored),
+                         type(image).__module__ + "." + type(image).__qualname__,
+                         _ptr_of(stored),
                          image.is_pinned() if isinstance(image, torch.Tensor) else "?",
                          stored.is_pinned(),
                          f"{image.untyped_storage().nbytes():,}" if isinstance(image, torch.Tensor) else "?",
@@ -277,6 +283,13 @@ def release(uid: str, target: str = "all") -> bool:
         slot_idx = idx
     had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
     dropped = sum(_slot_bytes(s) for s in victims)
+    global _LAST_FREED
+    _LAST_FREED = None
+    for s in victims:
+        v = s.get("image")
+        if isinstance(v, torch.Tensor):
+            _LAST_FREED = {"shape": tuple(v.shape), "ptr": v.untyped_storage().data_ptr()}
+            break
     # 引用者诊断 + 销毁监控：副本理应只有 _STORE 一处引用；release 后必须看到
     # 「副本已真正销毁」日志，否则对象仍被未发现的引用攥着。
     import sys
@@ -624,6 +637,19 @@ if getattr(PromptServer, "instance", None) is not None:
         logging.info("[PersistentOutput] 释放前内存: %s", mem_before)
         gc.collect()
         logging.info("[PersistentOutput] 释放后立即内存: %s", _mem_snapshot())
+        # 分配器复用探针：副本刚被销毁，立刻分配同尺寸块——若分配器返回的指针
+        # 等于已销毁副本的 ptr，说明 C++ free 已执行（问题转向 RSS 语义）；
+        # 若指针不同且 RSS 净增，说明 free 根本没执行（存在 C++ 层持有者）。
+        if _LAST_FREED:
+            try:
+                probe = torch.empty(*_LAST_FREED["shape"], dtype=torch.float32)
+                logging.info("[PersistentOutput] 复用探针: 销毁副本ptr=%s 新块ptr=%s RSS=%s",
+                             hex(_LAST_FREED["ptr"]), _ptr_of(probe), _rss_gb())
+                del probe
+                gc.collect()
+                logging.info("[PersistentOutput] 复用探针释放后 RSS=%s", _rss_gb())
+            except Exception as e:
+                logging.warning("[PersistentOutput] 复用探针失败: %s", e)
 
         async def _report_after():
             await asyncio.sleep(3)
