@@ -8,7 +8,7 @@ from .image_container import ImageContainer
 from .mask_paint_output import MaskPaintOutput
 from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
-from .psl_video_memory import PSLVideoCombineMemory, PSLVideoConcatSave
+from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
 
 _NODE_CLASSES = (
@@ -24,7 +24,6 @@ _NODE_CLASSES = (
     RefreshableTextBox,
     ImageContainer,
     PSLVideoCombineMemory,
-    PSLVideoConcatSave,
 )
 
 NODE_CLASS_MAPPINGS = {}

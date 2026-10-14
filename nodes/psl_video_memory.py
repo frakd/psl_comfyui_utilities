@@ -1,4 +1,4 @@
-"""PSL 内存视频合成与零重编码合并 —— 两个节点。
+"""PSL 内存视频合成节点。
 
 PSLVideoCombineMemory（Video Combine (Memory)）：
     帧 + 音频 → 内存 MP4，全程不落盘。编码引擎照搬 VHS VideoCombine 的
@@ -15,19 +15,11 @@ PSLVideoCombineMemory（Video Combine (Memory)）：
       - 输出：ffmpeg 以 fragmented MP4（-movflags +frag_keyframe+empty_moov）
         写 stdout（普通 MP4 muxer 需要 seek，管道写不了），Python 侧用
         BytesIO 接住后包成官方 io.Video（VideoFromFile(BytesIO)），可无缝
-        接 ComfyUI 一切 VIDEO 下游（含官方 SaveVideo）；
+        接 ComfyUI 一切 VIDEO 下游（多段合并直接用官方 ConcatenateVideo，
+        落盘用官方 SaveVideo，签名一致时均为流拷贝）；
       - 音频：VHS 是"先落盘无声视频 → 第二个 ffmpeg 进程 mux"，但 stdin 只
         有一条已被视频帧占用，因此这里把音频写成临时 f32le 裸流文件，与视频
         在同一条命令里完成 nvenc + aac + mux；apad + -shortest 对齐语义照搬。
-
-PSLVideoConcatSave（Video Concat & Save）：
-    多段视频 → 编码签名校验 → 流拷贝 remux 落盘 + 预览。签名口径对齐官方
-    VideoFromList（编码器/参数集/分辨率/位深/色彩/fps/音频参数），不一致时
-    默认中文报错（零重编码保护的显式契约），打开 allow_reencode 才整体
-    重编码并打警告。校验通过后交给官方 VideoFromList.save_to 走 packet
-    copy remux（时间戳 rebase、B 帧 dts 修复、faststart 均为官方久经测试
-    的路径）：视频流全程零重编码；音频轨会重编码为 AAC——这是拼接处时间戳
-    连续性所需，开销很小，视频才是大头。
 
 已知限制：中间视频驻留内存（15 Mbps 约 112 MB/分钟/段），ComfyUI 输出缓存
 会持有引用；长会话多段拼接时注意内存余量。
@@ -36,26 +28,21 @@ PSLVideoConcatSave（Video Concat & Save）：
 import logging
 import os
 import queue
-import re
 import shutil
 import subprocess
 import threading
 import tempfile
-from fractions import Fraction
 from io import BytesIO
 
-import av
 import torch
 import folder_paths
-from comfy.cli_args import args
-from comfy_api.latest import io, InputImpl, Types, ui
+from comfy_api.latest import io, InputImpl
 
 import comfy.utils
 
 logger = logging.getLogger("psl.video_memory")
 
 ENCODE_ARGS = ("utf-8", "replace")
-_ORDINAL_RE = re.compile(r"(\d+)$")
 
 # 支持 Nvenc 的格式走 -b:v 码率控制；软编 h264-mp4 走 -crf/-preset。
 _NVENC_FORMATS = {
@@ -346,158 +333,3 @@ class PSLVideoCombineMemory(io.ComfyNode):
                     os.remove(tmp_audio)
                 except OSError as exc:
                     logger.warning("临时音频文件删除失败：%s（%s）", tmp_audio, exc)
-
-
-def _video_signature(video) -> dict:
-    """提取一段视频的编码签名（口径对齐官方 VideoFromList.encoded_signature，
-    并额外纳入帧率与音频有无——这两项官方不在签名里校验，但拼接正确性需要）。"""
-    with av.open(video.get_stream_source()) as container:
-        if not len(container.streams.video):
-            raise ValueError("输入中没有视频流")
-        vs = container.streams.video[0]
-        decodable_audio = next(
-            (s for s in reversed(container.streams.audio) if s.codec_context is not None), None
-        )
-        bit_depth = 8
-        if vs.format is not None and vs.format.components:
-            bit_depth = max(c.bits for c in vs.format.components)
-        # PyAV 18 的 color_trc 是 int，旧版是枚举对象——统一取其名字/数值做比较
-        color_trc = vs.color_trc
-        return {
-            "codec": vs.codec.canonical_name,
-            "extradata": vs.codec_context.extradata,
-            "resolution": (vs.width, vs.height),
-            "bit_depth": bit_depth,
-            "color_trc": getattr(color_trc, "name", color_trc) if color_trc is not None else None,
-            "fps": Fraction(vs.average_rate) if vs.average_rate else None,
-            "has_audio": decodable_audio is not None,
-            "audio": (
-                (decodable_audio.sample_rate, decodable_audio.layout.name)
-                if decodable_audio is not None else None
-            ),
-        }
-
-
-_SIG_FIELD_NAMES = {
-    "codec": "编码器",
-    "extradata": "编码器参数集",
-    "resolution": "分辨率",
-    "bit_depth": "位深",
-    "color_trc": "色彩传递函数",
-    "fps": "帧率",
-    "has_audio": "是否含音频",
-    "audio": "音频参数",
-}
-
-
-def _signature_diffs(signatures: list) -> list:
-    """返回不一致字段的中文描述列表；空列表 = 全部一致。"""
-    base = signatures[0]
-    diffs = []
-    for index, sig in enumerate(signatures[1:], 1):
-        for key, expected in base.items():
-            actual = sig[key]
-            if expected != actual:
-                diffs.append(
-                    f"第 {index} 段 {key}（{_SIG_FIELD_NAMES.get(key, key)}）不一致："
-                    f"首段 {expected!r}，本段 {actual!r}"
-                )
-    return diffs
-
-
-def _flatten_videos(videos) -> list:
-    """Autogrow 输入展开为有序视频段列表（键按尾部序号排序，兼容多种键形态）。"""
-    items = []
-    if videos is None:
-        return items
-    if isinstance(videos, dict):
-        def ordinal(key):
-            m = _ORDINAL_RE.search(key)
-            return int(m.group(1)) if m else 0
-        for key in sorted(videos.keys(), key=ordinal):
-            value = videos[key]
-            items.extend(value if isinstance(value, (list, tuple)) else [value])
-    elif isinstance(videos, (list, tuple)):
-        items.extend(videos)
-    else:
-        items.append(videos)
-    return [v for v in items if v is not None]
-
-
-class PSLVideoConcatSave(io.ComfyNode):
-    @classmethod
-    def define_schema(cls) -> io.Schema:
-        return io.Schema(
-            node_id="PSLVideoConcatSave",
-            display_name="Video Concat & Save",
-            category="video/psl",
-            description=(
-                "多段视频合并后直接落盘：编码签名一致时视频流纯 packet 拷贝（零重编码），"
-                "仅音频轨重编码为 AAC 以保证拼接处时间戳连续。参数不一致默认报错，"
-                "打开宽松开关才整体重编码（慢）。"
-            ),
-            inputs=[
-                io.Autogrow.Input(
-                    "videos",
-                    template=io.Autogrow.TemplatePrefix(
-                        io.Video.Input("video", tooltip="按连接顺序依次拼接的视频段。"),
-                        prefix="video",
-                        min=1,
-                        max=100,
-                    ),
-                    tooltip="要合并的视频段（输出口连满自动增长）。",
-                ),
-                io.String.Input(
-                    "filename_prefix",
-                    default="video/%date:yyyy-MM-dd%/minimax_h3_i2v",
-                    tooltip="保存路径/文件名前缀，支持 %date:yyyy-MM-dd% 等模板（核心 SaveVideo 同款）。",
-                ),
-                io.Combo.Input("format", options=["mp4", "mkv"], default="mp4", optional=True, tooltip="输出容器。"),
-                io.Boolean.Input(
-                    "allow_reencode",
-                    default=False,
-                    tooltip="宽松模式：视频段参数不一致时不再报错，而是整体重编码为统一参数（慢，画质有损）。",
-                ),
-            ],
-            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
-            is_output_node=True,
-            outputs=[io.Video.Output(display_name="video", tooltip="合并后的视频，可供下游继续使用。")],
-        )
-
-    @classmethod
-    def execute(cls, videos, filename_prefix, format="mp4", allow_reencode=False) -> io.NodeOutput:
-        segments = _flatten_videos(videos)
-        if not segments:
-            raise ValueError("没有已连接的视频段，请至少连接一段视频")
-
-        signatures = [_video_signature(v) for v in segments]
-        diffs = _signature_diffs(signatures)
-        if diffs:
-            message = "视频段参数不一致，已拒绝拼接（零重编码保护）：\n" + "\n".join(diffs)
-            if not allow_reencode:
-                raise ValueError(message + "\n\n如接受整体重编码（慢），请把 allow_reencode 打开。")
-            logger.warning("%s\nallow_reencode 已开启，将整体重编码。", message)
-
-        merged = InputImpl.VideoFromList(list(segments))
-        container = Types.VideoContainer(format)
-        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, folder_paths.get_output_directory()
-        )
-        file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(format)}"
-        path = os.path.join(full_output_folder, file)
-
-        saved_metadata = None
-        if not args.disable_metadata:
-            metadata = {}
-            if cls.hidden.extra_pnginfo is not None:
-                metadata.update(cls.hidden.extra_pnginfo)
-            if cls.hidden.prompt is not None:
-                metadata["prompt"] = cls.hidden.prompt
-            if metadata:
-                saved_metadata = metadata
-
-        merged.save_to(path, format=container, codec=Types.VideoCodec.AUTO, metadata=saved_metadata)
-        return io.NodeOutput(
-            merged,
-            ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]),
-        )
