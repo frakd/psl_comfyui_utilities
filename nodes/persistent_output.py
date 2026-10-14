@@ -36,6 +36,7 @@
 import asyncio
 import gc
 import logging
+import weakref
 
 import torch
 from aiohttp import web
@@ -203,6 +204,30 @@ def _slot_bytes(s: dict) -> int:
         _tensor_bytes(s["audio"].get("waveform")) if isinstance(s.get("audio"), dict) else 0)
 
 
+def _rss_gb() -> str:
+    try:
+        import psutil
+        return f"{psutil.Process().memory_info().rss / 1024 ** 3:.2f}GB"
+    except Exception:
+        return "?"
+
+
+def _ptr_of(v) -> str:
+    return hex(v.untyped_storage().data_ptr()) if isinstance(v, torch.Tensor) else "None"
+
+
+def _log_tensor_freed(ptr: int) -> None:
+    """weakref 销毁回调：副本对象被 Python 释放的瞬间触发。没看到这条日志 =
+    对象还活着（仍有未发现的引用）；看到但 RSS 不降 = 分配器/OS 层滞留。"""
+    logging.info("[PersistentOutput] 副本已真正销毁 ptr=%s RSS=%s", hex(ptr), _rss_gb())
+
+
+def _watch_tensor(v) -> None:
+    if isinstance(v, torch.Tensor):
+        ptr = v.untyped_storage().data_ptr()
+        weakref.ref(v, lambda _r, ptr=ptr: _log_tensor_freed(ptr))
+
+
 def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     """本轮该槽有输入：把**深拷贝副本**存进保留区（原件留给上游缓存与桥接输出）。"""
     if uid is None or not (0 <= slot < SLOT_COUNT):
@@ -210,10 +235,13 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
     s = _slots(uid)[slot]
     if image is not None:
         s["image"] = _clone_value("image", image)
-        logging.info("[PersistentOutput] 槽%d 存图: %s", slot + 1, _mem_brief("image", image, s["image"]))
+        logging.info("[PersistentOutput] 槽%d 存图: %s ptr=%s RSS=%s",
+                     slot + 1, _mem_brief("image", image, s["image"]),
+                     _ptr_of(s["image"]), _rss_gb())
     if audio is not None:
         s["audio"] = _clone_value("audio", audio)
-        logging.info("[PersistentOutput] 槽%d 存音: %s", slot + 1, _mem_brief("audio", audio, s["audio"]))
+        logging.info("[PersistentOutput] 槽%d 存音: %s RSS=%s",
+                     slot + 1, _mem_brief("audio", audio, s["audio"]), _rss_gb())
 
 
 def release(uid: str, target: str = "all") -> bool:
@@ -238,8 +266,8 @@ def release(uid: str, target: str = "all") -> bool:
         slot_idx = idx
     had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
     dropped = sum(_slot_bytes(s) for s in victims)
-    # 引用者诊断：副本理应只有 _STORE 一处引用；若 release 后 RSS 不降，
-    # 这里打印的名字就是真凶。
+    # 引用者诊断 + 销毁监控：副本理应只有 _STORE 一处引用；release 后必须看到
+    # 「副本已真正销毁」日志，否则对象仍被未发现的引用攥着。
     import sys
     for s in victims:
         v = s.get("image")
@@ -247,8 +275,9 @@ def release(uid: str, target: str = "all") -> bool:
             referrers = gc.get_referrers(v)
             ref_desc = [f"{type(r).__name__}({len(r) if hasattr(r, '__len__') else '?'})"
                         for r in referrers]
-            logging.info("[PersistentOutput] 副本引用者诊断: refcount=%d 引用者=%s",
-                         sys.getrefcount(v), ref_desc)
+            logging.info("[PersistentOutput] 副本引用者诊断: ptr=%s refcount=%d 引用者=%s",
+                         _ptr_of(v), sys.getrefcount(v), ref_desc)
+            _watch_tensor(v)
 
     if slot_idx is None:
         del _STORE[uid]
@@ -421,6 +450,8 @@ class PersistentOutput(io.ComfyNode):
         el = getattr(cls.hidden, "execution_list", None)
         out_cache = getattr(el, "output_cache", None) if el is not None else None
         _prune_stale_cache_entries(uid, out_cache)
+        logging.info("[PersistentOutput] 本轮输出 ptr=%s RSS=%s",
+                     _ptr_of(outs[0]) if outs else "None", _rss_gb())
         # ui 值一律包一层 list：execution.py:422 合并多个 ui 时按 key 把值当可迭代
         # 展开（{k: [y for x in uis for y in x[k]]}），裸标量（int/str）会直接炸
         # "'int' object is not iterable"（实测踩过）。
