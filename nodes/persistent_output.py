@@ -9,15 +9,22 @@
 典型对比流：轮 1 接上游跑（槽 1 保留+桥接）→ 改参数跑轮 2（槽 2）→ 再跑轮 3（槽 3）
 → 断开上游：槽 1/槽 2 的输出分别接 A/B Compare 两耳，与实时结果并排对比。
 
-内存策略（定稿哲学：**只管自己的副本，完全不干预 ComfyUI 缓存机制**）：
+内存策略（定稿哲学：**副本只属于 _STORE，内核缓存里绝不留存本节点的输出**）：
 - 存入时 clone 一份节点独占的副本进 _STORE；输出恒等于存储副本（桥接也不直出
-  上游原件，避免我们的输出缓存条目 pin 住上游对象、扰乱内核按条目大小的记账）。
-- ComfyUI 会把本节点的输出写进全局运行缓存并按自己的策略（RAM 压力驱逐/命中
-  重放）管理它们——那是内核的正常行为，本节点不做任何摘除/清理干预（早期版本
-  干预过：句柄+记账+摘除，实测把上游节点的缓存状态搅乱，已全部撤掉）。
-- 释放 = 清 _STORE 的副本；副本内存随后由内核按其策略回收，需要立即全清时用
-  前端自带的「释放内存」按钮（内核官方 reset 通道）。释放后下一轮 gen widget
-  保证缓存必 miss，重放的是释放后的新状态（None），不会重放旧输出。
+  上游原件）。
+- 内核会对每个节点的输出**无条件**写运行缓存（execution.py:616-618）。条目里的
+  是副本的**引用**（不额外占内存），但引用会让对象活着——release 清了 _STORE
+  后，若条目还在，内存一字节都不会降（实测铁证）。所以只干预**我们自己节点**
+  的条目，精确按 key：① execute 时记账当轮 key、摘掉历轮旧条目（它引用着已被
+  替换的旧副本——"每次导入涨 6.7GB"的主体）；② release 时摘掉自己的全部条目，
+  副本立刻无人引用（除非已被下游消费，见下）。本轮条目必须活到本轮结束——下游
+  节点取上游数据走的就是这份缓存（graph.py get_local），当轮摘了下游拿到 None。
+- 释放 = 清 _STORE 副本 + ②的摘除。剩余例外（接受，不处理）：副本已被下游节点
+  消费时，下游条目的引用会 pin 到内核压力驱逐——内核对所有节点的统一行为，
+  /psl/persist/cache_debug 端点可对账；上游 VHS 自己条目里的原件同理。
+  需要全部立即清掉时用前端自带的「释放内存」按钮（官方 reset）。
+- gen widget 按需自增（仅释放后）：内容没变时签名不变，内核条目同 key 替换不
+  留尸体；释放后必 miss 重放释放后的新状态。
 - 其余不变：只存内存不落盘，进程退出即释放；键是节点 unique_id；三槽全空
   删整个键；节点从画布删除时前端自动全清。
 - 代价：桥接期间内容在内存里存两份（本节点副本 + 上游缓存原件），这是隔离
@@ -47,6 +54,109 @@ _GENERATION: dict[str, int] = {}
 
 def _bump_generation(uid: str) -> None:
     _GENERATION[uid] = _GENERATION.get(uid, 0) + 1
+
+
+# unique_id -> 本节点最近一次执行时的内核 outputs 缓存句柄与当轮 data key。
+# 句柄/键用于：execute 时摘掉历轮旧条目（旧副本尸体）、release 时摘掉自己的
+# 条目与引用了副本的下游条目。**本轮条目绝不能在当轮摘除**——下游节点取上游
+# 数据走的就是同一份缓存（graph.py get_local），当轮摘了下游会拿到 None。
+_CACHE_HANDLE: dict[str, object] = {}
+_CACHE_KEYS: dict[str, set] = {}
+
+
+def _tensor_ptrs(value, seen: set | None = None) -> set[int]:
+    """递归收集输出里的 CPU 张量 data_ptr（内容指纹，用于诊断对账）。"""
+    if seen is None:
+        seen = set()
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cpu" and value.numel() > 0:
+            seen.add(value.untyped_storage().data_ptr())
+    elif isinstance(value, dict):
+        for v in value.values():
+            _tensor_ptrs(v, seen)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _tensor_ptrs(v, seen)
+    return seen
+
+
+def _entry_stats(outputs, seen_storages: set | None = None) -> tuple[int, set[int]]:
+    """统计一个 CacheEntry.outputs 的 CPU 张量字节数与内容指纹（镜像内核 ram_release 的扫描）。"""
+    total = 0
+    ptrs: set[int] = set()
+    seen = seen_storages if seen_storages is not None else set()
+
+    def walk(v):
+        nonlocal total
+        if isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+        elif isinstance(v, torch.Tensor):
+            if v.device.type == "cpu" and v.numel() > 0:
+                key = (v.untyped_storage().data_ptr(), v.untyped_storage().nbytes())
+                if key not in seen:
+                    seen.add(key)
+                    total += v.untyped_storage().nbytes()
+                    ptrs.add(v.untyped_storage().data_ptr())
+
+    walk(outputs)
+    return total, ptrs
+
+
+def _evict_keys(cache, uid: str, keys) -> int:
+    """从内核 outputs 缓存摘除指定 data key 的条目（镜像内核删除动作，含侧表）。"""
+    if cache is None or not keys:
+        return 0
+    store = getattr(cache, "cache", None)
+    if not isinstance(store, dict):
+        return 0
+    removed = 0
+    try:
+        for key in list(keys):
+            if key not in store:
+                continue
+            del store[key]
+            removed += 1
+            # 镜像内核自己的删除：LRU/RAM 缓存的 side dict 不清会留残键
+            for side in ("used_generation", "timestamps", "children"):
+                sd = getattr(cache, side, None)
+                if isinstance(sd, dict):
+                    sd.pop(key, None)
+    except Exception as e:
+        logging.warning("[PersistentOutput] 摘除缓存条目失败 uid=%s: %s", uid, e)
+    return removed
+
+
+def _prune_stale_cache_entries(uid: str, out_cache) -> None:
+    """execute 时调用：记账本轮 data key，并摘掉以前各轮的旧条目。
+
+    本轮条目要等 execute 返回后才由内核写入（execution.py:616-618），因此此刻
+    缓存里凡是我们记过账的 key 都属于以前的轮次。gen 按需自增后签名只在内容
+    变化/释放后改变，但内容一旦变化旧条目就是攥着旧副本的尸体（旧副本已从
+    _STORE 被替换），摘掉才能让旧副本立刻回收。本轮条目**必须保留**——下游
+    节点取上游数据走的就是这份缓存（graph.py get_local）。
+    """
+    if out_cache is None:
+        return
+    _CACHE_HANDLE[uid] = out_cache
+    try:
+        key_set = getattr(out_cache, "cache_key_set", None)
+        key = key_set.get_data_key(uid) if key_set is not None else None
+    except Exception as e:
+        logging.warning("[PersistentOutput] 记录缓存键失败 uid=%s: %s", uid, e)
+        return
+    if key is None:
+        return
+    keys = _CACHE_KEYS.setdefault(uid, set())
+    stale = keys - {key}
+    if stale:
+        removed = _evict_keys(out_cache, uid, stale)
+        logging.info("[PersistentOutput] 清理旧轮缓存条目 %d 条 uid=%s", removed, uid)
+        keys -= stale
+    keys.add(key)
 
 
 def _slots(uid: str) -> list[dict]:
@@ -107,36 +217,42 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
 def release(uid: str, target: str = "all") -> bool:
     """手动释放。target: "slot1"/"slot2"/"slot3" / "all"。返回是否确有内容被释放。
 
-    释放 = 只清 _STORE 的副本；内核缓存条目按其自己的策略回收（本节点不干预，
-    见模块 docstring）。释放后 gen 已递增，下一轮缓存必 miss，重放的是释放后的
-    新状态。三槽全空则整个键删掉。
+    释放 = 清 _STORE 的副本 + 摘本节点历轮输出缓存条目（它们引用着副本，不清
+    则对象继续存活、内存不降）。上游/下游节点的缓存条目不碰——内核对所有节点
+    的统一行为；副本若已被下游消费，其条目的引用会 pin 到内核压力驱逐（诊断
+    端点 /psl/persist/cache_debug 可见）。三槽全空则整个键删掉。运行中途释放的
+    极端情况：下游本轮可能拿到 None——与"未保留输出 None"同语义。
     """
     if uid is None or uid not in _STORE:
         return False
     if target == "all":
-        dropped = sum(_slot_bytes(s) for s in _STORE[uid])
-        del _STORE[uid]
-        had_any = True
-        key_gone = True
-        logging.info("[PersistentOutput] 释放 all: 移除副本字节=%s", f"{dropped:,}")
+        victims = list(_STORE[uid])
+        slot_idx = None
     else:
         idx = {"slot1": 0, "slot2": 1, "slot3": 2}.get(target)
         if idx is None:
             return False
-        slots = _STORE.get(uid)
-        if slots is None:
-            return False
-        had_any = slots[idx]["image"] is not None or slots[idx]["audio"] is not None
-        logging.info("[PersistentOutput] 释放 %s: 移除副本字节=%s",
-                     target, f"{_slot_bytes(slots[idx]):,}")
-        slots[idx] = {"image": None, "audio": None}
+        victims = [_STORE[uid][idx]]
+        slot_idx = idx
+    had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
+    dropped = sum(_slot_bytes(s) for s in victims)
+
+    if slot_idx is None:
+        del _STORE[uid]
+    else:
+        slots = _STORE[uid]
+        slots[slot_idx] = {"image": None, "audio": None}
         # 三槽全空就把整个键删掉，不留空壳
-        key_gone = all(s["image"] is None and s["audio"] is None for s in slots)
-        if key_gone:
+        if all(s["image"] is None and s["audio"] is None for s in slots):
             _STORE.pop(uid, None)
+
     if had_any:
-        # 释放改变了槽状态：递增代数让下一轮缓存签名必变（gen widget），
-        # 下一轮重放的是释放后的新状态，不会命中旧输出。
+        removed_own = _evict_keys(_CACHE_HANDLE.get(uid), uid, _CACHE_KEYS.get(uid, ()))
+        _CACHE_KEYS.pop(uid, None)
+        logging.info("[PersistentOutput] 释放 %s: 副本字节=%s 摘自身缓存条目=%d",
+                     target, f"{dropped:,}", removed_own)
+        # 释放改变了槽状态：递增代数让下一轮缓存签名必变（gen widget 按需自增），
+        # 下一轮重放的是释放后的新状态，不会命中释放前的旧输出。
         _bump_generation(uid)
     return had_any
 
@@ -237,7 +353,9 @@ class PersistentOutput(io.ComfyNode):
                     ),
                 ),
             ],
-            hidden=[io.Hidden.unique_id],
+            # execution_list 必须显式声明：内核只对声明了的 hidden 注入执行列表
+            # （execution.py:213-214）。摘除本轮输出缓存条目全靠它的 output_cache 句柄。
+            hidden=[io.Hidden.unique_id, io.Hidden.execution_list],
             outputs=[
                 *[
                     out
@@ -281,6 +399,12 @@ class PersistentOutput(io.ComfyNode):
         # ui 必须有：executed 事件只在本节点有 ui 输出时才发送（execution.py:567），
         # 没有它前端 onExecuted 永远不触发、状态行永远不刷新（用户实测踩过）。
         # 把各槽概要直接随事件送出去，前端免二次 HTTP。
+        # 同时记账 outputs 缓存：内核必然会把我们的输出写进缓存条目
+        # （execution.py:616-618），这里记账当轮 key 并摘掉历轮旧条目（旧副本
+        # 尸体），释放路由才能按账摘除。本轮条目保留到当轮结束。
+        el = getattr(cls.hidden, "execution_list", None)
+        out_cache = getattr(el, "output_cache", None) if el is not None else None
+        _prune_stale_cache_entries(uid, out_cache)
         # ui 值一律包一层 list：execution.py:422 合并多个 ui 时按 key 把值当可迭代
         # 展开（{k: [y for x in uis for y in x[k]]}），裸标量（int/str）会直接炸
         # "'int' object is not iterable"（实测踩过）。
@@ -306,6 +430,41 @@ if getattr(PromptServer, "instance", None) is not None:
         if uid is None:
             return web.json_response({"error": "缺少 node_id"}, status=400)
         return web.json_response({"slots": describe(uid)})
+
+    @PromptServer.instance.routes.get("/psl/persist/cache_debug")
+    async def persist_cache_debug(request):
+        """只读诊断：摊开内核 outputs 缓存每个条目的 CPU 张量字节数与内容指纹，
+        以及 _STORE 的占用——"内存被谁攥着"一眼可见。"""
+        uid = _parse_uid(request.query.get("node_id"))
+        cache = _CACHE_HANDLE.get(uid) if uid else None
+        if cache is None:
+            return web.json_response({"error": "本节点尚未执行过（无缓存句柄）"}, status=404)
+        store = getattr(cache, "cache", None)
+        if not isinstance(store, dict):
+            return web.json_response({"error": "缓存结构不符合预期"}, status=500)
+        entries = []
+        store_bytes = 0
+        store_ptrs: set[int] = set()
+        if uid in _STORE:
+            for i, s in enumerate(_STORE[uid]):
+                b, p = _entry_stats([s.get("image"), s.get("audio")])
+                store_bytes += b
+                store_ptrs |= p
+        for i, (key, entry) in enumerate(store.items()):
+            b, p = _entry_stats(getattr(entry, "outputs", None))
+            entries.append({
+                "index": i,
+                "bytes": b,
+                "touches_store": bool(p & store_ptrs),
+                "ptrs": [hex(x) for x in p],
+            })
+        total = sum(e["bytes"] for e in entries)
+        return web.json_response({
+            "store_bytes": store_bytes,
+            "store_slots_held": uid in _STORE,
+            "kernel_entries": entries,
+            "kernel_total_bytes": total,
+        })
 
     @PromptServer.instance.routes.post("/psl/persist/release")
     async def persist_release(request):

@@ -139,21 +139,20 @@ app.registerExtension({
         labelsW.options = labelsW.options || {};
         labelsW.options.serialize = false;   // 不进 prompt（缓存不受标注影响），随工作流文件保存
 
-        // gen widget：排队序号。serializeValue 每次排队自增——本节点的缓存签名
-        // 每轮必变 ⇒ **每轮必重跑**，彻底消灭"缓存命中重放旧 ui 快照"（前端被旧
-        // 状态盖暗的根因，实测亮→暗→亮）。本节点是输出节点、无下游计算依赖，
-        // 重跑成本≈0（只是从内存存储读引用组装输出），这是"让 comfyui 知道
-        // 节点状态变了"的最可靠答案：不靠任何事件同步，签名必然不同。
-        // psl_gen 是**唯一计数源**：只在这里自增，绝不接受后端回写——后端
-        // _GENERATION 是独立计数器，两套计数器互相覆盖会让签名出现重复
-        // （实测 gen_in 在 2↔1 之间振荡），缓存命中重放/重复 key 随之而来。
-        // 后端的 not_idempotent=True 与代数机制保留作纵深防御。
+        // gen widget：按需自增的缓存签名扰动。平时排队返回同一值——内容没变时
+        // 签名稳定，不会每轮产生新缓存条目；释放成功后置 psl_dirty，下一次排队
+        // 才自增，保证释放后的状态必 miss 重放（不会命中释放前的旧输出）。
+        // psl_gen 是唯一计数源，绝不接受后端回写（两套计数器互相覆盖实测会振荡）。
         const genW = node.widgets?.find((w) => w.name === 'gen');
         if (genW) {
             genW.hidden = true;
             genW.serializeValue = () => {
+                if (!node.properties?.psl_dirty) {
+                    return String(node.properties?.psl_gen ?? '0');
+                }
                 const next = (parseInt(node.properties?.psl_gen ?? '0', 10) || 0) + 1;
                 node.properties.psl_gen = String(next);
+                node.properties.psl_dirty = false;
                 return String(next);
             };
         }
@@ -215,8 +214,10 @@ app.registerExtension({
                     releaseBtn.classList.remove('busy');
                     releaseBtn.classList.add('done');
                     releaseBtn.textContent = '✓ 已释放';
-                    // 注意：不用后端返回的 gen 回写 psl_gen——前端计数器是唯一
-                    // 计数源（见 genW 注释），回写会造成签名重复。
+                    // 释放改变了后端槽状态：标记 dirty，下次排队 gen 自增，缓存必 miss
+                    if (resp?.released) {
+                        node.properties.psl_dirty = true;
+                    }
                 } finally {
                     refreshStatus();
                     // 成功反馈停留片刻后回落（期间按钮保持禁用，防连点）
