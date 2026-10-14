@@ -1,13 +1,17 @@
 import { app } from '../../scripts/app.js';
 
 // DeepVRAMCleanup 前端：
-//  1. diag 上屏——后端把诊断文本挂进 ui 输出（见 nodes/deep_vram_cleanup.py），
-//     这里渲染成节点内的等宽文本区；最小高度一行字，不限最大高度，
-//     节点高度自动增高到文本所需（DOM widget 不参与节点自动布局）。
+//  1. diag 上屏——后端把诊断文本挂进 ui 输出（见 nodes/deep_vram_cleanup.py）。
+//     文本框高度**跟随节点**：占满节点内剩余空间，内容超出在框内滚动；
+//     手动缩小节点时框同步缩小，不会溢出节点边界。首次出 diag 时温和
+//     增高一次节点（封顶 400px）保证默认可读。
 //  2. run_nonce（隐藏 widget）——仅当 clear_source_node_cache 开启时每次
 //     排队自增：本节点有副作用，签名不变会被缓存命中直接跳过不执行；
 //     开关关闭时返回空串，维持 ComfyUI 正常缓存复用行为。
 let stylesInjected = false;
+
+const GROW_CAP = 400;      // 首次 diag 最多把节点撑到比剩余空间高 400px
+const BOTTOM_PAD = 10;     // 框底部留给节点边框/圆角的余量
 
 function injectStyles() {
     if (stylesInjected || document.getElementById('dvc-styles')) return;
@@ -15,8 +19,9 @@ function injectStyles() {
     const s = document.createElement('style');
     s.id = 'dvc-styles';
     s.textContent = `
-        .dvc-root { box-sizing: border-box; width: 100%; padding: 4px 6px; }
+        .dvc-root { box-sizing: border-box; width: 100%; overflow: hidden; }
         .dvc-diag {
+            box-sizing: border-box;
             margin: 0;
             font: 11px/1.45 monospace;
             white-space: pre-wrap;
@@ -27,7 +32,9 @@ function injectStyles() {
             border-radius: 4px;
             padding: 6px 8px;
             min-height: 1.45em;   /* 最小一行字 */
-            /* 不限最大高度：内容多长撑多长，节点跟着长高 */
+            height: 100%;
+            overflow-y: auto;     /* 超出框内滚动 */
+            overflow-x: hidden;
         }
         .dvc-diag:empty::before { content: '运行后显示诊断…'; color: #556; }
     `;
@@ -62,26 +69,31 @@ app.registerExtension({
             };
         }
 
-        // diag 更新后把节点增高到文本所需高度。DOM widget 布局在渲染帧之后
-        // 才稳定，用 rAF 量一次；last_y 拿不到时按当前节点高度增量补。
-        function fitNodeHeight() {
+        // 框高 = 节点高度 − 该 widget 顶部位置 − 底部余量。last_y 在布局完成
+        // 后才有值，拿不到时按节点高度兜底一个保守值。带缓存避免每帧写 style。
+        let lastAvail = -1;
+        function syncHeight() {
+            const w = node.widgets?.find((x) => x.name === 'dvc_diag');
+            const top = typeof w?.last_y === 'number' ? w.last_y : node.size[1] - 60;
+            const avail = Math.max(22, node.size[1] - top - BOTTOM_PAD);
+            if (avail === lastAvail) return;
+            lastAvail = avail;
+            root.style.height = avail + 'px';
+        }
+
+        // 首次出 diag：温和增高节点（封顶 GROW_CAP），让内容默认可读；
+        // 之后用户手动缩放由 syncHeight 跟随，不再反向撑节点。
+        function growForContent() {
             requestAnimationFrame(() => {
-                try {
-                    const w = node.widgets?.find((x) => x.name === 'dvc_diag');
-                    const h = pre.scrollHeight;
-                    if (!h) return;
-                    const base = typeof w?.last_y === 'number'
-                        ? w.last_y
-                        : node.size[1] - (root.offsetHeight || 0);
-                    const needed = base + h + 16;
-                    if (node.size[1] < needed) {
-                        node.size[1] = needed;
-                        node.onResize?.();
-                        node.setDirtyCanvas?.(true, true);
-                    }
-                } catch (e) {
-                    console.warn('[DeepVRAMCleanup] 节点高度自适应失败', e);
+                const w = node.widgets?.find((x) => x.name === 'dvc_diag');
+                const top = typeof w?.last_y === 'number' ? w.last_y : node.size[1] - 60;
+                const needed = top + Math.min(pre.scrollHeight + BOTTOM_PAD + 4, GROW_CAP);
+                if (node.size[1] < needed) {
+                    node.size[1] = needed;
+                    node.onResize?.();
+                    node.setDirtyCanvas?.(true, true);
                 }
+                syncHeight();
             });
         }
 
@@ -92,8 +104,20 @@ app.registerExtension({
             const d = Array.isArray(output?.diag) ? output.diag[0] : output?.diag;
             if (typeof d === 'string' && d.trim()) {
                 pre.textContent = d;
-                fitNodeHeight();
+                growForContent();
             }
         };
+
+        // 节点被手动缩放/布局变化时，框高跟随
+        const prevOnResize = node.onResize;
+        node.onResize = function (...args) {
+            prevOnResize?.apply(this, args);
+            syncHeight();
+        };
+        node.onDrawForeground = ((prev) => function (ctx, ...rest) {
+            prev?.apply(this, arguments);
+            // 每帧轻量同步一次（仅当高度变化时写 style，浏览器自行去抖重排）
+            syncHeight();
+        })(node.onDrawForeground);
     },
 });
