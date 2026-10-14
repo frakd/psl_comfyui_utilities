@@ -1,8 +1,12 @@
 import { app } from '../../scripts/app.js';
 
-// DeepVRAMCleanup 诊断上屏：后端把 diag 挂进 ui 输出（见 nodes/deep_vram_cleanup.py），
-// 这里在节点上渲染一个等宽文本区，画布上直接看到清理/跳过原因，
-// 不用翻命令行日志。多行文本自动换行，超长滚动。
+// DeepVRAMCleanup 前端：
+//  1. diag 上屏——后端把诊断文本挂进 ui 输出（见 nodes/deep_vram_cleanup.py），
+//     这里渲染成节点内的等宽文本区；最小高度一行字，不限最大高度，
+//     节点高度自动增高到文本所需（DOM widget 不参与节点自动布局）。
+//  2. run_nonce（隐藏 widget）——仅当 clear_source_node_cache 开启时每次
+//     排队自增：本节点有副作用，签名不变会被缓存命中直接跳过不执行；
+//     开关关闭时返回空串，维持 ComfyUI 正常缓存复用行为。
 let stylesInjected = false;
 
 function injectStyles() {
@@ -22,8 +26,8 @@ function injectStyles() {
             border: 1px solid #3a3a3a;
             border-radius: 4px;
             padding: 6px 8px;
-            max-height: 220px;
-            overflow: auto;
+            min-height: 1.45em;   /* 最小一行字 */
+            /* 不限最大高度：内容多长撑多长，节点跟着长高 */
         }
         .dvc-diag:empty::before { content: '运行后显示诊断…'; color: #556; }
     `;
@@ -44,6 +48,43 @@ app.registerExtension({
         root.appendChild(pre);
         node.addDOMWidget('dvc_diag', 'DIAG', root, { serialize: false, hideOnZoom: false });
 
+        // run_nonce：条件自增的防缓存签名（详见文件头注释）
+        const nonceW = node.widgets?.find((w) => w.name === 'run_nonce');
+        if (nonceW) {
+            nonceW.hidden = true;
+            nonceW.serializeValue = () => {
+                const clearOn = node.widgets?.find(
+                    (w) => w.name === 'clear_source_node_cache')?.value;
+                if (!clearOn) return '';
+                const next = (parseInt(node.properties?.dvc_nonce ?? '0', 10) || 0) + 1;
+                node.properties.dvc_nonce = String(next);
+                return String(next);
+            };
+        }
+
+        // diag 更新后把节点增高到文本所需高度。DOM widget 布局在渲染帧之后
+        // 才稳定，用 rAF 量一次；last_y 拿不到时按当前节点高度增量补。
+        function fitNodeHeight() {
+            requestAnimationFrame(() => {
+                try {
+                    const w = node.widgets?.find((x) => x.name === 'dvc_diag');
+                    const h = pre.scrollHeight;
+                    if (!h) return;
+                    const base = typeof w?.last_y === 'number'
+                        ? w.last_y
+                        : node.size[1] - (root.offsetHeight || 0);
+                    const needed = base + h + 16;
+                    if (node.size[1] < needed) {
+                        node.size[1] = needed;
+                        node.onResize?.();
+                        node.setDirtyCanvas?.(true, true);
+                    }
+                } catch (e) {
+                    console.warn('[DeepVRAMCleanup] 节点高度自适应失败', e);
+                }
+            });
+        }
+
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
@@ -54,21 +95,5 @@ app.registerExtension({
                 fitNodeHeight();
             }
         };
-
-        // DOM widget 的高度不参与节点自动布局：diag 更新后把节点增高到
-        // 文本实际所需高度，避免节点较小时文本框溢出节点边界。
-        function fitNodeHeight() {
-            try {
-                const w = node.widgets?.find((x) => x.name === 'dvc_diag');
-                const needed = (w?.last_y || 0) + root.offsetHeight + 14;
-                if (node.size[1] < needed) {
-                    node.size[1] = needed;
-                    node.onResize?.();
-                    node.setDirtyCanvas?.(true, true);
-                }
-            } catch (e) {
-                console.warn('[DeepVRAMCleanup] 节点高度自适应失败', e);
-            }
-        }
     },
 });

@@ -881,6 +881,10 @@ class DeepVRAMCleanup(io.ComfyNode):
                     tooltip="【收尾】直接调用 CUDA Runtime 的 cudaMemPoolTrimTo(0)，强制将 cudaMallocAsync 内存池中所有未使用的内存归还给操作系统。\n\n这是对 torch.cuda.empty_cache() 的补充——在 CUDA 13.x + cudaMallocAsync 后端下，仅靠 empty_cache() 往往无法彻底释放 reserved 内存。此选项直接绕过 PyTorch 操作 CUDA 内存池。"),
                 io.Boolean.Input("purge_orphan_tensors", default=False,
                     tooltip="【收尾 · 暴力模式】遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在以上清理都无效时作为最后手段使用。"),
+                io.String.Input("run_nonce", default="", optional=True,
+                    tooltip="内部防缓存机制：仅当 clear_source_node_cache 开启时，前端每次排队自增它使签名必变、"
+                            "本节点必执行（带副作用的节点被缓存命中会跳过不跑）；开关关闭时保持空值，"
+                            "本节点维持 ComfyUI 正常的缓存复用行为。由前端写入，不要手填。"),
                 # ===== 以下开关已按用户要求从 UI 移除（语义固定 / 停用），详见文件顶部注释：
                 #   offload_models_to_ram     —— 停用：目的在腾内存，而它把显存搬进内存（增加内存占用）
                 #   unload_additional_models  —— 固定 True（连带卸载附属模型）
@@ -960,6 +964,7 @@ class DeepVRAMCleanup(io.ComfyNode):
         passthrough2=None,
         passthrough3=None,
         passthrough4=None,
+        run_nonce="",
         models: dict = None,
         clips: dict = None,
         vaes: dict = None,
@@ -967,6 +972,9 @@ class DeepVRAMCleanup(io.ComfyNode):
     ):
         # hidden 输入（unique_id / prompt / execution_list）由 V3 框架经
         # PREPARE_CLASS_CLONE 挂到 cls.hidden 上，不再是 execute 的形参。
+        # run_nonce 只参与缓存签名（前端仅在 clear_source_node_cache 开启时
+        # 自增），执行侧不消费。
+        del run_nonce
         device = mm.get_torch_device()
         used_before, total = cls._vram(device)
         sysmem_before = _sysmem_line()
