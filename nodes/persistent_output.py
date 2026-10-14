@@ -21,10 +21,11 @@
   本轮条目必须活到本轮结束——下游节点取上游数据走的就是这份缓存（graph.py
   get_local），当轮摘了下游拿到 None。
 - 释放 = 清 _STORE（A 立刻无人引用）+ ②的摘除（上一轮输出的去向随缘）。
-  **Windows 堆对已 free 的脏大块惰性归还**（实测：对象销毁后 7.2GB 仍驻留
-  RSS 且不被后续分配复用，直到 EmptyWorkingSet 强制修剪才归还 OS、系统可用
-  +8GB）——所以副本不就地销毁，转入延迟队列，由后台任务 3s 后释放并
-  EmptyWorkingSet。上游 VHS 自己条目里的原件不动（内核对所有节点的统一行为，
+  承载层关键：A 由 **numpy 内存承载**（torch.from_numpy 包装），不用 torch 的
+  clone——实测（mem_probe，commit 口径）本进程里 torch 层分配的 7.2GB 张量
+  销毁后 C++ 去提交不执行（已提交永不回落、块不被复用），而 numpy 路径的
+  free 完整归还 commit。EmptyWorkingSet 只修剪工作集、不解决 commit，弃用。
+  上游 VHS 自己条目里的原件不动（内核对所有节点的统一行为，
   /psl/persist/cache_debug 可对账）；需要全部立即清掉时用前端自带的「释放
   内存」按钮（官方 reset）。
 - gen widget 按需自增（仅释放后）：内容没变时签名不变，内核条目同 key 替换不
@@ -35,7 +36,6 @@
   （A + 临时克隆）——这是"A 永不出节点"的必要成本；换来 release 的无条件生效。
 """
 
-import asyncio
 import gc
 import logging
 
@@ -168,21 +168,27 @@ def _slots(uid: str) -> list[dict]:
 
 
 def _clone_value(kind: str, value):
-    """存入前深拷贝：副本归本节点独占，释放才能真降内存（见模块 docstring）。"""
+    """存入前深拷贝：副本归本节点独占，释放才能真降内存（见模块 docstring）。
+
+    承载层用 **numpy**（value.numpy().copy() → torch.from_numpy 包装）而不是
+    torch 自己的 clone：实测（mem_probe，2026-10-14）本进程里 torch 层分配的
+    7.2GB 张量销毁后 C++ 去提交不执行（commit 永不回落、块不被复用），而
+    numpy 路径的 free 完整归还 commit。副本从不出节点，numpy 承载零副作用。
+    """
+    import numpy as np
     if value is None:
         return None
     if kind == "image":
-        return value.clone() if isinstance(value, torch.Tensor) else value
+        if isinstance(value, torch.Tensor):
+            a_np = value.detach().contiguous().numpy().copy()
+            return torch.from_numpy(a_np)
+        return value
     out = dict(value)
     wf = out.get("waveform")
     if isinstance(wf, torch.Tensor):
-        out["waveform"] = wf.clone()
+        wf_np = wf.detach().numpy().copy()
+        out["waveform"] = torch.from_numpy(wf_np)
     return out
-
-
-# 延迟释放队列：release 后副本不立刻销毁，转入此队列，由路由后台任务在 3s 后
-# 释放并 EmptyWorkingSet 强制归还 OS（Windows 堆对已 free 的脏大块惰性归还）。
-_KEEPALIVE: list = []
 
 
 def _tensor_bytes(t) -> int:
@@ -241,12 +247,11 @@ def store_input(uid: str, slot: int, image=None, audio=None) -> None:
 def release(uid: str, target: str = "all") -> bool:
     """手动释放。target: "slot1"/"slot2"/"slot3" / "all"。返回是否确有内容被释放。
 
-    释放 = 清 _STORE 的副本（转入延迟释放队列）+ 摘本节点历轮输出缓存条目。
-    副本由路由后台任务 3s 后释放并 EmptyWorkingSet 强制归还 OS——Windows 堆对
-    已 free 的脏大块惰性归还，不修剪就不降（实测）。上游/下游节点的缓存条目
-    不碰——内核对所有节点的统一行为；副本若已被下游消费，其条目的引用会 pin
-    到内核压力驱逐（/psl/persist/cache_debug 可对账）。三槽全空则整个键删掉。
-    运行中途释放的极端情况：下游本轮可能拿到 None——与"未保留输出 None"同语义。
+    释放 = 清 _STORE 的副本（numpy 承载，就地销毁即归还 commit）+ 摘本节点历轮
+    输出缓存条目。上游/下游节点的缓存条目不碰——内核对所有节点的统一行为；
+    副本若已被下游消费，其条目的引用会 pin 到内核压力驱逐
+    （/psl/persist/cache_debug 可对账）。三槽全空则整个键删掉。运行中途释放的
+    极端情况：下游本轮可能拿到 None——与"未保留输出 None"同语义。
     """
     if uid is None or uid not in _STORE:
         return False
@@ -261,16 +266,10 @@ def release(uid: str, target: str = "all") -> bool:
         slot_idx = idx
     had_any = any(s["image"] is not None or s["audio"] is not None for s in victims)
     dropped = sum(_slot_bytes(s) for s in victims)
-    # 副本不就地销毁：实测（2026-10-14）Windows 堆对"已 free 的脏大块"惰性归还——
-    # 对象销毁后 7.2GB 仍驻留 RSS、且不被后续分配复用，直到 EmptyWorkingSet 强制
-    # 修剪才真正归还 OS（系统可用 +8GB 实测）。转入延迟队列，由路由后台任务
-    # 3s 后释放并 EmptyWorkingSet。字节统计在转队列前完成。
-    for s in victims:
-        v = s.get("image")
-        if isinstance(v, torch.Tensor):
-            _KEEPALIVE.append(v)
-    logging.info("[PersistentOutput] 释放 %s: 副本字节=%s 转入延迟释放队列(%d 个) RSS=%s",
-                 target, f"{dropped:,}", len(_KEEPALIVE), _rss_gb())
+    # 副本由 numpy 承载（见 _clone_value），就地销毁即可——numpy 的 free 实测
+    # 完整归还 commit，不需要 EmptyWorkingSet 兜底。
+    logging.info("[PersistentOutput] 释放 %s: 副本字节=%s RSS=%s",
+                 target, f"{dropped:,}", _rss_gb())
 
     if slot_idx is None:
         del _STORE[uid]
@@ -582,31 +581,7 @@ if getattr(PromptServer, "instance", None) is not None:
         had = release(uid, target)
         logging.info("[PersistentOutput] 释放 node=%s target=%s 有内容=%s", uid, target, had)
         logging.info("[PersistentOutput] 释放前内存: %s", mem_before)
-
-        async def _report_after():
-            # 副本在延迟队列里"先活 3 秒再释放"：给当前运行收尾留缓冲，随后
-            # 释放 + EmptyWorkingSet 强制把 Windows 堆滞留的已释放大块归还 OS。
-            await asyncio.sleep(3)
-            n = len(_KEEPALIVE)
-            _KEEPALIVE.clear()
-            gc.collect()
-            logging.info("[PersistentOutput] 延迟释放 %d 个副本后 RSS=%s", n, _rss_gb())
-            if n:
-                try:
-                    import ctypes
-                    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                    k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
-                    k32.SetProcessWorkingSetSize.restype = ctypes.c_int
-                    ok = k32.SetProcessWorkingSetSize(ctypes.c_void_p(-1), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
-                    logging.info("[PersistentOutput] EmptyWorkingSet ok=%s err=%s RSS=%s",
-                                 ok, ctypes.get_last_error(), _rss_gb())
-                except Exception as e:
-                    logging.warning("[PersistentOutput] EmptyWorkingSet 失败: %s", e)
-            logging.info("[PersistentOutput] 释放完成内存: %s", _mem_snapshot())
-
-        asyncio.create_task(_report_after())
-        return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
-
-        asyncio.create_task(_report_after())
+        gc.collect()
+        logging.info("[PersistentOutput] 释放后内存: %s（已提交应回落 ~7GB/槽）", _mem_snapshot())
         return web.json_response({"released": had, "slots": describe(uid), "gen": _GENERATION.get(uid, 0)})
 
