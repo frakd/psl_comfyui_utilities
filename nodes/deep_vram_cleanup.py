@@ -1015,4 +1015,10 @@ class DeepVRAMCleanup(io.ComfyNode):
         lines.extend(_find_gpu_tensors_direct())
 
         diag = "\n".join(lines)
-        return (passthrough1, passthrough2, passthrough3, passthrough4, used_after, total, freed, diag)
+        # diag 同时挂进 ui：前端扩展（ui/deep_vram_cleanup.js）把它渲染到节点上，
+        # 命令行日志之外画布直接可见（清理/跳过原因一目了然）。
+        return io.NodeOutput(
+            passthrough1, passthrough2, passthrough3, passthrough4,
+            used_after, total, freed, diag,
+            ui={"diag": [diag]},
+        )
