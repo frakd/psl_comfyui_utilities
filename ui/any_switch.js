@@ -92,6 +92,10 @@ function injectStyles() {
             user-select: none;
             min-height: 22px;
             box-sizing: border-box;
+            /* 不许随容器收缩：否则容器不够高时行被压到 min-height，offsetHeight
+               量出来偏小 → 面板高度算少 → 列表留滚动条、最后一行被挤掉，且
+               量到的值会稳定在「压扁」状态上再也纠正不回来。 */
+            flex: 0 0 auto;
         }
         .asw-row .asw-mark {
             width: 12px;
@@ -130,7 +134,7 @@ function injectStyles() {
             user-select: text;
         }
         .asw-row .asw-name-input::placeholder { color: #666; }
-        .asw-empty { color: #666; font-size: 11px; padding: 4px 2px; }
+        .asw-empty { color: #666; font-size: 11px; padding: 4px 2px; flex: 0 0 auto; }
     `;
     document.head.appendChild(s);
 }
