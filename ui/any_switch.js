@@ -24,6 +24,9 @@ const ORDINAL_RE = /(\d+)$/;
 // 元素会被换掉，浏览器就不认这是「同一个目标」的连击了（detail 归 1、
 // dblclick 不触发）。改为按「同一个序数 + 时间窗」自己判定，重绘不影响。
 const DOUBLE_CLICK_MS = 400;
+// 面板高度的下限（px）：DOM 元素还没上屏时 offsetHeight 全为 0，不能据此把节点
+// 钉成 0 高。120 也是改造前的固定高度，等于「行数少时保持原样」。
+const WIDGET_MIN_H = 120;
 
 let stylesInjected = false;
 
@@ -181,6 +184,9 @@ app.registerExtension({
         let editing = null;          // 编辑中的条目 { ordinal, text, input, name }
         let preClickSelection = null;  // 最近一次单击前的选中值（双击改名时撤销首跳）
         let lastClick = { ordinal: null, time: 0 };   // 上一次单击的序数与时刻
+        let repaintScheduled = false;                 // 同一帧只补一次重绘
+        let fitScheduled = false;                     // 同一帧只补一次量高
+        let lastFitH = 0;                             // 上次写入的 min-height，避免白算尺寸
 
         function readLabels() {
             labels = {};
@@ -225,8 +231,10 @@ app.registerExtension({
 
         const root = document.createElement('div');
         root.className = 'asw-root';
-        root.style.setProperty('--comfy-widget-min-height', '120px');
-        root.style.setProperty('--comfy-widget-max-height', '220px');
+        // 只钉 min-height，不设 max：节点被手动拉高时多出来的空间留给列表
+        // （核心口径是 maxSize = maxHeight ?? Infinity）。真实高度由
+        // renderRows → fitNodeHeight 实测内容后写入；这里先给个不裁字的兜底值。
+        root.style.setProperty('--comfy-widget-min-height', `${WIDGET_MIN_H}px`);
 
         // ---- 模式切换 ----
         const modes = document.createElement('div');
@@ -285,6 +293,72 @@ app.registerExtension({
             renderRows();
         }
 
+        /** 面板内容需要的真实高度（px）。间距/内边距一律从 computedStyle 现读，
+         *  以后调 CSS 不会和这里脱节。 */
+        function contentHeight() {
+            const rootCS = getComputedStyle(root);
+            const listCS = getComputedStyle(list);
+            let inner = 0;
+            for (const el of list.children) inner += el.offsetHeight;
+            if (list.children.length > 1) {
+                inner += (list.children.length - 1) * (parseFloat(listCS.rowGap) || 0);
+            }
+            const total = (parseFloat(rootCS.paddingTop) || 0) + (parseFloat(rootCS.paddingBottom) || 0)
+                + modes.offsetHeight + (parseFloat(rootCS.rowGap) || 0) + inner;
+            return Math.max(WIDGET_MIN_H, Math.round(total));
+        }
+
+        /** 把面板高度钉到内容高度，行数变了才让节点重算总尺寸。
+         *  与核心 autogrow 增删槽后的做法一致（size = [w, computeSize(w)[1]]）：
+         *  行数变化时节点自己长高/收回，不需要手动拉；而内容没变时什么都不做，
+         *  手动拉过的尺寸不会被下一次运行/刷新顶回去。 */
+        function fitNodeHeight() {
+            const h = contentHeight();
+            if (h === lastFitH) return;              // 高度没变：不碰节点尺寸
+            lastFitH = h;
+            root.style.setProperty('--comfy-widget-min-height', `${h}px`);
+            if (!node.graph) return;                 // 还没上画布，等下一次重绘
+            const w = node.size?.[0];
+            if (!Number.isFinite(w) || w <= 0) return;
+            try {
+                const total = node.computeSize?.([w, 0]);
+                const nodeH = Array.isArray(total) ? total[1] : null;
+                if (Number.isFinite(nodeH) && nodeH > 0) node.size = [w, nodeH];
+                node.graph.setDirtyCanvas(true, true);
+            } catch (e) {
+                // 自适应失败不影响功能：面板仍有滚动条可以看全列表
+                console.warn('[AnySwitch] 自适应高度失败（列表仍可滚动查看）', e);
+            }
+        }
+
+        /** 下一帧补一次重绘。核心的增删槽是在 requestAnimationFrame 里做的
+         *  （autogrowInputDisconnected → replaceNodeInputs）：连接回调这一刻
+         *  同步渲染看到的是**裁剪前**的槽位，于是断开线后会残留多余行
+         *  （实测「3 个入口 4 行选项」）。本回调比核心那次注册得晚，同一帧内
+         *  排在它后面执行，因此渲染到的是裁剪后的真实槽位。 */
+        function scheduleRepaint() {
+            if (repaintScheduled) return;
+            repaintScheduled = true;
+            requestAnimationFrame(() => {
+                repaintScheduled = false;
+                if (!node.graph) return;             // 节点已被删除
+                renderRows();
+            });
+        }
+
+        /** 下一帧只重量一次高度（不重绘行）。给 ResizeObserver 用：在观察器回调里
+         *  直接改节点尺寸会撞上「loop limit exceeded」告警，排到下一帧就没有了；
+         *  fitNodeHeight 自身按高度去重，因此不会来回触发。 */
+        function scheduleFit() {
+            if (fitScheduled) return;
+            fitScheduled = true;
+            requestAnimationFrame(() => {
+                fitScheduled = false;
+                if (!node.graph) return;
+                fitNodeHeight();
+            });
+        }
+
         function renderRows() {
             const random = isRandom();
             const slots = autogrowSlots(node);
@@ -296,6 +370,7 @@ app.registerExtension({
                 hint.textContent = '在画布上连接输入后，这里会出现可勾选的列表';
                 list.appendChild(hint);
                 editing = null;   // 行都没了，编辑状态一并作废
+                fitNodeHeight();
                 return;
             }
             for (const slot of slots) {
@@ -368,6 +443,7 @@ app.registerExtension({
             }
             // 编辑中的条目：重绘（连线变化 / 加载工作流）后把输入框连同已敲的字一起恢复
             if (editing) openEditor(editing.ordinal, editing.text);
+            fitNodeHeight();     // 行数定了才算高度（输入框比文字高一点，放在编辑恢复之后）
         }
 
         // ---- 条目名内联编辑 ----
@@ -430,7 +506,10 @@ app.registerExtension({
             const r = prevOnConnectionsChange?.apply(this, arguments);
             try {
                 const name = ioSlot?.name ?? this.inputs?.[index]?.name ?? '';
-                if (type === 1 && name.startsWith(GROUP_PREFIX)) renderRows();   // 1 = INPUT
+                if (type === 1 && name.startsWith(GROUP_PREFIX)) {   // 1 = INPUT
+                    renderRows();       // 先给即时反馈（连线那一路立刻出现）
+                    scheduleRepaint();  // 再于核心裁剪槽位后补一次（断开线时的残留行靠它清掉）
+                }
             } catch (e) {
                 console.warn('[AnySwitch] 刷新输入列表失败', e);
             }
@@ -447,10 +526,32 @@ app.registerExtension({
             renderRows();
         };
 
-        node.addDOMWidget('switch_view', 'HTML', root, { serialize: false, hideOnZoom: false });
+        // getMinHeight 是核心 DOM widget 的布局契约：computeLayoutSize 每次布局都调它
+        // （不是缓存值），节点总高按它累加（computeSize 里 t += minHeight），所以列表
+        // 长了节点自己长高。不传 getMaxHeight：maxSize 落到 Infinity，手动拉高时多出的
+        // 空间归列表，不会被钉死。
+        node.addDOMWidget('switch_view', 'HTML', root, {
+            serialize: false,
+            hideOnZoom: false,
+            getMinHeight: contentHeight,
+        });
 
         readLabels();
         syncUI();
+
+        // 元素上屏（或盒子尺寸变化）后再量一次高度：工作流加载时 DOM widget 的挂载
+        // 可能晚于 onConfigure，那一刻 offsetHeight 还是 0、只能取兜底高度——列表会不会
+        // 溢出成滚动条就靠这一次补量。回调里只排下一帧，不在观察器回调中改尺寸。
+        if (typeof ResizeObserver === 'function') {
+            const observer = new ResizeObserver(() => scheduleFit());
+            observer.observe(root);
+            const prevOnRemoved = node.onRemoved;
+            node.onRemoved = function () {
+                const r = prevOnRemoved?.apply(this, arguments);
+                observer.disconnect();       // 节点删除后不再观察，不留悬空回调
+                return r;
+            };
+        }
 
         // 工作流加载：widget 值此时才恢复，重读条目名并重绘
         const prevConfigure = node.onConfigure;
@@ -460,6 +561,9 @@ app.registerExtension({
             preClickSelection = null;
             readLabels();
             syncUI();
+            // 加载时元素可能还没上屏（offsetHeight 为 0，只能取兜底高度），
+            // 下一帧再量一次真实内容高度。
+            scheduleRepaint();
             return r;
         };
     },
