@@ -17,6 +17,11 @@ input_0 两种写法——序数一律取尾部数字）。
 选中状态与模式都是普通 widget：进 prompt（参与缓存签名）也随工作流文件
 持久化，刷新/换工作流不丢。前端 ui.psl_pick 回传实际输出的序数，用于
 把勾选高亮同步到随机命中的那一路。
+
+条目名（面板里那行「输入 N」）由前端双击改名，存 labels_json 隐藏 widget：
+前端把它的 options.serialize 置 false，于是它不进 prompt（改名不该让下游
+缓存失效），但 widget 值照旧随工作流文件保存。backend 只是声明了这个输入
+以免前端脚本未生效时多传 kwargs 报错，正常收不到、也不消费。
 """
 
 import random
@@ -81,13 +86,24 @@ class AnySwitch(io.ComfyNode):
                         "空串表示未选择。不要手填。"
                     ),
                 ),
+                io.String.Input(
+                    "labels_json",
+                    default="{}",
+                    optional=True,
+                    tooltip=(
+                        "各路输入的条目名（JSON 对象，键是 0 基序数、值是用户双击改的名字），"
+                        "由前端维护并随工作流文件持久化；前端会把它标记为不参与 prompt "
+                        "序列化，所以后端正常收不到，仅作兼容保留。"
+                    ),
+                ),
             ],
             hidden=[io.Hidden.unique_id],
             outputs=[io.AnyType.Output("output", display_name="输出")],
         )
 
     @classmethod
-    def execute(cls, inputs: dict = None, mode="manual", selection=""):
+    def execute(cls, inputs: dict = None, mode="manual", selection="", labels_json="{}"):
+        del labels_json   # UI-only（条目名）：后端不消费，形参仅防前端脚本未生效时报多余 kwarg
         values = dict(inputs or {})
 
         pick = None   # 命中的 0 基序数；None 表示无有效选择

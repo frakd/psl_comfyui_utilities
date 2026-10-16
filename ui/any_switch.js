@@ -11,12 +11,19 @@ import { app } from '../../scripts/app.js';
 //    3. 随机：在 selection widget 的 serializeValue 里掷骰子并写回——
 //       selection 进 prompt，签名每次都变 ⇒ 每次都从本节点重新运行；
 //       onExecuted 读后端回传的 psl_pick 把高亮同步到实际命中的那路。
+//    4. 条目名：双击行内的「输入 N」原地改名（回车确认 / Esc 取消 / 留空回落
+//       默认名），存 labels_json 隐藏 widget。
 //  持久化：mode / selection 都是普通 widget（进 prompt + 随工作流保存），
+//  labels_json 只随工作流保存（不进 prompt，改名不该让下游缓存失效），
 //  onConfigure 恢复。连接数变化实时刷新列表（onConnectionsChange）。
 // ============================================================
 
 const GROUP_PREFIX = 'inputs.';
 const ORDINAL_RE = /(\d+)$/;
+// 双击判定窗口。不用原生 dblclick：行是按选中状态整表重绘的，两次点击之间
+// 元素会被换掉，浏览器就不认这是「同一个目标」的连击了（detail 归 1、
+// dblclick 不触发）。改为按「同一个序数 + 时间窗」自己判定，重绘不影响。
+const DOUBLE_CLICK_MS = 400;
 
 let stylesInjected = false;
 
@@ -98,6 +105,28 @@ function injectStyles() {
         .asw-row.selectable { cursor: pointer; }
         .asw-row.selectable:hover { border-color: #557; }
         .asw-row .asw-type { margin-left: auto; color: #777; font-size: 11px; }
+        .asw-row .asw-name {
+            flex: 1 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .asw-row .asw-name-input {
+            flex: 1 1 auto;
+            min-width: 0;
+            background: #101010;
+            color: #fff;
+            border: 1px solid #0095ff;
+            border-radius: 3px;
+            padding: 1px 4px;
+            font-size: 12px;
+            font-family: inherit;
+            line-height: 1.2;
+            outline: none;
+            user-select: text;
+        }
+        .asw-row .asw-name-input::placeholder { color: #666; }
         .asw-empty { color: #666; font-size: 11px; padding: 4px 2px; }
     `;
     document.head.appendChild(s);
@@ -131,6 +160,69 @@ app.registerExtension({
         modeW.hidden = true;
         selW.hidden = true;
 
+        // 条目名存在 labels_json 隐藏 widget 里。options.serialize=false 只挡住
+        // prompt（改名是纯 UI 行为，不该让下游缓存失效），widget 值仍随工作流
+        // 文件保存；恢复点在 onConfigure——工作流加载时 widget 值那时才就位。
+        // 拿不到它（后端还没重启，object_info 里没这个输入）时不让整个面板陪葬：
+        // 面板照常可用，只是不接改名，并在控制台明确报错。
+        const labelsW = node.widgets?.find((w) => w.name === 'labels_json');
+        if (labelsW) {
+            labelsW.hidden = true;
+            labelsW.options = labelsW.options || {};
+            labelsW.options.serialize = false;
+        } else {
+            console.error(
+                '[AnySwitch] 找不到 labels_json widget：条目名无法持久化。'
+                + '请重启 ComfyUI 后端（新增的输入要重新加载）并强制刷新页面（Ctrl+F5）。'
+            );
+        }
+
+        let labels = {};             // 序数（字符串）-> 自定义条目名
+        let editing = null;          // 编辑中的条目 { ordinal, text, input, name }
+        let preClickSelection = null;  // 最近一次单击前的选中值（双击改名时撤销首跳）
+        let lastClick = { ordinal: null, time: 0 };   // 上一次单击的序数与时刻
+
+        function readLabels() {
+            labels = {};
+            if (!labelsW) return;
+            const text = typeof labelsW.value === 'string' ? labelsW.value.trim() : '';
+            if (!text) return;                       // 旧工作流里这一格可能是空的
+            let raw;
+            try {
+                raw = JSON.parse(text);
+            } catch (e) {
+                console.warn('[AnySwitch] labels_json 不是合法 JSON，已按无标注处理：', e);
+                return;
+            }
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+                console.warn('[AnySwitch] labels_json 不是对象，已按无标注处理：', raw);
+                return;
+            }
+            for (const [key, val] of Object.entries(raw)) {
+                if (/^\d+$/.test(key) && typeof val === 'string' && val.trim()) {
+                    labels[key] = val.trim();
+                }
+            }
+        }
+
+        function writeLabels() {
+            if (!labelsW) return;    // 已在 nodeCreated 里报过错，此处不再重复刷屏
+            labelsW.value = JSON.stringify(labels);
+        }
+
+        function labelOf(ordinal) {
+            return labels[String(ordinal)] || `输入 ${ordinal + 1}`;
+        }
+
+        // 落盘一个条目名；空名 = 删除标注、回落默认名。
+        function setLabel(ordinal, text) {
+            const key = String(ordinal);
+            const name = (text ?? '').trim();
+            if (name) labels[key] = name;
+            else delete labels[key];
+            writeLabels();
+        }
+
         const root = document.createElement('div');
         root.className = 'asw-root';
         root.style.setProperty('--comfy-widget-min-height', '120px');
@@ -143,7 +235,7 @@ app.registerExtension({
         manualBtn.type = 'button';
         manualBtn.className = 'asw-mode';
         manualBtn.textContent = '手动选择';
-        manualBtn.title = '点选列表里的一路，输出那一 路（单选）';
+        manualBtn.title = '点选列表里的一路，输出那一路（单选）';
         const randomBtn = document.createElement('button');
         randomBtn.type = 'button';
         randomBtn.className = 'asw-mode random';
@@ -203,6 +295,7 @@ app.registerExtension({
                 hint.className = 'asw-empty';
                 hint.textContent = '在画布上连接输入后，这里会出现可勾选的列表';
                 list.appendChild(hint);
+                editing = null;   // 行都没了，编辑状态一并作废
                 return;
             }
             for (const slot of slots) {
@@ -220,9 +313,13 @@ app.registerExtension({
 
                 const mark = document.createElement('div');
                 mark.className = 'asw-mark';
-                const label = document.createElement('span');
-                label.textContent = `输入 ${ordinal + 1}`;
-                row.append(mark, label);
+                const name = document.createElement('span');
+                name.className = 'asw-name';
+                name.textContent = labelOf(ordinal);
+                name.title = labels[String(ordinal)]
+                    ? `${labels[String(ordinal)]}（双击改名）`
+                    : '双击改条目名';
+                row.append(mark, name);
 
                 if (connected && slot.type) {
                     const type = document.createElement('span');
@@ -232,21 +329,98 @@ app.registerExtension({
                 }
 
                 if (connected && !random) {
-                    row.title = '点击输出这一路（再点一次取消选择）';
-                    row.addEventListener('click', (e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        // 单选：点已选中的行 = 取消选择（输出 None）
-                        selW.value = String(ordinal) === selW.value ? '' : String(ordinal);
-                        renderRows();
-                    });
+                    row.title = '单击输出这一路（再点取消）；双击条目名可改名';
                 } else if (random) {
-                    row.title = '随机模式：运行后这里会显示实际命中的那一路';
+                    row.title = '随机模式：运行后这里会显示实际命中的那一路；双击条目名可改名';
                 } else {
-                    row.title = '未连接';
+                    row.title = '未连接；双击条目名可改名';
                 }
+
+                row.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (editing) return;                 // 编辑中不响应行点击
+                    const now = Date.now();
+                    const isDouble = lastClick.ordinal === ordinal
+                        && now - lastClick.time < DOUBLE_CLICK_MS;
+                    // 双击判定用掉后清零，三连击不会又触发一次改名
+                    lastClick = isDouble ? { ordinal: null, time: 0 } : { ordinal, time: now };
+
+                    if (isDouble) {
+                        // 双击 = 改名手势：撤销首跳点击造成的选中切换，否则「已选中
+                        // 的那一路」双击后会变成未选中（输出 None），纯属误伤。
+                        if (connected && !random && preClickSelection !== null) {
+                            selW.value = preClickSelection;
+                            renderRows();
+                        }
+                        preClickSelection = null;
+                        if (labelsW) openEditor(ordinal, labels[String(ordinal)] || '');
+                        return;
+                    }
+
+                    if (!connected || random) return;    // 这两类行只有改名可点
+                    preClickSelection = selW.value;
+                    // 单选：点已选中的行 = 取消选择（输出 None）
+                    selW.value = String(ordinal) === selW.value ? '' : String(ordinal);
+                    renderRows();
+                });
                 list.appendChild(row);
             }
+            // 编辑中的条目：重绘（连线变化 / 加载工作流）后把输入框连同已敲的字一起恢复
+            if (editing) openEditor(editing.ordinal, editing.text);
+        }
+
+        // ---- 条目名内联编辑 ----
+        /** 在指定条目行上打开输入框；重绘后调用可恢复未提交的输入。 */
+        function openEditor(ordinal, text) {
+            const row = list.querySelector(`.asw-row[data-ordinal="${ordinal}"]`);
+            const name = row?.querySelector('.asw-name');
+            if (!row || !name) {      // 该槽已被 autogrow 收回，放弃编辑
+                editing = null;
+                return;
+            }
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'asw-name-input';
+            input.value = text ?? '';
+            input.placeholder = `输入 ${ordinal + 1}`;
+            input.spellcheck = false;
+            input.title = '回车确认，Esc 取消；留空 = 恢复默认名';
+            editing = { ordinal, text: input.value, input, name };
+            name.style.display = 'none';
+            name.after(input);
+            input.focus();
+            input.select();
+
+            // 画布快捷键（Delete 删节点、Ctrl+Z 等）与画布手势不许被输入框冒泡上去
+            for (const ev of ['keydown', 'keyup', 'keypress', 'input', 'pointerdown',
+                              'mousedown', 'mouseup', 'click', 'dblclick', 'wheel']) {
+                input.addEventListener(ev, (e) => e.stopPropagation());
+            }
+            input.addEventListener('input', () => {
+                if (editing) editing.text = input.value;
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.isComposing || e.keyCode === 229) return;   // 输入法组合中，回车是选字
+                if (e.key === 'Enter') { e.preventDefault(); finishEdit(true); }
+                else if (e.key === 'Escape') { e.preventDefault(); finishEdit(false); }
+            });
+            input.addEventListener('blur', () => finishEdit(true));
+        }
+
+        /** 收尾编辑：commit=false 丢弃改动。提交即写 labels_json（随工作流持久化）。 */
+        function finishEdit(commit) {
+            if (!editing) return;
+            const { ordinal, input, name } = editing;
+            editing = null;      // 先清空：input.remove() 触发的 blur 才不会递归进来
+            const text = input.value;
+            input.remove();
+            name.style.display = '';
+            if (commit) setLabel(ordinal, text);
+            name.textContent = labelOf(ordinal);
+            name.title = labels[String(ordinal)]
+                ? `${labels[String(ordinal)]}（双击改名）`
+                : '双击改条目名';
         }
 
         // 连接数实时变化 → 刷新列表。核心在 Vue 渲染器下同样触发此回调
@@ -275,12 +449,16 @@ app.registerExtension({
 
         node.addDOMWidget('switch_view', 'HTML', root, { serialize: false, hideOnZoom: false });
 
+        readLabels();
         syncUI();
 
-        // 工作流加载：widget 值此时才恢复，重读并重绘
+        // 工作流加载：widget 值此时才恢复，重读条目名并重绘
         const prevConfigure = node.onConfigure;
         node.onConfigure = function (info) {
             const r = prevConfigure?.apply(this, arguments);
+            editing = null;      // 换工作流：放弃正在编辑的输入，一律以文件里的为准
+            preClickSelection = null;
+            readLabels();
             syncUI();
             return r;
         };
