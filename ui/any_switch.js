@@ -27,6 +27,8 @@ const DOUBLE_CLICK_MS = 400;
 // 面板高度的下限（px）：DOM 元素还没上屏时 offsetHeight 全为 0，不能据此把节点
 // 钉成 0 高。120 也是改造前的固定高度，等于「行数少时保持原样」。
 const WIDGET_MIN_H = 120;
+// 内容高度之外多留的余量（px）：不强求严丝合缝，避免测量误差吃掉最后一行。
+const WIDGET_SLACK = 20;
 
 let stylesInjected = false;
 
@@ -297,7 +299,7 @@ app.registerExtension({
             renderRows();
         }
 
-        /** 面板内容需要的真实高度（px）。间距/内边距一律从 computedStyle 现读，
+        /** 面板内容高度 + 余量（px）。间距/内边距一律从 computedStyle 现读，
          *  以后调 CSS 不会和这里脱节。 */
         function contentHeight() {
             const rootCS = getComputedStyle(root);
@@ -309,7 +311,9 @@ app.registerExtension({
             }
             const total = (parseFloat(rootCS.paddingTop) || 0) + (parseFloat(rootCS.paddingBottom) || 0)
                 + modes.offsetHeight + (parseFloat(rootCS.rowGap) || 0) + inner;
-            return Math.max(WIDGET_MIN_H, Math.round(total));
+            // 不追求严丝合缝：多留一点，免得最后一行被那一两像素的测量误差挤掉，
+            // 面板也不至于贴得那么局促。多出来的空间由列表吸收（行不改高）。
+            return Math.max(WIDGET_MIN_H, Math.round(total) + WIDGET_SLACK);
         }
 
         /** 把面板高度钉到内容高度，行数变了才让节点重算总尺寸。
