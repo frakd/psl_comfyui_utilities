@@ -28,7 +28,7 @@ const DOUBLE_CLICK_MS = 400;
 // 钉成 0 高。120 也是改造前的固定高度，等于「行数少时保持原样」。
 const WIDGET_MIN_H = 120;
 // 内容高度之外多留的余量（px）：不强求严丝合缝，避免测量误差吃掉最后一行。
-const WIDGET_SLACK = 20;
+const WIDGET_SLACK = 10;
 
 let stylesInjected = false;
 
