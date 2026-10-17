@@ -223,7 +223,10 @@ app.registerExtension({
         }
 
         function labelOf(ordinal) {
-            return labels[String(ordinal)] || `输入 ${ordinal + 1}`;
+            // 默认名与端口名 0 基对齐：input0/input1 -> 输入 0/输入 1（此前是 +1 偏移，
+            // 面板写「输入 1」端口却是 input0，两边对不上）。用户双击改的名字
+            // 存 labels_json（键本来就是 0 基序数），不受此改动影响。
+            return labels[String(ordinal)] || `输入 ${ordinal}`;
         }
 
         // 落盘一个条目名；空名 = 删除标注、回落默认名。
@@ -467,7 +470,7 @@ app.registerExtension({
             input.type = 'text';
             input.className = 'asw-name-input';
             input.value = text ?? '';
-            input.placeholder = `输入 ${ordinal + 1}`;
+            input.placeholder = `输入 ${ordinal}`;   // 与 labelOf 同源：0 基对齐端口名
             input.spellcheck = false;
             input.title = '回车确认，Esc 取消；留空 = 恢复默认名';
             editing = { ordinal, text: input.value, input, name };
