@@ -14,10 +14,14 @@ batch 槽在「没选图」或「选中图尺寸不一致」时按同一规则�
 
 两个 widget 的分工是缓存正确性的关键：
 - selected_json 进 prompt，是后端唯一需要的东西（有序的被选文件名）。
-- pool_json 只承载 UI 状态（容器里全部图片、每行图片数），由前端 JS 设
+- pool_json 只承载 UI 状态（容器里全部图片、每行图片数、点选模式），由前端 JS 设
   options.serialize=false，因此**不进 prompt**、只随工作流文件持久化。
   否则你在容器里上传/排序但没改选中集时，下游缓存也会白丢一遍
   （缓存签名把 prompt 里每个字面量原样纳入，见 comfy_execution/caching.py:120-127）。
+
+execute 另返回一个轻量 ui（psl_ic_run，值无语义）：executed 消息只对带 ui 输出的
+节点发出（execution.py 只在 len(output_ui)>0 时发送），前端顺序单选模式靠它感知
+「本节点这次真的运行完了」，从而在每次运行后自动把选中项推进到下一张。
 """
 
 import json
@@ -52,6 +56,9 @@ class ImageContainer(io.ComfyNode):
                 f"前 {SLOT_COUNT} 个输出各出一张图，未选中的槽按「未选中槽输出」开关处理；"
                 f"第 7 个 batch 输出把选中的图合成一个批次，尺寸不一致时跳过合成，"
                 f"前 {SLOT_COUNT} 个单图输出不受影响。"
+                "工具条可切换点选模式：多选（默认，按点击先后占用槽 1..6）、"
+                "单选（同时只选一张，点另一张自动替换）、"
+                "顺序单选（单选之外，每次本节点运行完自动切到下一张，最后一张停住）。"
             ),
             # 必须是输出节点：既让「运行到此节点」可用（execution.py:1181-1183 只把
             # OUTPUT_NODE 当作部分执行的根），也让它不依赖下游连线就能被执行。
@@ -165,4 +172,7 @@ class ImageContainer(io.ComfyNode):
             if all((t.shape[1], t.shape[2]) == (height, width) for t in loaded):
                 batch = torch.cat(loaded, dim=0)
 
-        return io.NodeOutput(*slots, batch)
+        # ui 里带一个轻量运行标记：executed 消息只对带 ui 输出的节点发出，前端
+        # 顺序单选模式据此在每次本节点运行完后自动推进选中项。值本身无语义；
+        # 包一层 list 是因为 ui 合并时会把值当可迭代展开（execution.py:422）。
+        return io.NodeOutput(*slots, batch, ui={"psl_ic_run": [1]})

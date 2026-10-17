@@ -7,10 +7,25 @@ import { app } from '../../scripts/app.js';
 //  顺序规则：输出槽编号完全由点击先后决定，缩略图左上角的角标就是它占的槽；
 //  取消选中某张后，后面所有角标自动进位。长按拖拽只改变容器内的显示顺序，
 //  不动角标 —— 两套顺序互不干扰。
+//
+//  点选模式（工具条「全不选」左侧三档，随 pool_json 持久化、不进 prompt）：
+//  multi      多选 —— 默认，即上文的点选累加行为；
+//  single     单选 —— 同时只允许选中一张，点另一张整体替换，点已选中的那张不变；
+//  sequential 顺序单选 —— 单选的一切行为 + 本节点每次运行完成后自动把选中项
+//             推进到容器里的下一张（推进依据 onExecuted，只有真的执行过才会触发；
+//             失败/缓存命中/被跳过都不推进），到最后一张则保持不动。
 // ============================================================
 
 const SUBFOLDER = 'imageContainer';
 const SLOT_COUNT = 6;
+// 点选模式三档：label 是按钮文案，title 是悬停说明，NAME 进状态栏
+const MODES = [
+    { id: 'multi', label: '多选', title: '多选：按点击先后占用输出槽 1..6（默认）' },
+    { id: 'single', label: '单选', title: '单选：同时只选中一张；点另一张自动替换，点已选中的那张不变' },
+    { id: 'sequential', label: '顺序', title: '顺序单选：单选 + 每次本节点运行完自动切到下一张（最后一张停住）' },
+];
+const MODE_IDS = MODES.map((m) => m.id);
+const MODE_NAMES = { multi: '多选', single: '单选', sequential: '顺序单选' };
 const ENTRY_CLS = 'ic-entry';
 const DRAG_HOLD_MS = 200;   // 按住这么久即进入拖拽
 const DRAG_MOVE_PX = 6;     // 或位移超过这么多像素即进入拖拽
@@ -37,11 +52,14 @@ function injectStyles() {
             box-sizing: border-box;
             overflow: hidden;
         }
-        /* 头部固定：列表再长也不会把上传按钮顶走 */
+        /* 头部固定：列表再长也不会把上传按钮顶走。
+           flex-wrap：窄节点时按钮换行而不是被裁掉 */
         .ic-header {
             display: flex;
             align-items: center;
             gap: 6px;
+            row-gap: 4px;
+            flex-wrap: wrap;
             padding: 6px 8px;
             background: #2a2a2a;
             border-bottom: 1px solid #444;
@@ -62,6 +80,24 @@ function injectStyles() {
         .ic-btn.danger:hover { background: rgba(210, 66, 66, 0.9); }
         .ic-btn.plain { background: #3d3d3d; border: 1px solid #555; padding: 3px 7px; }
         .ic-btn.plain:hover { background: #555; }
+        /* 点选模式按钮组：当前档位高亮成主按钮蓝 */
+        .ic-modes { display: inline-flex; gap: 2px; }
+        .ic-mode {
+            background: #3d3d3d;
+            border: 1px solid #555;
+            color: #ddd;
+            border-radius: 4px;
+            padding: 3px 7px;
+            font-size: 12px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .ic-mode:hover { background: #555; }
+        .ic-mode.active {
+            background: rgba(47, 121, 191, 0.85);
+            border-color: rgba(47, 121, 191, 0.85);
+            color: #fff;
+        }
         .ic-spacer { flex: 1 1 auto; }
         .ic-cols {
             width: 40px;
@@ -260,8 +296,9 @@ app.registerExtension({
 
         // ---------- 状态 ----------
         let pool = [];          // [{id,name,subfolder,type}]，容器内显示顺序
-        let selectedIds = [];   // 有序，最多 SLOT_COUNT 个
+        let selectedIds = [];   // 有序，最多 SLOT_COUNT 个（单选/顺序单选下最多 1 个）
         let cols = 4;
+        let selMode = 'multi';  // multi | single | sequential
 
         function readPoolState() {
             let st = {};
@@ -278,10 +315,14 @@ app.registerExtension({
             selectedIds = (Array.isArray(st.selected) ? st.selected : [])
                 .filter((id) => alive.has(id))
                 .slice(0, SLOT_COUNT);
+            // 点选模式也存在 pool_json 里：随工作流文件持久化、不进 prompt。
+            // 旧工作流没有 mode 字段 → 回落 multi。
+            selMode = MODE_IDS.includes(st.mode) ? st.mode : 'multi';
+            syncModeButtons();
         }
 
         function writeState() {
-            poolW.value = JSON.stringify({ cols, items: pool, selected: selectedIds });
+            poolW.value = JSON.stringify({ cols, items: pool, selected: selectedIds, mode: selMode });
             const byId = new Map(pool.map((p) => [p.id, p]));
             selectedW.value = JSON.stringify(
                 selectedIds.map((id) => byId.get(id)).filter(Boolean)
@@ -334,6 +375,24 @@ app.registerExtension({
             render();
         };
 
+        // ---- 点选模式切换（放在「全不选」左边）----
+        const modesWrap = document.createElement('div');
+        modesWrap.className = 'ic-modes';
+        const modeBtns = {};
+        for (const m of MODES) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'ic-mode';
+            b.textContent = m.label;
+            b.title = m.title;
+            b.addEventListener('click', (e) => {
+                e.stopPropagation();
+                setMode(m.id);
+            });
+            modeBtns[m.id] = b;
+            modesWrap.appendChild(b);
+        }
+
         const spacer = document.createElement('div');
         spacer.className = 'ic-spacer';
 
@@ -371,7 +430,7 @@ app.registerExtension({
         plusBtn.onclick = () => setCols(cols + 1);
         colsInput.onchange = () => setCols(parseInt(colsInput.value, 10) || 4);
 
-        header.append(uploadBtn, pasteBtn, clearBtn, deselectBtn, spacer, minusBtn, colsInput, plusBtn);
+        header.append(uploadBtn, pasteBtn, clearBtn, modesWrap, deselectBtn, spacer, minusBtn, colsInput, plusBtn);
 
         const scroll = document.createElement('div');
         scroll.className = 'ic-scroll';
@@ -449,7 +508,10 @@ app.registerExtension({
             // 未选中槽的语义由 unselected_output 开关决定，状态栏如实反映当前档位
             const mode = modeW?.value || 'none';
             const hint = selectedIds.length < SLOT_COUNT ? ` · 未选中槽: ${mode}` : '';
-            status.textContent = `容器 ${pool.length} 张 · 已选 ${selectedIds.length}/${SLOT_COUNT}${hint}`;
+            // 单选/顺序单选下已选上限是 1，状态栏按当前模式如实显示
+            const cap = selMode === 'multi' ? SLOT_COUNT : 1;
+            status.textContent =
+                `容器 ${pool.length} 张 · 已选 ${selectedIds.length}/${cap} · ${MODE_NAMES[selMode]}${hint}`;
         }
 
         function buildEntry(entry, itemW) {
@@ -515,16 +577,60 @@ app.registerExtension({
         }
 
         function toggleSelect(id) {
-            const at = selectedIds.indexOf(id);
-            if (at >= 0) {
-                selectedIds.splice(at, 1);   // 取消输出，后面的自动前移
-            } else {
-                if (selectedIds.length >= SLOT_COUNT) {
-                    status.textContent = `最多只能选 ${SLOT_COUNT} 张（输出槽只有 ${SLOT_COUNT} 个）`;
-                    return;
+            if (selMode === 'multi') {
+                const at = selectedIds.indexOf(id);
+                if (at >= 0) {
+                    selectedIds.splice(at, 1);   // 取消输出，后面的自动前移
+                } else {
+                    if (selectedIds.length >= SLOT_COUNT) {
+                        status.textContent = `最多只能选 ${SLOT_COUNT} 张（输出槽只有 ${SLOT_COUNT} 个）`;
+                        return;
+                    }
+                    selectedIds.push(id);      // 按点击先后占用下一个输出槽
                 }
-                selectedIds.push(id);      // 按点击先后占用下一个输出槽
+            } else {
+                // 单选 / 顺序单选：radio 语义 —— 点已选中的那张保持不变，
+                // 点另一张整体替换（上一张自动取消）。清空走「全不选」按钮。
+                if (selectedIds[0] === id) return;
+                selectedIds = [id];
             }
+            refreshSelection();
+        }
+
+        // ---------- 点选模式 ----------
+        function syncModeButtons() {
+            for (const m of MODES) {
+                modeBtns[m.id]?.classList.toggle('active', selMode === m.id);
+            }
+        }
+
+        function setMode(v) {
+            if (!MODE_IDS.includes(v) || v === selMode) return;
+            const prev = selMode;
+            selMode = v;
+            // 多选 -> 单选/顺序单选：按约定收拢为「容器显示顺序的第一张」
+            // （与顺序模式的「下一张」同一定义，行为可预期）；容器为空则清空。
+            if (prev === 'multi') selectedIds = pool.length ? [pool[0].id] : [];
+            syncModeButtons();
+            refreshSelection();
+        }
+
+        // 顺序单选：本节点每次运行完成后自动推进。挂在 onExecuted 上——后端
+        // execute 带 ui 输出（psl_ic_run）后该回调必然被调用，且只在本节点真的
+        // 执行过时触发：缓存命中 / 运行失败 / 节点被跳过都不会推进。
+        // 不用 status 事件兜底：推进不是幂等操作，同一次运行只能推进一次。
+        const prevOnExecuted = node.onExecuted;
+        node.onExecuted = function (output) {
+            prevOnExecuted?.apply(this, arguments);
+            advanceSequential();
+        };
+
+        function advanceSequential() {
+            if (selMode !== 'sequential' || !pool.length) return;
+            // 未选中（如手动全不选过）→ 从第一张开始；已选中 → 下一张；
+            // 已是最后一张 → min 钳住保持不动。
+            const at = selectedIds.length ? pool.findIndex((p) => p.id === selectedIds[0]) : -1;
+            selectedIds = [pool[Math.min(at + 1, pool.length - 1)].id];
             refreshSelection();
         }
 
