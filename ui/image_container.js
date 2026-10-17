@@ -11,9 +11,10 @@ import { app } from '../../scripts/app.js';
 //  点选模式（工具条「全不选」左侧三档，随 pool_json 持久化、不进 prompt）：
 //  multi      多选 —— 默认，即上文的点选累加行为；
 //  single     单选 —— 同时只允许选中一张，点另一张整体替换，点已选中的那张不变；
-//  sequential 顺序单选 —— 单选的一切行为 + 本节点每次运行完成后自动把选中项
-//             推进到容器里的下一张（推进依据 onExecuted，只有真的执行过才会触发；
-//             失败/缓存命中/被跳过都不推进），到最后一张则保持不动。
+//  sequential 顺序单选 —— 单选的一切行为 + 排队即推进：每次排队（Queue）时本次
+//             运行仍用当前选中的那张，选中游标随即推进到下一张供下次排队使用；
+//             连点多次排队依次用第 1、2、3…张。推进发生在排队瞬间，与运行成败
+//             无关（取消 / 失败 / 缓存命中同样已推进）；到最后一张则保持不动。
 // ============================================================
 
 const SUBFOLDER = 'imageContainer';
@@ -22,7 +23,7 @@ const SLOT_COUNT = 6;
 const MODES = [
     { id: 'multi', label: '多选', title: '多选：按点击先后占用输出槽 1..6（默认）' },
     { id: 'single', label: '单选', title: '单选：同时只选中一张；点另一张自动替换，点已选中的那张不变' },
-    { id: 'sequential', label: '顺序', title: '顺序单选：单选 + 每次本节点运行完自动切到下一张（最后一张停住）' },
+    { id: 'sequential', label: '顺序', title: '顺序单选：单选 + 每次排队自动切到下一张（连点多次排队依次用第 1、2、3…张；最后一张停住）' },
 ];
 const MODE_IDS = MODES.map((m) => m.id);
 const MODE_NAMES = { multi: '多选', single: '单选', sequential: '顺序单选' };
@@ -615,20 +616,29 @@ app.registerExtension({
             refreshSelection();
         }
 
-        // 顺序单选：本节点每次运行完成后自动推进。挂在 onExecuted 上——后端
-        // execute 带 ui 输出（psl_ic_run）后该回调必然被调用，且只在本节点真的
-        // 执行过时触发：缓存命中 / 运行失败 / 节点被跳过都不会推进。
-        // 不用 status 事件兜底：推进不是幂等操作，同一次运行只能推进一次。
-        const prevOnExecuted = node.onExecuted;
-        node.onExecuted = function (output) {
-            prevOnExecuted?.apply(this, arguments);
-            advanceSequential();
+        // 顺序单选推进：挂在 selectedW.serializeValue 上——每次排队构建 prompt 时
+        // 都会调用（与 any_switch 随机模式同一机制）。排队即推进：先取「推进前」的
+        // 选中集作为本次运行的值返回，再把游标推进到下一张供下次排队使用。
+        // 连点多次排队 → 依次用第 1、2、3…张。推进瞬间运行成败尚不可知，因此
+        // 不做任何成败判断（取消 / 失败 / 缓存命中同样已推进）；也正因如此顺序
+        // 模式下 selected_json 每次排队都不同 → 本节点每跑必重跑，这是逐张步进的
+        // 内在代价。推进不是幂等操作，只挂这一个钩子，别再叠加 onExecuted 之类
+        // 的第二次推进点（会跳张）。
+        selectedW.serializeValue = () => {
+            if (selMode !== 'sequential' || !pool.length) return selectedW.value;
+            if (!selectedIds.length) {
+                // 没选（如刚切模式 / 手动全不选过）：本次运行就从第一张开始
+                selectedIds = [pool[0].id];
+                refreshSelection();
+            }
+            const val = selectedW.value;   // 本次运行用的选中集（推进前快照）
+            advanceSequential();           // 游标推进，UI 同步显示下一次将用的那张
+            return val;
         };
 
         function advanceSequential() {
-            if (selMode !== 'sequential' || !pool.length) return;
-            // 未选中（如手动全不选过）→ 从第一张开始；已选中 → 下一张；
-            // 已是最后一张 → min 钳住保持不动。
+            if (!pool.length) return;
+            // 未选中 → 从第一张开始；已选中 → 下一张；已是最后一张 → min 钳住保持不动。
             const at = selectedIds.length ? pool.findIndex((p) => p.id === selectedIds[0]) : -1;
             selectedIds = [pool[Math.min(at + 1, pool.length - 1)].id];
             refreshSelection();

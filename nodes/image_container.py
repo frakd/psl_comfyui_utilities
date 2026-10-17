@@ -19,9 +19,9 @@ batch 槽在「没选图」或「选中图尺寸不一致」时按同一规则�
   否则你在容器里上传/排序但没改选中集时，下游缓存也会白丢一遍
   （缓存签名把 prompt 里每个字面量原样纳入，见 comfy_execution/caching.py:120-127）。
 
-execute 另返回一个轻量 ui（psl_ic_run，值无语义）：executed 消息只对带 ui 输出的
-节点发出（execution.py 只在 len(output_ui)>0 时发送），前端顺序单选模式靠它感知
-「本节点这次真的运行完了」，从而在每次运行后自动把选中项推进到下一张。
+顺序单选模式的「推进到下一张」完全在前端实现：前端在 serializeValue（每次排队构建
+prompt 时调用）里把推进后的选中集写进 selected_json，后端对此无感知，
+execute 不需要任何额外的 ui 输出。
 """
 
 import json
@@ -58,7 +58,8 @@ class ImageContainer(io.ComfyNode):
                 f"前 {SLOT_COUNT} 个单图输出不受影响。"
                 "工具条可切换点选模式：多选（默认，按点击先后占用槽 1..6）、"
                 "单选（同时只选一张，点另一张自动替换）、"
-                "顺序单选（单选之外，每次本节点运行完自动切到下一张，最后一张停住）。"
+                "顺序单选（单选之外，每次排队自动推进到下一张：本次运行仍用当前选中的图，"
+                "连点多次排队依次用第 1、2、3…张，最后一张停住）。"
             ),
             # 必须是输出节点：既让「运行到此节点」可用（execution.py:1181-1183 只把
             # OUTPUT_NODE 当作部分执行的根），也让它不依赖下游连线就能被执行。
@@ -172,7 +173,4 @@ class ImageContainer(io.ComfyNode):
             if all((t.shape[1], t.shape[2]) == (height, width) for t in loaded):
                 batch = torch.cat(loaded, dim=0)
 
-        # ui 里带一个轻量运行标记：executed 消息只对带 ui 输出的节点发出，前端
-        # 顺序单选模式据此在每次本节点运行完后自动推进选中项。值本身无语义；
-        # 包一层 list 是因为 ui 合并时会把值当可迭代展开（execution.py:422）。
-        return io.NodeOutput(*slots, batch, ui={"psl_ic_run": [1]})
+        return io.NodeOutput(*slots, batch)
