@@ -2,6 +2,7 @@ from .ab_audio_compare import AudioABCompare
 from .any_switch import AnySwitch
 from .aspect_ratio_selector import AspectRatioSelectorNode
 from .audio_filter import AudioHarshnessSuppressor
+from .cached_clip_text_encode import CachedCLIPTextEncode
 from .deep_vram_cleanup import DeepVRAMCleanup
 from .h3_av_lora import MiniMaxH3AVLoRAStack
 from .image_container import ImageContainer
@@ -15,6 +16,7 @@ _NODE_CLASSES = (
     DeepVRAMCleanup,
     AudioHarshnessSuppressor,
     AudioABCompare,
+    CachedCLIPTextEncode,
     AnySwitch,
     MiniMaxH3AVLoRAStack,
     AspectRatioSelectorNode,

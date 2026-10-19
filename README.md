@@ -31,6 +31,7 @@ Typing `psl` or `personal` in the node search box filters out every node in this
 | [Mask Paint Output](#mask-paint-output) | 预览底图、在其上画遮罩，成对输出 IMAGE + MASK |
 | [Persistent Output](#persistent-output) | 三槽位记住前几趟运行的图/音频，断线后仍可复现做对比 |
 | [Refreshable Text Box](#refreshable-text-box) | 文本框自动刷新显示上游文本，且不污染运行缓存 |
+| [CLIP Text Encode (Cached)](#clip-text-encode-cached) | 文本编码结果按 (CLIP, 文本) 缓存，上游重跑但文本没变时不再重编码 |
 | [Image Container (6 Outputs)](#image-container-6-outputs) | 图片池 + 点选排序（多选/单选/顺序单选），输出 6 路单图与 1 个 batch |
 | [Video Combine (Memory)](#video-combine-memory) | 帧+音频直接在内存合成 MP4 不落盘（NVENC 加速引擎），合并/落盘接官方节点 |
 
@@ -152,6 +153,18 @@ Typical loop: leave "allow overwrite" on → run up to this node → edit the te
 
 ---
 
+### CLIP Text Encode (Cached)
+
+`nodes/cached_clip_text_encode.py` · 分类 Category：`conditioning`
+
+**中** —— 与核心 CLIP Text Encode 等价，但按 (CLIP 对象, 文本) 缓存编码结果。痛点与 Refreshable Text Box 同源：ComfyUI 的缓存签名会把输入字面量和祖先签名一起纳入，所以 LoRA 开关、元数据同步、文本框刷新都会让下游文本编码重跑一次——哪怕最终文本一字未变。对 Qwen3.5-9B 这类大文本编码器，这次重编码就是数秒。本节点在 encode 外面加一层 4 条的小 LRU：命中时直接返回上次的 conditioning，不重新 tokenize/encode；文本或 CLIP 真正变化时照常重编码。带 hooks 的 conditioning 不缓存，`cache_mode=disabled` 可临时绕过。它只替换显式使用本节点的编码，不做全局 monkey-patch。
+注意：节点本身仍会被 ComfyUI 执行（上游签名变了），只是执行成本降到一次字典查找；若要让节点完全不执行，需要把触发词来源与 loader 解耦（独立节点 + 前端同步），不在本节点能力范围内。
+
+**EN** — Drop-in equivalent of the core CLIP Text Encode that caches the encoded conditioning by (CLIP object, text). Same root cause as Refreshable Text Box: ComfyUI's cache signature includes input literals plus ancestor signatures, so toggling a LoRA, syncing metadata, or refreshing a text box re-runs the downstream text encode even when the final text is byte-identical. With a Qwen3.5-9B text encoder that costs seconds per run. This node wraps `encode` in a 4-entry LRU: on a hit it returns the previous conditioning without tokenizing/encoding again; a real text or CLIP change still re-encodes. Conditioning that carries hooks is never cached, and `cache_mode=disabled` bypasses the cache. It only affects encodes that explicitly use this node — no global monkey-patching.
+Caveat: the node itself is still executed by ComfyUI (its ancestor signature changed); the cost drops to a dict lookup. Making the node not execute at all requires decoupling the trigger-word source from the loader (a separate node plus front-end syncing), which is out of scope here.
+
+---
+
 ### Image Container (6 Outputs)
 
 `nodes/image_container.py` · `ui/image_container.js` · 分类 Category：`image/container`
@@ -184,6 +197,7 @@ nodes/                      节点后端 node back ends
   audio_filter/             Harshness Suppressor 及其 DSP 实现与脱离服务端可跑的测试
                             suppressor + its DSP core and tests that run without a server
 ui/                         各节点的前端脚本 front-end scripts, served under /extensions/<pack name>/
+tests/                      脱离服务端可跑的节点单测 node unit tests that run without a server
 docs/model_reroute.md       Model Reroute 的用法、限制与兼容性表
                             usage, limits and compatibility matrix for Model Reroute
 ```
