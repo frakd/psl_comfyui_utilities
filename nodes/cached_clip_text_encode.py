@@ -28,14 +28,26 @@ _cache_lock = threading.Lock()
 
 
 def _clip_cache_key(clip, text: str):
-    """(CLIP 对象标识, layer_idx, patch 数, 文本)。"""
+    """(CLIP 对象标识, layer_idx, patch 状态, 文本)。
+
+    patch 状态同时记录 patches_uuid 与 patch 数：标准 ``add_patches`` 每次真正
+    改权重都会换 uuid，因此同一对象原地加/换 patch（数量不变）也能正确失效；
+    patch 数则兼容没有 ``patches_uuid`` 的旧版/自定义 patcher。
+    """
     patcher = getattr(clip, "patcher", None)
     patches = getattr(patcher, "patches", None)
     try:
         patch_count = len(patches) if patches is not None else 0
     except TypeError:
         patch_count = 0
-    return (id(clip), getattr(clip, "layer_idx", None), patch_count, text)
+    patches_uuid = getattr(patcher, "patches_uuid", None)
+    return (
+        id(clip),
+        getattr(clip, "layer_idx", None),
+        patches_uuid,
+        patch_count,
+        text,
+    )
 
 
 def _lookup(clip, text: str):

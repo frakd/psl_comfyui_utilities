@@ -115,6 +115,22 @@ def test_layer_idx_and_patch_count_participate_in_key():
     assert clip.calls == 3
 
 
+def test_patches_uuid_change_invalidates_same_patch_count():
+    module._clear_cache()
+    clip = FakeClip()
+    clip.patcher.patches = {"same": object()}
+    clip.patcher.patches_uuid = "uuid-0"
+
+    run(clip, "x")
+    assert clip.calls == 1
+
+    # 模拟原地 add_patches：patch 数量不变，但 patcher 的 weights uuid 变了
+    clip.patcher.patches = {"same": object()}
+    clip.patcher.patches_uuid = "uuid-1"
+    run(clip, "x")
+    assert clip.calls == 2
+
+
 def test_lru_evicts_oldest_entry():
     module._clear_cache()
     clip = FakeClip()
@@ -155,6 +171,7 @@ if __name__ == "__main__":
     test_disabled_mode_bypasses_cache()
     test_hooks_conditioning_is_not_cached()
     test_layer_idx_and_patch_count_participate_in_key()
+    test_patches_uuid_change_invalidates_same_patch_count()
     test_lru_evicts_oldest_entry()
     test_none_clip_is_reported()
     test_schema_exposes_conditioning_output()
