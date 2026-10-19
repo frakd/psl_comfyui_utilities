@@ -158,9 +158,11 @@ Typical loop: leave "allow overwrite" on → run up to this node → edit the te
 `nodes/cached_clip_text_encode.py` · 分类 Category：`conditioning`
 
 **中** —— 与核心 CLIP Text Encode 等价，但按 (CLIP 对象, 文本) 缓存编码结果。痛点与 Refreshable Text Box 同源：ComfyUI 的缓存签名会把输入字面量和祖先签名一起纳入，所以 LoRA 开关、元数据同步、文本框刷新都会让下游文本编码重跑一次——哪怕最终文本一字未变。对 Qwen3.5-9B 这类大文本编码器，这次重编码就是数秒。本节点在 encode 外面加一层 4 条的小 LRU：命中时直接返回上次的 conditioning，不重新 tokenize/encode；文本或 CLIP 真正变化时照常重编码。带 hooks 的 conditioning 不缓存，`cache_mode=disabled` 可临时绕过。它只替换显式使用本节点的编码，不做全局 monkey-patch。
+用法：把工作流里核心的 `CLIP Text Encode` 直接换成这个节点，`clip` / `text` 照原样接上，`cache_mode` 保持 `enabled`。缓存只持有 conditioning，CLIP 模型本身用 `weakref` 引用，不会阻止模型卸载或换出；如果某个自定义节点原地修改 CLIP 权重而没有换对象，用 `cache_mode=disabled` 绕过。
 注意：节点本身仍会被 ComfyUI 执行（上游签名变了），只是执行成本降到一次字典查找；若要让节点完全不执行，需要把触发词来源与 loader 解耦（独立节点 + 前端同步），不在本节点能力范围内。
 
 **EN** — Drop-in equivalent of the core CLIP Text Encode that caches the encoded conditioning by (CLIP object, text). Same root cause as Refreshable Text Box: ComfyUI's cache signature includes input literals plus ancestor signatures, so toggling a LoRA, syncing metadata, or refreshing a text box re-runs the downstream text encode even when the final text is byte-identical. With a Qwen3.5-9B text encoder that costs seconds per run. This node wraps `encode` in a 4-entry LRU: on a hit it returns the previous conditioning without tokenizing/encoding again; a real text or CLIP change still re-encodes. Conditioning that carries hooks is never cached, and `cache_mode=disabled` bypasses the cache. It only affects encodes that explicitly use this node — no global monkey-patching.
+Usage: replace a core CLIP Text Encode with this node, wire `clip` / `text` as before, and leave `cache_mode` on `enabled`. The cache holds conditioning only; the CLIP model is referenced through a `weakref`, so it won't block unloading or swapping. If a custom node mutates CLIP weights in place without producing a new object, set `cache_mode=disabled`.
 Caveat: the node itself is still executed by ComfyUI (its ancestor signature changed); the cost drops to a dict lookup. Making the node not execute at all requires decoupling the trigger-word source from the loader (a separate node plus front-end syncing), which is out of scope here.
 
 ---
