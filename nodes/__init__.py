@@ -6,6 +6,7 @@ from .cached_clip_text_encode import CachedCLIPTextEncode
 from .deep_vram_cleanup import DeepVRAMCleanup
 from .h3_av_lora import MiniMaxH3AVLoRAStack
 from .image_container import ImageContainer
+from .lora_step_schedule import PSLLoRAStepSchedule
 from .mask_paint_output import MaskPaintOutput
 from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
@@ -25,6 +26,7 @@ _NODE_CLASSES = (
     PersistentOutput,
     RefreshableTextBox,
     ImageContainer,
+    PSLLoRAStepSchedule,
     PSLVideoCombineMemory,
 )
 
