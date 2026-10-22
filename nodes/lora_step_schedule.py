@@ -64,6 +64,7 @@ PRECISION_TO_DTYPE = {
 
 _MAX_LIST_POINTS = 2000
 _LORA_CACHE_MAX = 2
+_CHAIN_ATTACHMENT_KEY = "psl_lora_step_schedule_chain"
 _lora_cache: "OrderedDict[tuple[str, int, int], dict]" = OrderedDict()
 _lora_cache_lock = threading.Lock()
 
@@ -506,6 +507,50 @@ def _model_lora_key_map(model) -> dict:
     return key_map
 
 
+def _compute_lora_delta(
+    adapter: WeightAdapterBase,
+    x: torch.Tensor,
+    output: torch.Tensor,
+    offset: tuple[int, int, int] | None,
+    label: str,
+    out_dim: int,
+    compute_dtype: torch.dtype,
+    strength: float,
+) -> torch.Tensor | None:
+    """Evaluate one adapter branch and return a delta ready for ``output``."""
+    if strength == 0.0:
+        return None
+    x_compute = x if x.dtype == compute_dtype else x.to(dtype=compute_dtype)
+    try:
+        delta = adapter.h(x_compute, output)
+    except Exception:
+        LOG.exception("LoRA 前向分支计算失败：%s", label)
+        raise
+    if not isinstance(delta, torch.Tensor):
+        raise RuntimeError(f"LoRA 适配器 {label} 的 h() 未返回张量")
+
+    if offset is None:
+        expected = tuple(output.shape)
+    else:
+        _dim, _start, length = offset
+        expected_shape = list(output.shape)
+        expected_shape[out_dim] = length
+        expected = tuple(expected_shape)
+    if tuple(delta.shape) != expected:
+        raise RuntimeError(
+            "LoRA 前向分支输出形状与目标切片不匹配："
+            f"{tuple(delta.shape)} vs {expected}（{label}）。"
+            "请确认 LoRA 与底模架构/层类型一致。"
+        )
+
+    # Scale in the selected compute dtype, then cast for the addition.
+    if strength != 1.0:
+        delta = delta * strength
+    if delta.dtype != output.dtype:
+        delta = delta.to(dtype=output.dtype)
+    return delta
+
+
 class _ModuleLoRAHook:
     """Forward branch for one module, with optional fused-projection slices.
 
@@ -609,39 +654,18 @@ class _ModuleLoRAHook:
         out_dim = 1 if self._is_conv else -1
         deltas = []
         for adapter, offset, label in self.specs:
-            try:
-                delta = adapter.h(x, output)
-            except Exception:
-                LOG.exception(
-                    "LoRA 前向分支计算失败：%s（模块 %s）",
-                    label,
-                    type(module).__name__,
-                )
-                raise
-            if not isinstance(delta, torch.Tensor):
-                self._warn_skip("适配器 h() 未返回张量")
-                return None
-
-            if offset is None:
-                expected = tuple(output.shape)
-            else:
-                _dim, _start, length = offset
-                expected_shape = list(output.shape)
-                expected_shape[out_dim] = length
-                expected = tuple(expected_shape)
-            if tuple(delta.shape) != expected:
-                raise RuntimeError(
-                    "LoRA 前向分支输出形状与目标切片不匹配："
-                    f"{tuple(delta.shape)} vs {expected}（{label}）。"
-                    "请确认 LoRA 与底模架构/层类型一致。"
-                )
-
-            # Scale in the selected compute dtype, then cast for the addition.
-            if self.strength != 1.0:
-                delta = delta * self.strength
-            if delta.dtype != output.dtype:
-                delta = delta.to(dtype=output.dtype)
-            deltas.append((offset, delta))
+            delta = _compute_lora_delta(
+                adapter,
+                x,
+                output,
+                offset,
+                label,
+                out_dim,
+                compute_dtype,
+                self.strength,
+            )
+            if delta is not None:
+                deltas.append((offset, delta))
 
         if not deltas:
             return None
@@ -657,6 +681,240 @@ class _ModuleLoRAHook:
                 _dim, start, length = offset
                 result.narrow(out_dim, start, length).add_(delta)
         return result
+
+
+class _MergedModuleHook:
+    """One forward hook for all dynamic LoRAs that target the same module."""
+
+    def __init__(
+        self,
+        module_name: str,
+        specs: list[tuple[Any, WeightAdapterBase, tuple[int, int, int] | None, str]],
+    ):
+        self.module_name = module_name
+        self.specs = list(specs)
+        self._module: nn.Module | None = None
+        self._handle = None
+        self._skip_warned = False
+        self._is_conv = False
+
+    def _labels(self) -> str:
+        return ", ".join(label for _, _, _, label in self.specs)
+
+    def attach(self, patcher) -> None:
+        if self._handle is not None:
+            return
+        try:
+            module = patcher.get_model_object(self.module_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"LoRA 模块 {self.module_name} 在当前模型上不存在"
+            ) from exc
+
+        info = _module_info(module)
+        if info is None:
+            raise RuntimeError(
+                f"LoRA 模块 {self.module_name}（{type(module).__name__}）不支持前向注入"
+            )
+
+        self._is_conv = info.is_conv
+        for _state, adapter, offset, label in self.specs:
+            adapter.multiplier = 1.0
+            adapter.is_conv = info.is_conv
+            adapter.conv_dim = info.conv_dim
+            adapter.kernel_size = info.kernel_size
+            adapter.in_channels = info.in_channels
+            adapter.out_channels = info.out_channels
+            adapter.kw_dict = info.kw_dict
+            _validate_lora_shape(adapter, info, module, offset, label)
+
+        self._module = module
+        self._handle = module.register_forward_hook(self._forward_hook)
+        LOG.debug(
+            "合并挂载 LoRA 前向分支: %s（%d 个适配器） -> %s",
+            self.module_name,
+            len(self.specs),
+            type(module).__name__,
+        )
+
+    def detach(self) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+        self._module = None
+
+    def _warn_skip(self, reason: str) -> None:
+        if self._skip_warned:
+            return
+        self._skip_warned = True
+        LOG.warning(
+            "合并 LoRA 前向分支跳过 %s：%s。该层不会应用这些 LoRA。",
+            self._labels(),
+            reason,
+        )
+
+    def _forward_hook(self, module: nn.Module, args, output):
+        if not args or not isinstance(args[0], torch.Tensor):
+            self._warn_skip("输入不是单个张量")
+            return None
+        if not isinstance(output, torch.Tensor):
+            self._warn_skip("模块输出不是单个张量")
+            return None
+        x = args[0]
+        if not x.is_floating_point():
+            self._warn_skip("输入不是浮点张量")
+            return None
+
+        out_dim = 1 if self._is_conv else -1
+        deltas = []
+        for state, adapter, offset, label in self.specs:
+            delta = _compute_lora_delta(
+                adapter,
+                x,
+                output,
+                offset,
+                label,
+                out_dim,
+                state.compute_dtype,
+                float(state.current_strength),
+            )
+            if delta is not None:
+                deltas.append((offset, delta))
+
+        if not deltas:
+            return None
+        if len(deltas) == 1 and deltas[0][0] is None:
+            return output + deltas[0][1]
+
+        # One clone for all LoRAs on this module, including fused q/k/v slices.
+        result = output.clone()
+        for offset, delta in deltas:
+            if offset is None:
+                result += delta
+            else:
+                _dim, start, length = offset
+                result.narrow(out_dim, start, length).add_(delta)
+        return result
+
+
+class _ChainCoordinator:
+    """Merge all dynamic LoRAs in one MODEL chain onto shared module hooks."""
+
+    def __init__(self, states: list[Any]):
+        unique = []
+        seen = set()
+        for state in states:
+            if id(state) in seen:
+                continue
+            seen.add(id(state))
+            unique.append(state)
+        self.states = unique
+        self.hooks: list[_MergedModuleHook] = []
+        self.active = False
+        self._attached_model = None
+
+    def _grouped_specs(self) -> dict[str, list[tuple[Any, WeightAdapterBase, Any, str]]]:
+        groups: dict[str, list[tuple[Any, WeightAdapterBase, Any, str]]] = {}
+        for state in self.states:
+            for hook in state.hooks:
+                for adapter, offset, label in hook.specs:
+                    groups.setdefault(hook.module_name, []).append(
+                        (state, adapter, offset, label)
+                    )
+        return groups
+
+    def attach(self, patcher) -> None:
+        model = getattr(patcher, "model", None)
+        if self.active:
+            if model is self._attached_model:
+                return
+            self._detach_hooks()
+
+        # A state may have been active alone before this chain was formed.
+        for state in self.states:
+            state._deactivate(restore_adapters=False)
+            state.current_strength = float(state.schedule[0])
+
+        device = getattr(patcher, "load_device", None)
+        if not isinstance(device, torch.device):
+            device = comfy.model_management.get_torch_device()
+
+        hooks: list[_MergedModuleHook] = []
+        try:
+            for state in self.states:
+                _cast_adapters(state.adapters, device, state.compute_dtype)
+            for module_name, specs in self._grouped_specs().items():
+                hook = _MergedModuleHook(module_name, specs)
+                hook.attach(patcher)
+                hooks.append(hook)
+        except Exception:
+            for hook in hooks:
+                hook.detach()
+            for state in self.states:
+                state._restore_adapters()
+            raise
+
+        self.hooks = hooks
+        self.active = True
+        self._attached_model = model
+        LOG.info(
+            "合并 %d 个动态 LoRA：%d 个模块，%d 个适配器",
+            len(self.states),
+            len(hooks),
+            sum(len(hook.specs) for hook in hooks),
+        )
+
+    def _detach_hooks(self) -> None:
+        for hook in self.hooks:
+            hook.detach()
+        self.hooks = []
+        self.active = False
+        self._attached_model = None
+
+    def cleanup(self, patcher) -> None:
+        if not self.active:
+            return
+        if getattr(patcher, "model", None) is not self._attached_model:
+            return
+        self._detach_hooks()
+
+    def detach(self, patcher, unpatch_all=True) -> None:
+        if self.active:
+            self._detach_hooks()
+        for state in self.states:
+            state._restore_adapters()
+
+
+def _chain_states(patcher) -> list[Any]:
+    try:
+        chain = patcher.get_attachment(_CHAIN_ATTACHMENT_KEY)
+    except Exception:
+        return []
+    if not isinstance(chain, dict):
+        return []
+    states = chain.get("states")
+    return list(states) if isinstance(states, list) else []
+
+
+def _new_chain(states: list[Any]) -> dict:
+    return {"states": list(states), "coordinator": None}
+
+
+def _chain_coordinator(patcher, create=False):
+    try:
+        chain = patcher.get_attachment(_CHAIN_ATTACHMENT_KEY)
+    except Exception:
+        return None
+    if not isinstance(chain, dict):
+        return None
+    states = chain.get("states")
+    if not isinstance(states, list) or len(states) <= 1:
+        return None
+    coordinator = chain.get("coordinator")
+    if coordinator is None and create:
+        coordinator = _ChainCoordinator(states)
+        chain["coordinator"] = coordinator
+    return coordinator
 
 
 class _ScheduleState:
@@ -743,10 +1001,18 @@ class _ScheduleState:
         # A path that never reaches predict_noise should at least use the
         # first schedule value instead of the previous run's last value.
         self.current_strength = float(self.schedule[0])
-        self._ensure_active(patcher)
+        coordinator = _chain_coordinator(patcher, create=True)
+        if coordinator is not None:
+            coordinator.attach(patcher)
+        else:
+            self._ensure_active(patcher)
 
     def on_cleanup(self, patcher) -> None:
         """Sampling finished: detach hooks, keep adapters resident for re-use."""
+        coordinator = _chain_coordinator(patcher)
+        if coordinator is not None:
+            coordinator.cleanup(patcher)
+            return
         if not self._active:
             return
         if getattr(patcher, "model", None) is not self._attached_model:
@@ -755,6 +1021,10 @@ class _ScheduleState:
 
     def on_detach(self, patcher, unpatch_all=True) -> None:
         """Model is being unloaded: release the GPU copies of the adapters."""
+        coordinator = _chain_coordinator(patcher)
+        if coordinator is not None:
+            coordinator.detach(patcher, unpatch_all)
+            return
         if self._active and getattr(patcher, "model", None) is self._attached_model:
             self._deactivate(restore_adapters=True)
         else:
@@ -765,7 +1035,11 @@ class _ScheduleState:
         guider = getattr(executor, "class_obj", None)
         patcher = getattr(guider, "model_patcher", None)
         if patcher is not None:
-            self._ensure_active(patcher)
+            coordinator = _chain_coordinator(patcher, create=True)
+            if coordinator is not None:
+                coordinator.attach(patcher)
+            else:
+                self._ensure_active(patcher)
         elif not self._active and not self._no_patcher_warned:
             self._no_patcher_warned = True
             LOG.warning(
@@ -1080,6 +1354,7 @@ class PSLLoRAStepSchedule(io.ComfyNode):
         all_adapters: list[WeightAdapterBase] = [
             spec[0] for specs in module_specs.values() for spec in specs
         ]
+        upstream_states = _chain_states(model)
 
         new_model = model.clone()
         clone_at = time.perf_counter()
@@ -1119,8 +1394,15 @@ class PSLLoRAStepSchedule(io.ComfyNode):
             f"psl_lora_step_schedule_detach_{tag}",
             state.on_detach,
         )
+        chain = _new_chain([*upstream_states, state])
+        new_model.set_attachments(_CHAIN_ATTACHMENT_KEY, chain)
         registered_at = time.perf_counter()
 
+        LOG.info(
+            "LoRA Step Schedule 链：本节点为第 %d 个动态 LoRA（上游 %d 个）",
+            len(chain["states"]),
+            len(upstream_states),
+        )
         LOG.info(
             "LoRA Step Schedule 耗时：文件/转换 %.3fs，key_map %.3fs，load_lora %.3fs，"
             "分组 %.3fs，clone %.3fs，注册 %.3fs，总计 %.3fs",

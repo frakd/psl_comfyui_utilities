@@ -565,6 +565,258 @@ def test_execute_end_to_end_with_fused_qkv_slices():
             module.comfy.lora.model_lora_keys_unet = old_key_map
 
 
+def test_stacked_chain_merges_and_keeps_per_state_schedules():
+    from safetensors.torch import save_file
+    from comfy.model_patcher import ModelPatcher
+    from comfy.patcher_extension import WrappersMP
+
+    torch.manual_seed(11)
+    base_model = FakeBaseModel()
+    patcher = ModelPatcher(
+        base_model,
+        load_device=torch.device("cpu"),
+        offload_device=torch.device("cpu"),
+    )
+    base_weight = base_model.diffusion_model.weight.detach().clone()
+
+    down_a = torch.randn(2, 4)
+    up_a = torch.randn(3, 2)
+    down_b = torch.randn(2, 4)
+    up_b = torch.randn(3, 2)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path_a = Path(temp_dir) / "chain_a.safetensors"
+        path_b = Path(temp_dir) / "chain_b.safetensors"
+        for path, down, up in ((path_a, down_a, up_a), (path_b, down_b, up_b)):
+            save_file(
+                {
+                    "diffusion_model.lora_A.weight": down,
+                    "diffusion_model.lora_B.weight": up,
+                },
+                str(path),
+            )
+
+        old_get_full_path = module.folder_paths.get_full_path
+        paths = {"chain_a.safetensors": path_a, "chain_b.safetensors": path_b}
+        module.folder_paths.get_full_path = (
+            lambda folder, name: str(paths[name]) if name in paths else old_get_full_path(folder, name)
+        )
+        try:
+            out_a = Node.execute(
+                model=patcher,
+                lora_name="chain_a.safetensors",
+                start_strength=1.0,
+                end_strength=0.0,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+            out_b = Node.execute(
+                model=out_a,
+                lora_name="chain_b.safetensors",
+                start_strength=0.5,
+                end_strength=0.5,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+            out_sibling = Node.execute(
+                model=patcher,
+                lora_name="chain_b.safetensors",
+                start_strength=0.5,
+                end_strength=0.5,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+
+            key = module._CHAIN_ATTACHMENT_KEY
+            assert len(out_a.get_attachment(key)["states"]) == 1
+            assert len(out_b.get_attachment(key)["states"]) == 2
+            # Sibling branches must not inherit the other branch's LoRA.
+            assert len(out_sibling.get_attachment(key)["states"]) == 1
+
+            out_b.pre_run()
+            coordinator = out_b.get_attachment(key)["coordinator"]
+            assert coordinator is not None
+            assert len(coordinator.hooks) == 1
+            assert len(coordinator.hooks[0].specs) == 2
+
+            x = torch.randn(2, 4)
+            base = torch.nn.functional.linear(x, base_weight)
+            delta_a = torch.nn.functional.linear(
+                torch.nn.functional.linear(x, down_a), up_a
+            )
+            delta_b = torch.nn.functional.linear(
+                torch.nn.functional.linear(x, down_b), up_b
+            )
+
+            with torch.no_grad():
+                y = out_b.model.diffusion_model(x)
+            assert torch.allclose(y, base + delta_a + delta_b * 0.5, atol=1e-6), y
+
+            wrappers = out_b.get_all_wrappers(WrappersMP.PREDICT_NOISE)
+            assert len(wrappers) == 2
+            options = {
+                "transformer_options": {
+                    "sample_sigmas": torch.tensor([1.0, 0.5, 0.0])
+                }
+            }
+
+            class Executor:
+                class_obj = types.SimpleNamespace(model_patcher=out_b)
+
+                def __call__(self, *args, **kwargs):
+                    return None
+
+            executor = Executor()
+            for wrapper in wrappers:
+                wrapper(executor, x, torch.tensor(0.5), options, 0)
+            with torch.no_grad():
+                y_step1 = out_b.model.diffusion_model(x)
+            assert torch.allclose(y_step1, base + delta_b * 0.5, atol=1e-6), y_step1
+
+            out_b.cleanup()
+            with torch.no_grad():
+                y_after = out_b.model.diffusion_model(x)
+            assert torch.allclose(y_after, base, atol=1e-6)
+
+            # A third state must join the same chain and still use one hook.
+            out_c = Node.execute(
+                model=out_b,
+                lora_name="chain_a.safetensors",
+                start_strength=1.0,
+                end_strength=1.0,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+            assert len(out_c.get_attachment(key)["states"]) == 3
+            out_c.pre_run()
+            coordinator_c = out_c.get_attachment(key)["coordinator"]
+            assert coordinator_c is not None
+            assert len(coordinator_c.hooks) == 1
+            assert len(coordinator_c.hooks[0].specs) == 3
+            with torch.no_grad():
+                y_c = out_c.model.diffusion_model(x)
+            assert torch.allclose(
+                y_c, base + delta_a * 2.0 + delta_b * 0.5, atol=1e-6
+            ), y_c
+            out_c.cleanup()
+        finally:
+            module.folder_paths.get_full_path = old_get_full_path
+
+
+def test_stacked_chain_merges_fused_qkv_slices():
+    from safetensors.torch import save_file
+    from comfy.model_patcher import ModelPatcher
+
+    torch.manual_seed(12)
+    base_model = FakeQKVModel()
+    patcher = ModelPatcher(
+        base_model,
+        load_device=torch.device("cpu"),
+        offload_device=torch.device("cpu"),
+    )
+    qkv = base_model.diffusion_model.layers[0].proj.qkv
+    base_weight = qkv.weight.detach().clone()
+
+    tensors_a = {}
+    tensors_b = {}
+    expected_down_a = []
+    expected_up_a = []
+    expected_down_b = []
+    expected_up_b = []
+    for i, proj in enumerate(("q", "k", "v")):
+        down_a = torch.randn(2, 4)
+        up_a = torch.randn(3, 2)
+        down_b = torch.randn(2, 4)
+        up_b = torch.randn(3, 2)
+        tensors_a[f"diffusion_model.layers.0.proj.{proj}.lora_A.weight"] = down_a
+        tensors_a[f"diffusion_model.layers.0.proj.{proj}.lora_B.weight"] = up_a
+        tensors_b[f"diffusion_model.layers.0.proj.{proj}.lora_A.weight"] = down_b
+        tensors_b[f"diffusion_model.layers.0.proj.{proj}.lora_B.weight"] = up_b
+        expected_down_a.append(down_a)
+        expected_up_a.append(up_a)
+        expected_down_b.append(down_b)
+        expected_up_b.append(up_b)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path_a = Path(temp_dir) / "qkv_a.safetensors"
+        path_b = Path(temp_dir) / "qkv_b.safetensors"
+        save_file(tensors_a, str(path_a))
+        save_file(tensors_b, str(path_b))
+
+        old_get_full_path = module.folder_paths.get_full_path
+        old_key_map = module.comfy.lora.model_lora_keys_unet
+        module.folder_paths.get_full_path = (
+            lambda folder, name: str(path_a)
+            if name == "qkv_a.safetensors"
+            else str(path_b)
+            if name == "qkv_b.safetensors"
+            else old_get_full_path(folder, name)
+        )
+        module.comfy.lora.model_lora_keys_unet = lambda model, key_map: {
+            f"diffusion_model.layers.0.proj.{proj}": (
+                "diffusion_model.layers.0.proj.qkv.weight",
+                (0, i * 3, 3),
+            )
+            for i, proj in enumerate(("q", "k", "v"))
+        }
+        try:
+            out_a = Node.execute(
+                model=patcher,
+                lora_name="qkv_a.safetensors",
+                start_strength=1.0,
+                end_strength=1.0,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+            out_b = Node.execute(
+                model=out_a,
+                lora_name="qkv_b.safetensors",
+                start_strength=0.5,
+                end_strength=0.5,
+                curve="linear",
+                points=2,
+                strength_list="",
+                precision="fp32",
+            ).result[0]
+
+            out_b.pre_run()
+            coordinator = out_b.get_attachment(module._CHAIN_ATTACHMENT_KEY)["coordinator"]
+            assert coordinator is not None
+            assert len(coordinator.hooks) == 1
+            assert len(coordinator.hooks[0].specs) == 6
+
+            x = torch.randn(2, 4)
+            expected = torch.nn.functional.linear(x, base_weight).clone()
+            for i in range(3):
+                delta_a = torch.nn.functional.linear(
+                    torch.nn.functional.linear(x, expected_down_a[i]),
+                    expected_up_a[i],
+                )
+                delta_b = torch.nn.functional.linear(
+                    torch.nn.functional.linear(x, expected_down_b[i]),
+                    expected_up_b[i],
+                )
+                expected[:, i * 3 : (i + 1) * 3] += delta_a + delta_b * 0.5
+
+            with torch.no_grad():
+                y = out_b.model.diffusion_model.layers[0].proj.qkv(x)
+            assert torch.allclose(y, expected, atol=1e-6), y
+            out_b.cleanup()
+        finally:
+            module.folder_paths.get_full_path = old_get_full_path
+            module.comfy.lora.model_lora_keys_unet = old_key_map
+
+
 class FakeModel:
     def __init__(self):
         self.model = object()
@@ -610,6 +862,8 @@ if __name__ == "__main__":
     test_lazy_activation_cleanup_and_detach_restores_weights()
     test_execute_end_to_end_with_real_patcher()
     test_execute_end_to_end_with_fused_qkv_slices()
+    test_stacked_chain_merges_and_keeps_per_state_schedules()
+    test_stacked_chain_merges_fused_qkv_slices()
     test_execute_none_lora_is_passthrough()
     test_execute_rejects_bad_strength_list_even_without_lora()
     print("lora step schedule tests passed")
