@@ -565,10 +565,55 @@ def test_execute_end_to_end_with_fused_qkv_slices():
             module.comfy.lora.model_lora_keys_unet = old_key_map
 
 
+def test_concat_branch_folds_alpha_and_mixed_ranks():
+    torch.manual_seed(13)
+    linear = nn.Linear(4, 3, bias=False)
+    up_a, down_a = torch.randn(3, 2), torch.randn(2, 4)
+    up_b, down_b = torch.randn(3, 3), torch.randn(3, 4)
+    alpha_a, alpha_b = 2.0, 0.5
+    adapter_a = module.LoRAAdapter(
+        set(), (up_a, down_a, alpha_a, None, None, None)
+    )
+    adapter_b = module.LoRAAdapter(
+        set(), (up_b, down_b, alpha_b, None, None, None)
+    )
+    state_a = types.SimpleNamespace(
+        current_strength=1.0, compute_dtype=torch.float32
+    )
+    state_b = types.SimpleNamespace(
+        current_strength=0.5, compute_dtype=torch.float32
+    )
+    hook = module._MergedModuleHook(
+        "lin",
+        [
+            (state_a, adapter_a, None, "a.weight"),
+            (state_b, adapter_b, None, "b.weight"),
+        ],
+    )
+    hook.attach(FakePatcher(linear))
+    assert len(hook._concat_branches) == 1
+    assert len(hook._concat_branches[0].states) == 2
+    assert hook._concat_branches[0].ranks == [2, 3]
+
+    x = torch.randn(2, 4)
+    base = torch.nn.functional.linear(x, linear.weight)
+    delta_a = torch.nn.functional.linear(
+        torch.nn.functional.linear(x, down_a), up_a
+    ) * (alpha_a / down_a.shape[0])
+    delta_b = torch.nn.functional.linear(
+        torch.nn.functional.linear(x, down_b), up_b
+    ) * (alpha_b / down_b.shape[0])
+    with torch.no_grad():
+        y = linear(x)
+    assert torch.allclose(y, base + delta_a + delta_b * 0.5, atol=1e-6), y
+    hook.detach()
+    hook.release_cache()
+
+
 def test_stacked_chain_merges_and_keeps_per_state_schedules():
     from safetensors.torch import save_file
     from comfy.model_patcher import ModelPatcher
-    from comfy.patcher_extension import WrappersMP
+    from comfy.patcher_extension import CallbacksMP, WrappersMP
 
     torch.manual_seed(11)
     base_model = FakeBaseModel()
@@ -581,8 +626,8 @@ def test_stacked_chain_merges_and_keeps_per_state_schedules():
 
     down_a = torch.randn(2, 4)
     up_a = torch.randn(3, 2)
-    down_b = torch.randn(2, 4)
-    up_b = torch.randn(3, 2)
+    down_b = torch.randn(3, 4)
+    up_b = torch.randn(3, 3)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         path_a = Path(temp_dir) / "chain_a.safetensors"
@@ -644,6 +689,10 @@ def test_stacked_chain_merges_and_keeps_per_state_schedules():
             assert coordinator is not None
             assert len(coordinator.hooks) == 1
             assert len(coordinator.hooks[0].specs) == 2
+            assert len(coordinator.hooks[0]._concat_branches) == 1
+            assert len(coordinator.hooks[0]._individual_specs) == 0
+            cached_hook = coordinator.hooks[0]
+            cached_branch = cached_hook._concat_branches[0]
 
             x = torch.randn(2, 4)
             base = torch.nn.functional.linear(x, base_weight)
@@ -657,6 +706,21 @@ def test_stacked_chain_merges_and_keeps_per_state_schedules():
             with torch.no_grad():
                 y = out_b.model.diffusion_model(x)
             assert torch.allclose(y, base + delta_a + delta_b * 0.5, atol=1e-6), y
+
+            # Real transformer inputs are often [batch, tokens, features].
+            x3 = torch.randn(2, 3, 4)
+            base3 = torch.nn.functional.linear(x3, base_weight)
+            delta_a3 = torch.nn.functional.linear(
+                torch.nn.functional.linear(x3, down_a), up_a
+            )
+            delta_b3 = torch.nn.functional.linear(
+                torch.nn.functional.linear(x3, down_b), up_b
+            )
+            with torch.no_grad():
+                y3 = out_b.model.diffusion_model(x3)
+            assert torch.allclose(
+                y3, base3 + delta_a3 + delta_b3 * 0.5, atol=1e-6
+            ), y3
 
             wrappers = out_b.get_all_wrappers(WrappersMP.PREDICT_NOISE)
             assert len(wrappers) == 2
@@ -684,6 +748,15 @@ def test_stacked_chain_merges_and_keeps_per_state_schedules():
                 y_after = out_b.model.diffusion_model(x)
             assert torch.allclose(y_after, base, atol=1e-6)
 
+            # cleanup keeps the concat cache; the next pre_run reuses it.
+            out_b.pre_run()
+            assert coordinator.hooks[0] is cached_hook
+            assert coordinator.hooks[0]._concat_branches[0] is cached_branch
+            with torch.no_grad():
+                y_reuse = out_b.model.diffusion_model(x)
+            assert torch.allclose(y_reuse, base + delta_a + delta_b * 0.5, atol=1e-6)
+            out_b.cleanup()
+
             # A third state must join the same chain and still use one hook.
             out_c = Node.execute(
                 model=out_b,
@@ -707,6 +780,9 @@ def test_stacked_chain_merges_and_keeps_per_state_schedules():
                 y_c, base + delta_a * 2.0 + delta_b * 0.5, atol=1e-6
             ), y_c
             out_c.cleanup()
+            for callback in out_c.get_all_callbacks(CallbacksMP.ON_DETACH):
+                callback(out_c, False)
+            assert coordinator_c.hooks == []
         finally:
             module.folder_paths.get_full_path = old_get_full_path
 
@@ -794,6 +870,9 @@ def test_stacked_chain_merges_fused_qkv_slices():
             assert coordinator is not None
             assert len(coordinator.hooks) == 1
             assert len(coordinator.hooks[0].specs) == 6
+            assert len(coordinator.hooks[0]._concat_branches) == 3
+            assert all(len(branch.states) == 2 for branch in coordinator.hooks[0]._concat_branches)
+            assert len(coordinator.hooks[0]._individual_specs) == 0
 
             x = torch.randn(2, 4)
             expected = torch.nn.functional.linear(x, base_weight).clone()
@@ -858,6 +937,7 @@ if __name__ == "__main__":
     test_forward_hook_skips_zero_strength()
     test_module_hook_does_not_touch_weight()
     test_module_hook_adds_fused_output_slices()
+    test_concat_branch_folds_alpha_and_mixed_ranks()
     test_adapter_problem_rejects_dora_and_reshape()
     test_lazy_activation_cleanup_and_detach_restores_weights()
     test_execute_end_to_end_with_real_patcher()

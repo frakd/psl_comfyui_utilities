@@ -683,6 +683,52 @@ class _ModuleLoRAHook:
         return result
 
 
+class _ConcatBranch:
+    """A concatenated-rank LoRA branch for specs sharing offset and dtype.
+
+    Strength is applied in rank space before the shared up projection:
+    sum_i(s_i * up_i @ down_i @ x) = up_cat @ (diag(s_i) @ down_cat @ x).
+    The concatenated matrices are static; only the per-step strength changes.
+    """
+
+    def __init__(
+        self,
+        offset: tuple[int, int, int] | None,
+        compute_dtype: torch.dtype,
+        specs: list[tuple[Any, WeightAdapterBase, Any, str]],
+        down_cat: torch.Tensor,
+        up_cat: torch.Tensor,
+        ranks: list[int],
+    ):
+        self.offset = offset
+        self.compute_dtype = compute_dtype
+        self.states = [state for state, _adapter, _offset, _label in specs]
+        self.labels = [label for _state, _adapter, _offset, label in specs]
+        self.down_cat = down_cat
+        self.up_cat = up_cat
+        self.ranks = ranks
+
+    def to(self, device: torch.device) -> None:
+        if self.down_cat.device != device:
+            self.down_cat = self.down_cat.to(device=device)
+            self.up_cat = self.up_cat.to(device=device)
+
+    def delta(self, x: torch.Tensor) -> torch.Tensor | None:
+        strengths = [float(state.current_strength) for state in self.states]
+        if not any(strength != 0.0 for strength in strengths):
+            return None
+
+        x_compute = x if x.dtype == self.compute_dtype else x.to(dtype=self.compute_dtype)
+        hidden = torch.nn.functional.linear(x_compute, self.down_cat)
+        offset = 0
+        for strength, rank in zip(strengths, self.ranks):
+            if strength != 1.0:
+                # hidden can be [batch, ..., rank_sum]; scale the last dim.
+                hidden[..., offset : offset + rank] *= strength
+            offset += rank
+        return torch.nn.functional.linear(hidden, self.up_cat)
+
+
 class _MergedModuleHook:
     """One forward hook for all dynamic LoRAs that target the same module."""
 
@@ -697,9 +743,81 @@ class _MergedModuleHook:
         self._handle = None
         self._skip_warned = False
         self._is_conv = False
+        self._concat_branches: list[_ConcatBranch] = []
+        self._individual_specs: list[
+            tuple[Any, WeightAdapterBase, tuple[int, int, int] | None, str]
+        ] = []
+        self._branches_built = False
+        self._branch_signature = None
 
     def _labels(self) -> str:
         return ", ".join(label for _, _, _, label in self.specs)
+
+    def _build_branches(self, info: _ModuleInfo):
+        individual: list[
+            tuple[Any, WeightAdapterBase, tuple[int, int, int] | None, str]
+        ] = []
+        if info.is_conv:
+            return [], list(self.specs)
+
+        groups: dict[tuple, list[tuple[Any, WeightAdapterBase, Any, str]]] = {}
+        for state, adapter, offset, label in self.specs:
+            if not isinstance(adapter, LoRAAdapter):
+                individual.append((state, adapter, offset, label))
+                continue
+            weights = getattr(adapter, "weights", None)
+            if (
+                not isinstance(weights, (tuple, list))
+                or len(weights) < 6
+                or weights[3] is not None  # mid / tucker
+                or weights[4] is not None  # dora (already rejected)
+                or weights[5] is not None  # reshape (already rejected)
+            ):
+                individual.append((state, adapter, offset, label))
+                continue
+            up, down = weights[0], weights[1]
+            if not (
+                isinstance(up, torch.Tensor)
+                and isinstance(down, torch.Tensor)
+                and up.dim() == 2
+                and down.dim() == 2
+            ):
+                individual.append((state, adapter, offset, label))
+                continue
+            key = (
+                offset,
+                state.compute_dtype,
+                int(up.shape[0]),
+                int(down.shape[1]),
+            )
+            groups.setdefault(key, []).append((state, adapter, offset, label))
+
+        branches: list[_ConcatBranch] = []
+        for (offset, dtype, _out_dim, _in_dim), specs in groups.items():
+            if len(specs) < 2:
+                individual.extend(specs)
+                continue
+            downs = []
+            ups = []
+            ranks = []
+            for _state, adapter, _offset, _label in specs:
+                up, down, alpha = adapter.weights[0], adapter.weights[1], adapter.weights[2]
+                rank = int(down.shape[0])
+                scale = float(alpha) / rank if alpha is not None else 1.0
+                downs.append(down)
+                ups.append(up * scale if scale != 1.0 else up)
+                ranks.append(rank)
+            branches.append(
+                _ConcatBranch(
+                    offset,
+                    dtype,
+                    specs,
+                    torch.cat(downs, dim=0),
+                    torch.cat(ups, dim=1),
+                    ranks,
+                )
+            )
+        return branches, individual
 
     def attach(self, patcher) -> None:
         if self._handle is not None:
@@ -728,14 +846,41 @@ class _MergedModuleHook:
             adapter.kw_dict = info.kw_dict
             _validate_lora_shape(adapter, info, module, offset, label)
 
+        signature = (
+            info.is_conv,
+            info.conv_dim,
+            info.kernel_size,
+            info.in_channels,
+            info.out_channels,
+            getattr(module, "in_features", None),
+            getattr(module, "out_features", None),
+        )
+        device = getattr(patcher, "load_device", None)
+        if not isinstance(device, torch.device):
+            device = comfy.model_management.get_torch_device()
+        if not self._branches_built or self._branch_signature != signature:
+            self._concat_branches, self._individual_specs = self._build_branches(info)
+            self._branches_built = True
+            self._branch_signature = signature
+        else:
+            for branch in self._concat_branches:
+                branch.to(device)
+
         self._module = module
         self._handle = module.register_forward_hook(self._forward_hook)
         LOG.debug(
-            "合并挂载 LoRA 前向分支: %s（%d 个适配器） -> %s",
+            "合并挂载 LoRA 前向分支: %s（%d 个适配器，%d 个拼接组） -> %s",
             self.module_name,
             len(self.specs),
+            len(self._concat_branches),
             type(module).__name__,
         )
+
+    def release_cache(self) -> None:
+        self._concat_branches = []
+        self._individual_specs = []
+        self._branches_built = False
+        self._branch_signature = None
 
     def detach(self) -> None:
         if self._handle is not None:
@@ -767,7 +912,27 @@ class _MergedModuleHook:
 
         out_dim = 1 if self._is_conv else -1
         deltas = []
-        for state, adapter, offset, label in self.specs:
+        for branch in self._concat_branches:
+            delta = branch.delta(x)
+            if delta is None:
+                continue
+            if branch.offset is None:
+                expected = tuple(output.shape)
+            else:
+                _dim, _start, length = branch.offset
+                expected_shape = list(output.shape)
+                expected_shape[out_dim] = length
+                expected = tuple(expected_shape)
+            if tuple(delta.shape) != expected:
+                raise RuntimeError(
+                    "拼接 LoRA 分支输出形状与目标切片不匹配："
+                    f"{tuple(delta.shape)} vs {expected}（{', '.join(branch.labels)}）"
+                )
+            if delta.dtype != output.dtype:
+                delta = delta.to(dtype=output.dtype)
+            deltas.append((branch.offset, delta))
+
+        for state, adapter, offset, label in self._individual_specs:
             delta = _compute_lora_delta(
                 adapter,
                 x,
@@ -828,7 +993,7 @@ class _ChainCoordinator:
         if self.active:
             if model is self._attached_model:
                 return
-            self._detach_hooks()
+            self._detach_handles()
 
         # A state may have been active alone before this chain was formed.
         for state in self.states:
@@ -839,35 +1004,42 @@ class _ChainCoordinator:
         if not isinstance(device, torch.device):
             device = comfy.model_management.get_torch_device()
 
-        hooks: list[_MergedModuleHook] = []
         try:
+            attach_started = time.perf_counter()
             for state in self.states:
                 _cast_adapters(state.adapters, device, state.compute_dtype)
-            for module_name, specs in self._grouped_specs().items():
-                hook = _MergedModuleHook(module_name, specs)
+            if not self.hooks:
+                self.hooks = [
+                    _MergedModuleHook(module_name, specs)
+                    for module_name, specs in self._grouped_specs().items()
+                ]
+            for hook in self.hooks:
                 hook.attach(patcher)
-                hooks.append(hook)
         except Exception:
-            for hook in hooks:
+            for hook in self.hooks:
                 hook.detach()
+                hook.release_cache()
+            self.hooks = []
             for state in self.states:
                 state._restore_adapters()
             raise
 
-        self.hooks = hooks
         self.active = True
         self._attached_model = model
         LOG.info(
-            "合并 %d 个动态 LoRA：%d 个模块，%d 个适配器",
+            "合并 %d 个动态 LoRA：%d 个模块，%d 个适配器，"
+            "%d 个拼接组 / %d 个单独分支，挂载 %.3fs",
             len(self.states),
-            len(hooks),
-            sum(len(hook.specs) for hook in hooks),
+            len(self.hooks),
+            sum(len(hook.specs) for hook in self.hooks),
+            sum(len(hook._concat_branches) for hook in self.hooks),
+            sum(len(hook._individual_specs) for hook in self.hooks),
+            time.perf_counter() - attach_started,
         )
 
-    def _detach_hooks(self) -> None:
+    def _detach_handles(self) -> None:
         for hook in self.hooks:
             hook.detach()
-        self.hooks = []
         self.active = False
         self._attached_model = None
 
@@ -876,11 +1048,15 @@ class _ChainCoordinator:
             return
         if getattr(patcher, "model", None) is not self._attached_model:
             return
-        self._detach_hooks()
+        self._detach_handles()
 
     def detach(self, patcher, unpatch_all=True) -> None:
-        if self.active:
-            self._detach_hooks()
+        for hook in self.hooks:
+            hook.detach()
+            hook.release_cache()
+        self.hooks = []
+        self.active = False
+        self._attached_model = None
         for state in self.states:
             state._restore_adapters()
 
