@@ -12,6 +12,7 @@ from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
 from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
+from .video_match_v2 import PSLAdvancedVideoMatchV2
 
 _NODE_CLASSES = (
     DeepVRAMCleanup,
@@ -28,6 +29,7 @@ _NODE_CLASSES = (
     ImageContainer,
     PSLLoRAStepSchedule,
     PSLVideoCombineMemory,
+    PSLAdvancedVideoMatchV2,
 )
 
 NODE_CLASS_MAPPINGS = {}
