@@ -8,6 +8,7 @@ from .h3_av_lora import MiniMaxH3AVLoRAStack
 from .image_container import ImageContainer
 from .lora_step_schedule import PSLLoRAStepSchedule
 from .mask_paint_output import MaskPaintOutput
+from .memory_monitor import MemoryMonitorEnd, MemoryMonitorStart
 from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
 from .psl_video_memory import PSLVideoCombineMemory
@@ -16,6 +17,8 @@ from .video_match_v2 import PSLAdvancedVideoMatchV2
 
 _NODE_CLASSES = (
     DeepVRAMCleanup,
+    MemoryMonitorStart,
+    MemoryMonitorEnd,
     AudioHarshnessSuppressor,
     AudioABCompare,
     CachedCLIPTextEncode,

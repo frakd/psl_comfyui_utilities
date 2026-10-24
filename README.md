@@ -22,6 +22,7 @@ Typing `psl` or `personal` in the node search box filters out every node in this
 | 节点 Node | 一句话作用 / What it does |
 | --- | --- |
 | [Deep VRAM Cleanup](#deep-vram-cleanup) | 手动清显存/内存：清节点缓存、卸载模型、归还内存，节点上直接看诊断 |
+| [Memory Monitor Start / End](#memory-monitor-start--end) | 工作流首尾成对使用：系统级内存/显存曲线 + 最近 3 次日志，后台采样 |
 | [Audio Harshness Suppressor](#audio-harshness-suppressor) | ⚠️ 实验性：只在真正刺耳的那几帧压高频，整条轨道不闷（效果尚未调好） |
 | [Audio A/B Compare](#audio-ab-compare) | 两路音频合成一条左右分声道，戴耳机同时 A/B 对比 |
 | [Any Switch](#any-switch) | 可视化多路开关，勾选第几路输出第几路，或每趟随机一路 |
@@ -50,6 +51,16 @@ Typing `psl` or `personal` in the node search box filters out every node in this
 
 **EN** — A manual VRAM/RAM janitor node. Toggles decide what it actually does: clear all node cache, clear only selected source nodes' cache, unload models (optionally including disconnected ones), `empty_cache`, trim the CUDA pool, purge orphan tensors. An on-node diagnostics box reports VRAM/RAM before and after plus the outcome of each action. It's an output node, so you can run it alone or leave it inline as a passthrough.
 Three things worth knowing: (1) when targeted cache clearing is on, the front end auto-increments a nonce so this node really re-runs — a cache hit would otherwise skip the side effects entirely; (2) connecting cache sources *without* enabling the clearing toggle gives you a **dry run** that only measures how much each source could release; (3) `purge_orphan_tensors` walks every gc-tracked object detaching CUDA tensors — slow, aggressive, and it can disturb other nodes' state, so leave it off unless you know why you need it. The RAM-return step uses a Windows working-set trim and is skipped on other platforms.
+
+---
+
+### Memory Monitor Start / End
+
+`nodes/memory_monitor.py` · `nodes/memory_monitor_core.py` · `nodes/system_memory.py` · `ui/memory_monitor.js` · 分类 Category：`utils/monitor`
+
+**中** —— 成对使用的系统级监控：Start 放在工作流开头（Any 直通），End 放在结尾（Any 直通、输出节点）。**两个节点本身都是纯透传，不在 execute() 里做副作用，因此不会改变缓存签名，也不会让下游缓存失效。** Start 的 `interval`/`max_duration_min` 在节点前端面板里设置（存 `node.properties`，**不进 prompt**）；前端在 prompt 的 `execution_start` 读取面板值并调用 `/psl/memory_monitor/start`，在 `execution_success`/`execution_error`/`execution_interrupted` 调用 `/psl/memory_monitor/stop`。后台线程按 `interval` 秒记录整机物理内存、commit、NVIDIA GPU 专用/共享显存；End 节点内画两张曲线（上：系统内存，下：显存），悬浮十字线显示四组 GB 与百分比。数据来自 Windows `GlobalMemoryStatusEx` + PDH + DXGI，统计的是**所有进程**，不是只统计 ComfyUI。日志以 JSONL 落在 `user/psl_memory_monitor/`，最多保留最近 3 次；End 的下拉可回看这 3 次，刷新/重启后仍可看。异常/中断没走到 End 时，采样线程最多跑 `max_duration_min` 分钟自动收尾并保存部分日志。API 调用不会自动触发监控，需要显式调用 start/stop 路由。commit 与共享显存仅 Windows 有数据。
+
+**EN** — A paired system-wide monitor: Start at the head of the chain (Any passthrough), End at the tail (Any passthrough, output node). **Both nodes are pure passthroughs with no side effects in execute(), so they do not change the cache signature or invalidate downstream caches.** Start's `interval`/`max_duration_min` live in a frontend panel (`node.properties`, **never in the prompt**); the frontend reads them on `execution_start` and calls `/psl/memory_monitor/start`, then calls `/psl/memory_monitor/stop` on `execution_success`/`execution_error`/`execution_interrupted`. A background thread records system physical RAM, commit, and NVIDIA dedicated/shared VRAM every `interval` seconds; End renders two stacked charts (system memory / VRAM) with a hover crosshair showing GB and percentages. Data comes from Windows `GlobalMemoryStatusEx`, PDH and DXGI and covers **all processes**, not just ComfyUI. JSONL logs live in `user/psl_memory_monitor/`, keeping the latest three runs; End's dropdown can replay them after a reload/restart. If the workflow errors/interrupts before End, the sampler auto-stops after `max_duration_min` minutes and saves a partial log. API callers must call the start/stop routes explicitly. Commit and shared VRAM are Windows-only.
 
 ---
 
