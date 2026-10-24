@@ -22,13 +22,19 @@ cross_channel=0.10, cdf_max_shift=0.08, cdf_chroma_guard=0.90）。
 6. 保留原版的时间窗口 / 强度衰减 / 高光保护 / 亮度自适应逻辑。
 
 新增 stable_anchor 模式 (自动稳健路线):
-- 从全片段统计中筛掉低对比/淡出/溶解/跳变帧, 参考侧取最近的稳定窗口,
-  目标侧用全部稳定帧代表自身基准;
+- 场景切分对所有 stat_mode 生效: 参考 A 只取参考视频最后一个镜头段,
+  目标 B/修正只取目标开头第一个镜头段, 修正到目标第一个硬切处停止;
+  切镜后的画面既不参与锚点, 也不会继续被接缝映射改色;
+- 接缝局域锚点: 参考侧只在末尾 max(2×ref_anchor_frames,16) 帧里筛稳定帧,
+  取最后 K 帧; 目标侧只在开头同一窗口里筛稳定帧;
 - 用一条 B→A 的固定映射按强度曲线混合, 保留目标片段内部的曝光/对比动态,
   不再逐帧归一化 (这是 dual_anchor 在大范围明度变化上的根因);
 - 自动明度软上限: 限制每帧平均明度的净偏移, 避免参考/目标基准差过大时整段变亮变暗;
 - 低对比置信门控: 溶解/闪白帧自动降低修正强度, 避免 scale 打满造成的饱和度尖峰;
 - 低色度保护: 肤色/中性色只保留部分 a/b 修正, 防止参考偏色把皮肤推成洋红;
+- 瞬态过曝平滑: 用相邻帧亮度识别开头 1-2 帧的正向尖峰, 再对亮度曲线做高斯时域平滑,
+  把峰的能量摊到前后帧; 硬切/淡出处分段, 不跨切镜扩散;
+  首帧是否按闪光处理由上一段视频末帧亮度判断, 接缝切镜/转场不处理;
 - cross_channel 在 stable_anchor 下通过 _lk_map 真正生效。
 
 输出语义与原版一致: 参考视频 + 修正后的目标视频, 可直接替换对比。
@@ -46,12 +52,25 @@ _STABLE_LOW_CONTRAST = 0.35  # 对比度低于中位数的 35% 视为溶解/闪�
 _STABLE_OUTLIER = 0.10       # 稳定帧中位色偏离超过 10% 视为离群
 _STABLE_CONF_LO = 0.25       # 对比度低于锚点的 25% 时完全跳过修正
 _STABLE_CONF_SPAN = 0.50     # 25%..75% 之间线性过渡到全强度
-_LUMA_SHIFT_FRACTION = 0.10  # 每帧平均明度净偏移上限 (占 L 通道范围的 10%)
+_LUMA_SHIFT_FRACTION = 0.10  # 每帧平均明度向下偏移上限 (占 L 通道范围的 10%)
+_LUMA_RISE_FRACTION = 0.03   # 向上提亮上限更紧, 避免整帧高亮
 # 低色度区域 (肤色/中性色) 的色相最敏感: cross_channel 与逐通道 CDF 容易把
 # 肤色推向洋红。对 a/b 修正做自动回拉, 只保留部分匹配; L 仍完整匹配。
 _LOW_CHROMA_GUARD_LO = 0.03
 _LOW_CHROMA_GUARD_HI = 0.20
 _LOW_CHROMA_GUARD_STRENGTH = 0.80
+# 瞬态过曝压制: 用相邻帧亮度的中位数作为局部基线, 只处理正向尖峰;
+# 检测到峰后对亮度曲线做高斯时域平滑, 把峰值能量摊到前后帧。
+_FLASH_RADIUS = 4
+_FLASH_L_LO = 0.004          # 占 L 通道范围的比例
+_FLASH_CUT_DL = 0.040        # 切镜判定: 跳变前后窗口中位数差超过该比例
+_FLASH_CUT_RADIUS = 5        # 切镜检测窗口, 大于闪光长度, 避免把 1-2 帧闪光当切镜
+_SCENE_CUT_DIFF = 0.08       # 去均值缩略图 MAD 超过该值视为场景切镜
+_SCENE_MIN_STD = 0.02        # 低对比/溶解帧不参与切镜判定
+_SCENE_THUMB = 32            # 场景切镜检测用的缩略图边长
+_FLASH_SMOOTH_RADIUS = 4
+_FLASH_SMOOTH_SIGMA = 1.6
+_FLASH_STRENGTH = 0.90
 
 
 class PSLAdvancedVideoMatchV2(io.ComfyNode):
@@ -139,8 +158,9 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                     default="dual_anchor",
                     tooltip=(
                         "变换模式: dual_anchor=双锚点逐帧统计(旧默认); "
-                        "stable_anchor=稳定锚点+固定映射+自动明度上限+溶解帧门控"
-                        "+低色度肤色保护(推荐用于有曝光变化/淡出/溶解的片段); "
+                        "stable_anchor=接缝局域稳定锚点+场景切分+固定映射+自动明度上限"
+                        "+溶解帧门控+低色度肤色保护+瞬态过曝时域平滑(切镜/接缝保护, "
+                        "推荐用于有曝光变化/淡出/溶解的片段); "
                         "frozen=固定变换全窗口复用; rolling=逐帧EMA更新(旧版行为)"
                     ),
                 ),
@@ -349,6 +369,133 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
         return list(range(mus.shape[0])), True
 
     @classmethod
+    def _scene_cuts(cls, video, device):
+        """基于去均值缩略图的相邻帧 MAD 检测硬切; 对全局曝光变化不敏感。"""
+        n = video.shape[0]
+        if n < 2:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        h, w = video.shape[1], video.shape[2]
+        hs, ws = cls._fit_size(h, w, target=_SCENE_THUMB)
+        prev = None
+        prev_std = 0.0
+        flags = []
+        for frame in video:
+            thumb = cls._downscale(frame.to(device), (hs, ws))
+            thumb = thumb - thumb.mean(dim=(0, 1), keepdim=True)
+            thumb_std = float(thumb.std())
+            if prev is not None:
+                stable = prev_std > _SCENE_MIN_STD and thumb_std > _SCENE_MIN_STD
+                flags.append(stable and float((thumb - prev).abs().mean()) > _SCENE_CUT_DIFF)
+            prev, prev_std = thumb, thumb_std
+        return torch.tensor(flags, device=device, dtype=torch.bool)
+
+    @classmethod
+    def _cut_flags(cls, values, cut_threshold, radius=_FLASH_CUT_RADIUS):
+        """用跳变前后窗口中位数的差判断硬切; 短促闪光会回到原电平, 不会被判成切镜。"""
+        n = values.shape[0]
+        if n < 2:
+            return torch.zeros(0, dtype=torch.bool, device=values.device)
+        vals = values.detach().cpu().tolist()
+        cuts = []
+        for k in range(n - 1):
+            before = vals[max(0, k - radius):k + 1]
+            after = vals[k + 1:min(n, k + 1 + radius)]
+            if not before or not after:
+                cuts.append(False)
+                continue
+            # 切镜: 前后窗口的 min 和 max 同向移动; 闪光只抬高/压低一侧
+            d_max = max(after) - max(before)
+            d_min = min(after) - min(before)
+            cuts.append((d_max > cut_threshold and d_min > cut_threshold) or
+                        (d_max < -cut_threshold and d_min < -cut_threshold))
+        return torch.tensor(cuts, device=values.device, dtype=torch.bool)
+
+    @classmethod
+    def _temporal_baseline(cls, values, cuts, stability_threshold, radius=_FLASH_RADIUS):
+        """双侧中位数基线: 只有同时高于前后两侧的短促凸起才算过曝尖峰。
+
+        首帧用后侧中位数判断 (目标片段可能只有 3 帧, 开头亮峰不能漏);
+        但如果后侧窗口内存在硬切, 或后侧本身是淡出/曝光斜坡, 则跳过首帧。
+        末帧没有后侧参考, 跳过。切点附近的帧也不做峰检测。
+        """
+        n = values.shape[0]
+        if n < 2:
+            return values.clone()
+        vals = values.detach().cpu().tolist()
+        cut_list = cuts.detach().cpu().tolist() if torch.is_tensor(cuts) else list(cuts)
+        base = list(vals)
+        if n >= 3 and not any(cut_list[:min(radius, n - 1)]):
+            following = vals[1:min(n, 1 + radius)]
+            # 后侧窗口若仍是单调淡出/曝光斜坡, 不当作首帧闪光
+            if following and max(following) - min(following) <= stability_threshold:
+                base[0] = sorted(following)[len(following) // 2]
+        for i in range(1, n - 1):
+            lo, hi = max(0, i - radius), min(n, i + radius + 1)
+            if any(cut_list[lo:hi - 1]):
+                base[i] = vals[i]
+                continue
+            before = sorted(vals[lo:i])
+            after = sorted(vals[i + 1:hi])
+            left = before[len(before) // 2] if before else vals[i]
+            right = after[len(after) // 2] if after else vals[i]
+            base[i] = max(left, right)
+        return torch.tensor(base, device=values.device, dtype=values.dtype)
+
+    @classmethod
+    def _first_frame_is_seam(cls, first, reference_last, threshold):
+        """首帧不高于上一段末帧 -> 接缝切镜/转场, 不按本段闪光处理。"""
+        return first <= reference_last + threshold
+
+    @classmethod
+    def _gaussian_smooth_segment(cls, values, radius=_FLASH_SMOOTH_RADIUS,
+                                 sigma=_FLASH_SMOOTH_SIGMA):
+        x = torch.arange(-radius, radius + 1, device=values.device, dtype=values.dtype)
+        kernel = torch.exp(-(x * x) / (2.0 * sigma * sigma))
+        kernel = kernel / kernel.sum()
+        padded = F.pad(values.view(1, 1, -1), (radius, radius))
+        counts = F.pad(torch.ones_like(values).view(1, 1, -1), (radius, radius))
+        numerator = F.conv1d(padded, kernel.view(1, 1, -1))
+        denominator = F.conv1d(counts, kernel.view(1, 1, -1))
+        return (numerator / denominator.clamp_min(1e-12)).view(-1)
+
+    @classmethod
+    def _gaussian_smooth(cls, values, cuts=None, radius=_FLASH_SMOOTH_RADIUS,
+                         sigma=_FLASH_SMOOTH_SIGMA):
+        """在切点处分段平滑, 避免高斯核跨过切镜把两边混在一起。"""
+        n = values.shape[0]
+        if n == 0:
+            return values.clone()
+        if cuts is None or not bool(cuts.any()):
+            return cls._gaussian_smooth_segment(values, radius, sigma)
+        out = values.clone()
+        start = 0
+        for end in range(n):
+            if end == n - 1 or bool(cuts[end]):
+                out[start:end + 1] = cls._gaussian_smooth_segment(
+                    values[start:end + 1], radius, sigma)
+                start = end + 1
+        return out
+
+    @classmethod
+    def _peak_mask(cls, excess, threshold, cuts=None, radius=_FLASH_SMOOTH_RADIUS):
+        mask = torch.zeros_like(excess)
+        n = excess.shape[0]
+        for i in torch.nonzero(excess > threshold, as_tuple=False).flatten().tolist():
+            mask[i] = 1.0
+            if cuts is None:
+                mask[max(0, i - radius):min(n, i + radius + 1)] = 1.0
+                continue
+            for j in range(i - 1, max(-1, i - radius - 1), -1):
+                if bool(cuts[j]):
+                    break
+                mask[j] = 1.0
+            for j in range(i + 1, min(n, i + radius + 1)):
+                if bool(cuts[j - 1]):
+                    break
+                mask[j] = 1.0
+        return mask
+
+    @classmethod
     def _anchor_stats(cls, video, indices, fit, to_space, device):
         mus, covs = [], []
         for t in indices:
@@ -375,10 +522,11 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
         return x_space[..., 0]
 
     @classmethod
-    def _cap_luma_shift(cls, x_space, out, color_space, cap, device):
+    def _cap_luma_shift(cls, x_space, out, color_space, cap_down, cap_up, device):
         """只压整帧平均明度的净偏移, 保留局部对比与逐帧曝光动态。"""
         shift = cls._luma_signal(out, color_space, device).mean() - \
             cls._luma_signal(x_space, color_space, device).mean()
+        cap = cap_up if float(shift) > 0 else cap_down
         if float(shift.abs()) <= cap:
             return out
         excess = shift - cap * torch.tanh(shift / cap)
@@ -534,11 +682,25 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
         use_stable = mode == "stable_anchor"
         use_frozen = mode == "frozen"
 
-        # ---------- 1. 参考侧: 尾部 K 帧稳健锚点 ----------
+        # 场景切分对所有模式生效: 色调/亮度匹配只应发生在同一镜头内
+        ref_cuts = cls._scene_cuts(ref, device)
+        tgt_cuts = cls._scene_cuts(vid, device)
+        ref_scene_start = 0
+        for k in range(0, ref.shape[0] - 1):
+            if bool(ref_cuts[k]):
+                ref_scene_start = k + 1
+        target_cut_frame = None
+        for k in range(0, vid.shape[0] - 1):
+            if bool(tgt_cuts[k]):
+                target_cut_frame = k
+                break
+
+        # ---------- 1. 参考侧: 最后一个镜头段内的尾部 K 帧 ----------
         K = max(1, min(int(ref_anchor_frames), ref.shape[0]))
         fit = cls._fit_size(H, W)
+        ref_anchor_start = max(ref.shape[0] - K, ref_scene_start)
         frame_mus, frame_covs, frame_hists = [], [], []
-        for t in range(ref.shape[0] - K, ref.shape[0]):
+        for t in range(ref_anchor_start, ref.shape[0]):
             sm = to_space(cls._downscale(ref[t].to(device), fit)).reshape(-1, 3)
             mu = sm.mean(0)
             cen = sm - mu
@@ -563,24 +725,44 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
         cdf_t = cdf_t / cdf_t[:, -1:].clamp_min(1e-12)
 
         if not use_stable:
-            print(f"[PSL V2] anchors={K} fit={fit} space={color_space} mode={match_mode}")
+            print(
+                f"[PSL V2] anchors ref={ref_anchor_start}..{ref.shape[0] - 1} "
+                f"cut={target_cut_frame} space={color_space} mode={match_mode}"
+            )
 
         # ---------- 2. 目标侧: 变换与强度 ----------
         alpha = max(0.0, min(0.95, float(stat_smoothing)))
         window = int(window_size)
         fade = max(int(fade_out), window + 1)
 
-        # ---------- 2.0 stable_anchor: 全片段稳定锚点 + 固定映射 ----------
-        # A = 参考侧最近的稳定窗口; B = 目标侧全部稳定帧 (等距抽样, 控制成本)。
-        # 固定映射 B->A 保留目标片段内部的曝光/对比动态, 不再逐帧统计归一化。
+        # ---------- 2.0 stable_anchor: 接缝局域稳定锚点 + 固定映射 ----------
+        # A = 参考视频尾部窗口内的稳定帧; B = 目标视频开头窗口内的稳定帧。
+        # 只取接缝附近, 避免整段视频的全局平均把开头映射到别的场景/曝光上。
         stable_state = None
         if use_stable:
             ref_mus, ref_sigs = cls._clip_stats(ref, fit, to_space, device)
             tgt_mus, tgt_sigs = cls._clip_stats(vid, fit, to_space, device)
-            ref_idx, ref_fallback = cls._stable_indices(ref_mus, ref_sigs, scales)
-            tgt_idx, tgt_fallback = cls._stable_indices(tgt_mus, tgt_sigs, scales)
+            ref_luma = cls._luma_signal(ref_mus.unsqueeze(0), str(color_space), device).squeeze(0)
+            tgt_luma = cls._luma_signal(tgt_mus.unsqueeze(0), str(color_space), device).squeeze(0)
+            tail_n = min(3, ref_luma.shape[0])
+            ref_seam_luma = float(torch.median(ref_luma[-tail_n:]))
 
+            anchor_window = max(2 * K, 16)
+            ref_start = max(0, ref.shape[0] - anchor_window)
+            ref_seg_start = max(ref_start, ref_scene_start)
+            ref_local_idx, ref_fallback = cls._stable_indices(
+                ref_mus[ref_seg_start:], ref_sigs[ref_seg_start:], scales)
+            ref_idx = [ref_seg_start + i for i in ref_local_idx]
             ia = ref_idx[-K:]
+
+            tgt_head_end = min(vid.shape[0], anchor_window)
+            if target_cut_frame is not None:
+                tgt_head_end = min(tgt_head_end, target_cut_frame + 1)
+            tgt_idx, tgt_fallback = cls._stable_indices(
+                tgt_mus[:tgt_head_end], tgt_sigs[:tgt_head_end], scales)
+
+            cut_frame = target_cut_frame
+
             max_b = max(2 * K, 16)
             if len(tgt_idx) > max_b:
                 ib = [tgt_idx[int(i * len(tgt_idx) / max_b)] for i in range(max_b)]
@@ -609,27 +791,37 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                 if cls._hist_has_spread(hist_src):
                     lut = cls._build_lut(hist_src, cdf_t, nbins, max_shift_bins)
 
-            stable_state = (A, b, lut, sig_b)
+            stable_state = (A, b, lut, sig_b, tgt_luma, ref_seam_luma, cut_frame, tgt_cuts)
             if ref_fallback or tgt_fallback:
                 print(
-                    "[PSL V2] stable_anchor: not enough stable frames, "
+                    "[PSL V2] stable_anchor: not enough stable frames in seam window, "
                     f"fallback ref={ref_fallback} tgt={tgt_fallback}"
                 )
+
+            def _span(idx):
+                return f"{idx[0]}..{idx[-1]}(n={len(idx)})" if idx else "none"
+
             print(
-                f"[PSL V2] stable anchors ref={len(ia)} tgt={len(ib)} "
+                f"[PSL V2] stable anchors ref={_span(ia)} tgt={_span(ib)} "
+                f"window={anchor_window} cut={cut_frame} "
+                f"scene_cuts ref={int(ref_cuts.sum())} tgt={int(tgt_cuts.sum())} "
+                f"refL={mu_t[0]:.3f} tgtL={mu_b[0]:.3f} "
                 f"cross={cross_channel} fit={fit} space={color_space}"
             )
 
-        # ---------- 2.1 dual_anchor: 目标侧基线锚点 (v2 尾段 = v2 自身稳定基准 B) ----------
+        # ---------- 2.1 dual_anchor: 目标开头第一场景段尾帧作为 B ----------
         # 逐帧目标基准 = p·A + (1-p)·B, 随强度曲线平滑插值:
         #   p=1 (首帧) -> v1 尾部基准 (衔接处完全对齐);
         #   p=0 (稳定段) -> v2 自身基准 (原始本色);
-        # 帧 0 与帧 1 会被同时拉到同一目标基准, 消除"原始v2帧间色漂"造成的可见跳变。
+        # 切镜处会强制 strength=0, 不会把映射带进下一场景。
         dual_state = None
         if use_dual:
-            K2 = max(1, min(int(ref_anchor_frames), B))
+            # B 只取目标开头第一个镜头段的尾帧, 不再从整段目标尾部取
+            tgt_scene_end = (target_cut_frame + 1) if target_cut_frame is not None else B
+            K2 = max(1, min(int(ref_anchor_frames), tgt_scene_end))
+            b_start = max(0, tgt_scene_end - K2)
             b_mus, b_covs, b_hists = [], [], []
-            for t in range(B - K2, B):
+            for t in range(b_start, tgt_scene_end):
                 sm = to_space(cls._downscale(vid[t].to(device), fit)).reshape(-1, 3)
                 mu = sm.mean(0)
                 cen = sm - mu
@@ -697,6 +889,7 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
 
         ema_mean = ema_cov = ema_hist_raw = ema_hist_aff = None
         corrected = []
+        out_luma = []
 
         for i in range(B):
             x = vid[i].to(device)
@@ -711,9 +904,13 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                 t = (i - window) / max(1, fade - window)
                 p = 0.5 * (1.0 + math.cos(math.pi * t))
             strength = p * float(match_intensity)
+            if target_cut_frame is not None and i > target_cut_frame:
+                strength = 0.0
 
             if strength <= 1e-5:
                 corrected.append(x.cpu())
+                if stable_state is not None:
+                    out_luma.append(float(stable_state[4][i]))
                 continue
 
             x_space = to_space(x)
@@ -721,7 +918,7 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
 
             if stable_state is not None:
                 # stable_anchor: 固定映射 + 低对比置信门控 (溶解/闪白帧自动减力)
-                A, b, lut, sig_b = stable_state
+                A, b, lut, sig_b, tgt_luma, _, _, _ = stable_state
                 xs_space = to_space(cls._downscale(x, fit)).reshape(-1, 3)
                 sig_s = xs_space.std(0).clamp_min(1e-4)
                 ratio = (sig_s / sig_b).min().clamp(0, 1)
@@ -853,9 +1050,46 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
 
             out = x_space + delta * final_strength
             if stable_state is not None:
-                cap = _LUMA_SHIFT_FRACTION * (ranges[0][1] - ranges[0][0])
-                out = cls._cap_luma_shift(x_space, out, str(color_space), cap, device)
+                # 保持输入帧的 L 对比度: 禁止 A/B 的 std 差把整段对比度压缩/拉高
+                if str(color_space) != "srgb":
+                    l_in = x_space[..., 0]
+                    l_out = out[..., 0]
+                    in_std = l_in.std()
+                    out_std = l_out.std().clamp_min(1e-6)
+                    ratio = (in_std / out_std).clamp(0.5, 2.0)
+                    out[..., 0] = l_out.mean() + (l_out - l_out.mean()) * ratio
+
+                l_range = ranges[0][1] - ranges[0][0]
+                out = cls._cap_luma_shift(
+                    x_space, out, str(color_space),
+                    _LUMA_SHIFT_FRACTION * l_range,
+                    _LUMA_RISE_FRACTION * l_range,
+                    device,
+                )
+                out_luma.append(float(cls._luma_signal(out, str(color_space), device).mean()))
             corrected.append(from_space(out).clamp(0, 1).cpu())
+
+        # 瞬态过曝: 在输出亮度曲线上检测短促正向尖峰, 用高斯时域平滑把峰摊到前后帧
+        if stable_state is not None and float(match_intensity) > 0 and len(out_luma) == B:
+            luma_curve = torch.tensor(out_luma, device=device)
+            l_scale = ranges[0][1] - ranges[0][0]
+            cut_threshold = _FLASH_CUT_DL * l_scale
+            cuts = cls._cut_flags(luma_curve, cut_threshold) | stable_state[7]
+            baseline = cls._temporal_baseline(luma_curve, cuts, cut_threshold)
+            if cls._first_frame_is_seam(float(luma_curve[0]), stable_state[5],
+                                        _FLASH_L_LO * l_scale):
+                baseline[0] = luma_curve[0]
+            mask = cls._peak_mask(luma_curve - baseline, _FLASH_L_LO * l_scale, cuts)
+            if bool(mask.any()):
+                smoothed = cls._gaussian_smooth(luma_curve, cuts)
+                delta_l = (smoothed - luma_curve) * mask * _FLASH_STRENGTH
+                for i in torch.nonzero(delta_l.abs() > 1e-6, as_tuple=False).flatten().tolist():
+                    o = to_space(corrected[i].to(device))
+                    if str(color_space) == "srgb":
+                        o = o + float(delta_l[i])
+                    else:
+                        o[..., 0] += float(delta_l[i])
+                    corrected[i] = from_space(o).clamp(0, 1).cpu()
 
         result = torch.stack(corrected, dim=0)
         return io.NodeOutput(torch.cat([ref, result], dim=0))
