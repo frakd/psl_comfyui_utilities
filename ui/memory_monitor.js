@@ -123,11 +123,12 @@ function injectStyles() {
         }
         .psl-mm-foot.error { color: #e08a8a; }
         .psl-mm-tooltip {
-            position: absolute;
-            z-index: 20;
+            position: fixed;
+            z-index: 100000;
             display: none;
             pointer-events: none;
             min-width: 210px;
+            max-width: min(380px, calc(100vw - 16px));
             padding: 6px 8px;
             background: rgba(16, 19, 22, 0.96);
             border: 1px solid #3b4650;
@@ -137,6 +138,7 @@ function injectStyles() {
             font-size: 10px;
             line-height: 1.45;
             backdrop-filter: blur(3px);
+            white-space: nowrap;
         }
         .psl-mm-tt-head { color: #e3ebf1; font-weight: 600; margin-bottom: 3px; }
         .psl-mm-tt-row { display: flex; justify-content: space-between; gap: 12px; }
@@ -366,13 +368,32 @@ function reasonLabel(reason) {
 
 function plotGeometry(width, height) {
     return {
-        left: 30,
+        left: 36,
         right: 8,
         top: 6,
         bottom: 16,
         width,
         height,
     };
+}
+
+function niceAxisStep(maxGB) {
+    if (!(maxGB > 0) || !Number.isFinite(maxGB)) return 1;
+    const rough = maxGB / 4;
+    const magnitude = 10 ** Math.floor(Math.log10(rough || 1));
+    const normalized = rough / magnitude;
+    let step;
+    if (normalized <= 1) step = 1;
+    else if (normalized <= 2) step = 2;
+    else if (normalized <= 5) step = 5;
+    else step = 10;
+    return step * magnitude;
+}
+
+function fmtAxisGB(value) {
+    if (value >= 10) return String(Math.round(value));
+    if (value >= 1) return value.toFixed(1).replace(/\.0$/, '');
+    return value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 function seriesFor(sample, kind) {
@@ -440,7 +461,7 @@ function setupEndUI(node) {
         }
         const note = document.createElement('span');
         note.className = 'psl-mm-axis-note';
-        note.textContent = '占用率（各自上限）';
+        note.textContent = '绝对占用 (GB) · 虚线=上限';
         chartHead.append(chartName, legendEl, note);
         const wrap = document.createElement('div');
         wrap.className = 'psl-mm-canvas-wrap';
@@ -470,8 +491,10 @@ function setupEndUI(node) {
     const tooltip = document.createElement('div');
     tooltip.className = 'psl-mm-tooltip';
 
-    root.append(head, meta, ramChart.block, vramChart.block, foot, tooltip);
+    root.append(head, meta, ramChart.block, vramChart.block, foot);
     node.addDOMWidget('psl_memory_monitor', 'HTML', root, { serialize: false, hideOnZoom: false });
+    // Tooltip lives on body so the node's overflow:hidden cannot clip it.
+    document.body.appendChild(tooltip);
 
     if (node.size[0] < 440) node.size[0] = 440;
     if (node.size[1] < 520) node.size[1] = 520;
@@ -531,8 +554,8 @@ function setupEndUI(node) {
         return g.left + (duration > 0 ? Math.max(0, Math.min(1, t / duration)) : 0) * (w - g.left - g.right);
     }
 
-    function yFor(percent, g, h, yMax) {
-        const clamped = Math.max(0, Math.min(yMax * 1.25, percent));
+    function yFor(value, g, h, yMax) {
+        const clamped = Math.max(0, Math.min(yMax * 1.25, Number(value) || 0));
         return g.top + (1 - clamped / yMax) * (h - g.top - g.bottom);
     }
 
@@ -551,30 +574,38 @@ function setupEndUI(node) {
             Number(current.meta?.interval_s) || 0,
             1,
         );
-        const ratios = [];
+        const capacities = {};
+        let maxBytes = 0;
         for (const sample of samples) {
             for (const s of seriesFor(sample, kind)) {
-                const p = pct(s.value, s.total);
-                if (p != null) ratios.push(p);
+                const value = Number(s.value);
+                const total = Number(s.total);
+                if (Number.isFinite(value) && value > maxBytes) maxBytes = value;
+                if (Number.isFinite(total) && total > maxBytes) maxBytes = total;
+                if (capacities[s.key] == null && Number.isFinite(total) && total > 0) {
+                    capacities[s.key] = total;
+                }
             }
         }
-        let yMax = Math.max(100, Math.ceil((Math.max(...ratios, 0) || 100) / 25) * 25);
-        const yStep = yMax / 4;
+        if (!(maxBytes > 0)) maxBytes = 1024 ** 3;
+        const maxGB = maxBytes / 1024 ** 3;
+        const stepGB = niceAxisStep(maxGB);
+        const yMaxGB = Math.max(stepGB, Math.ceil(maxGB / stepGB) * stepGB);
+        const yMax = yMaxGB * 1024 ** 3;
 
         ctx.font = '9px ui-monospace, SFMono-Regular, Consolas, monospace';
         ctx.textBaseline = 'middle';
         ctx.textAlign = 'right';
         ctx.strokeStyle = COLORS.grid;
         ctx.lineWidth = 1;
-        for (let i = 0; i <= 4; i++) {
-            const value = i * yStep;
-            const y = g.top + (1 - value / yMax) * (h - g.top - g.bottom);
+        for (let valueGB = 0; valueGB <= yMaxGB + 1e-9; valueGB += stepGB) {
+            const y = g.top + (1 - valueGB / yMaxGB) * (h - g.top - g.bottom);
             ctx.beginPath();
             ctx.moveTo(g.left, y);
             ctx.lineTo(w - g.right, y);
             ctx.stroke();
             ctx.fillStyle = COLORS.axis;
-            ctx.fillText(`${Math.round(value)}%`, g.left - 5, y);
+            ctx.fillText(fmtAxisGB(valueGB), g.left - 5, y);
         }
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
@@ -589,34 +620,39 @@ function setupEndUI(node) {
             ctx.fillStyle = COLORS.axis;
             ctx.fillText(fmtDuration(duration * frac), x, h - g.bottom + 3);
         }
-        if (yMax > 100) {
-            const y100 = g.top + (1 - 100 / yMax) * (h - g.top - g.bottom);
+        // Capacity lines: dashed in each series colour, behind the data.
+        for (const s of seriesFor(samples[0], kind)) {
+            const total = capacities[s.key];
+            if (total == null) continue;
+            const y = yFor(total, g, h, yMax);
+            ctx.save();
+            ctx.globalAlpha = 0.3;
             ctx.setLineDash([4, 4]);
-            ctx.strokeStyle = COLORS.capacity;
+            ctx.strokeStyle = s.color;
             ctx.beginPath();
-            ctx.moveTo(g.left, y100);
-            ctx.lineTo(w - g.right, y100);
+            ctx.moveTo(g.left, y);
+            ctx.lineTo(w - g.right, y);
             ctx.stroke();
-            ctx.setLineDash([]);
+            ctx.restore();
         }
 
         const stride = Math.max(1, Math.ceil(samples.length / Math.max(120, (w - g.left - g.right) * 2)));
-        for (const s of seriesFor(samples[0], kind)) {
-            ctx.strokeStyle = s.color;
+        for (const def of seriesFor(samples[0], kind)) {
+            ctx.strokeStyle = def.color;
             ctx.lineWidth = 1.7;
             ctx.lineJoin = 'round';
             ctx.lineCap = 'round';
             let started = false;
             for (let i = 0; i < samples.length; i += stride) {
                 const sample = samples[i];
-                const series = seriesFor(sample, kind).find((x) => x.key === s.key);
-                const p = series ? pct(series.value, series.total) : null;
-                if (p == null) {
+                const series = seriesFor(sample, kind).find((x) => x.key === def.key);
+                const value = series ? Number(series.value) : NaN;
+                if (!Number.isFinite(value)) {
                     started = false;
                     continue;
                 }
                 const x = xFor(sample.t, duration, w, g);
-                const y = yFor(p, g, h, yMax);
+                const y = yFor(value, g, h, yMax);
                 if (!started) {
                     ctx.beginPath();
                     ctx.moveTo(x, y);
@@ -628,12 +664,12 @@ function setupEndUI(node) {
             if (started) {
                 ctx.stroke();
                 const last = samples[samples.length - 1];
-                const lastSeries = seriesFor(last, kind).find((x) => x.key === s.key);
-                const lp = lastSeries ? pct(lastSeries.value, lastSeries.total) : null;
-                if (lp != null) {
+                const lastSeries = seriesFor(last, kind).find((x) => x.key === def.key);
+                const value = lastSeries ? Number(lastSeries.value) : NaN;
+                if (Number.isFinite(value)) {
                     const lx = xFor(last.t, duration, w, g);
-                    const ly = yFor(lp, g, h, yMax);
-                    ctx.fillStyle = s.color;
+                    const ly = yFor(value, g, h, yMax);
+                    ctx.fillStyle = def.color;
                     ctx.beginPath();
                     ctx.arc(lx, ly, 2, 0, Math.PI * 2);
                     ctx.fill();
@@ -653,9 +689,9 @@ function setupEndUI(node) {
             ctx.stroke();
             ctx.setLineDash([]);
             for (const s of seriesFor(sample, kind)) {
-                const p = pct(s.value, s.total);
-                if (p == null) continue;
-                const y = yFor(p, g, h, yMax);
+                const value = Number(s.value);
+                if (!Number.isFinite(value)) continue;
+                const y = yFor(value, g, h, yMax);
                 ctx.fillStyle = s.color;
                 ctx.strokeStyle = '#11161a';
                 ctx.lineWidth = 1.5;
@@ -742,13 +778,14 @@ function setupEndUI(node) {
         hoverIndex = idx;
         renderTooltip(current.samples[idx]);
         drawAll();
-        const rootRect = root.getBoundingClientRect();
         const tw = tooltip.offsetWidth || 230;
         const th = tooltip.offsetHeight || 90;
-        let left = event.clientX - rootRect.left + 14;
-        let top = event.clientY - rootRect.top + 12;
-        if (left + tw > rootRect.width - 4) left = Math.max(4, event.clientX - rootRect.left - tw - 12);
-        if (top + th > rootRect.height - 4) top = Math.max(4, event.clientY - rootRect.top - th - 10);
+        let left = event.clientX + 14;
+        let top = event.clientY + 12;
+        if (left + tw > window.innerWidth - 8) left = event.clientX - tw - 14;
+        if (top + th > window.innerHeight - 8) top = event.clientY - th - 12;
+        left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+        top = Math.max(8, Math.min(top, window.innerHeight - th - 8));
         tooltip.style.left = `${left}px`;
         tooltip.style.top = `${top}px`;
     }
@@ -852,6 +889,7 @@ function setupEndUI(node) {
     const prevOnRemoved = node.onRemoved;
     node.onRemoved = function () {
         endControllers.delete(controller);
+        tooltip.remove();
         return prevOnRemoved?.apply(this, arguments);
     };
 
