@@ -32,7 +32,8 @@ class RefreshableTextBox(io.ComfyNode):
                 "可自刷新的文本框：运行时把上游文本刷进文本框显示，并原样输出。"
                 "「允许覆盖」开启时刷新只改显示、不改进 prompt 的值，因此本节点与下游的"
                 "运行缓存不会因为文本变化而失效；关掉（锁定）后文本框内容才会真正生效并输出。"
-                "上游没接、或上游输出为空串/None 时不刷新，保留文本框里已有的内容。"
+                "上游没接、或上游输出 None 时不刷新，保留文本框里已有的内容；"
+                "上游已连接并输出空串时按空串处理（清空文本框）。"
                 "典型用法：开着允许覆盖 → 运行到此节点 → 编辑文本 → 锁定 → 再运行。"
             ),
             # 必须是输出节点：前端 isOutputNode 过滤 + 后端 execution.py:1181-1183
@@ -45,7 +46,7 @@ class RefreshableTextBox(io.ComfyNode):
                     optional=True,
                     default="",
                     force_input=True,
-                    tooltip="上游来的文本。连线输入；不连、或上游输出为空串/None 时不刷新文本框。",
+                    tooltip="上游来的文本。不连或上游输出 None 时不刷新；已连接时按上游文本刷新（空串会清空文本框）。",
                 ),
                 io.String.Input(
                     "locked_text",

@@ -173,10 +173,10 @@ Per slot there are three states: connected → the store is replaced and the out
 `nodes/refreshable_text_box.py` · `ui/refreshable_text_box.js` · 分类 Category：`text`
 
 **中** —— 显示会自刷新的文本，且刷新不污染运行缓存。痛点是：文本框节点每次运行后把上游文本写回自己的 widget，下一次 prompt 里这个字面量就变了，运行缓存从本节点起整片失效——即使上游文本根本没变。而后端没有任何"某输入不参与缓存"的机制，`IS_CHANGED` 也救不了（变化的字面量照样进签名，它只能增加失效、不能减少）。所以由前端给文本 widget 挂 `serializeValue`：未锁定时一律发送空串常量 → prompt 字节稳定 → 本节点与下游缓存不失效；锁定后才发送真实文本（此时失效是预期的，你就是要让改过的文本生效）。
-典型用法：开着「允许覆盖」→ 运行到此节点 → 在文本框里编辑 → 关掉允许覆盖（锁定）→ 再运行。文本照样会随工作流文件持久化，不必为了不失效而牺牲保存。上游没接、或上游输出为空串/None 时不会刷新文本框（保留里面已有的内容），因此允许覆盖模式下跑一次不会把已编辑的文本清空。
+典型用法：开着「允许覆盖」→ 运行到此节点 → 在文本框里编辑 → 关掉允许覆盖（锁定）→ 再运行。文本照样会随工作流文件持久化，不必为了不失效而牺牲保存。上游没接、或上游输出 None 时不会刷新文本框（保留里面已有的内容）；上游已连接并输出空串时按空串处理，文本框会被清空。
 
 **EN** — Shows text that refreshes itself without letting that refresh bust the run cache. The pain it removes: a text-box node that writes upstream text back into its own widget changes that literal in the next prompt, so everything downstream re-runs even when the upstream text never changed. There is no back-end mechanism for "this input shouldn't affect caching", and `IS_CHANGED` can't help either — a changed literal still enters the signature, and it can only add invalidations, never remove them. So the fix lives in the front end: the text widget's `serializeValue` sends a constant empty string while unlocked, keeping the prompt byte-stable and the cache intact; only after locking does it send the real text (and then the invalidation is expected — that's the point of editing).
-Typical loop: leave "allow overwrite" on → run up to this node → edit the text → unlock (switch overwrite off) → run again. The text still persists with the workflow file, so you don't have to give up saving to avoid the invalidation. An unconnected upstream (or one that outputs an empty string/None) never refreshes the box, so a run in overwrite mode can't wipe text you already edited.
+Typical loop: leave "allow overwrite" on → run up to this node → edit the text → unlock (switch overwrite off) → run again. The text still persists with the workflow file, so you don't have to give up saving to avoid the invalidation. An unconnected upstream, or one that outputs `None`, never refreshes the box; a connected upstream that outputs an empty string does — the box is cleared.
 
 ---
 

@@ -184,15 +184,24 @@ app.registerExtension({
         // serialize:false：按钮条不进 prompt；hideOnZoom:false：缩小时不变成占位矩形
         node.addDOMWidget('rtx_buttons', 'HTML', root, { serialize: false, hideOnZoom: false });
 
+        // 没接上游时 text_in 取后端默认空串，与「上游确实输出空串」在 ui 里长得一样；
+        // 用输入槽的连接状态区分：前者保留文本框，后者按空串处理（清空）。
+        const textInSlot = node.inputs?.findIndex((i) => i.name === 'text_in') ?? -1;
+        function textInConnected() {
+            if (textInSlot < 0) return false;
+            return node.isInputConnected
+                ? node.isInputConnected(textInSlot)
+                : node.inputs[textInSlot].link != null;
+        }
+
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
             const t = output?.text;
             const v = Array.isArray(t) && t.length > 0 ? t[0] : null;
-            // 没接上游时 text_in 取后端默认空串，上游返回 None 时就是 null：
-            // 这两种情况都没有可刷新的内容，不能覆盖文本框——否则允许覆盖模式下
-            // 跑一次就把已有文本清空了。"还原上游"也保留最近一次真实的上游文本。
-            if (typeof v === 'string' && v.length > 0) {
+            // null = 上游没给内容（未接入、上游返回 None）：保留原文本；
+            // 空串 = 上游明确输出空：照常刷新清空。非字符串一律不认。
+            if (typeof v === 'string' && (v.length > 0 || textInConnected())) {
                 upstream = v;
                 // 只有「允许覆盖」时才刷新显示；锁定状态下绝不覆盖用户改过的文本
                 if (lockW.value) textW.value = upstream;
