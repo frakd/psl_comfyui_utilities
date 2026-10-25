@@ -2,8 +2,9 @@ import { app } from '../../scripts/app.js';
 
 // ============================================================
 //  Refreshable Text Box — 自刷新文本框
-//  核心是 serializeValue：显示会变，但发给后端的值在未锁定时恒为常量，
-//  于是 prompt 字节稳定、运行缓存不失效。
+//  核心是 serializeValue：接了上游且允许覆盖时，发给后端的值恒为空串常量，
+//  于是 prompt 字节稳定、运行缓存不失效；未接上游时文本框是唯一内容来源，
+//  发送真实文本并作为输出兜底；锁定后同样发送真实文本。
 //
 //  按钮区是 DOM widget（2×2 网格，serialize:false，不进 prompt/工作流）：
 //    第一行  锁定开关 + 还原上游（状态类操作）
@@ -115,10 +116,25 @@ app.registerExtension({
         // 只在运行时存在，刷新页面后要等下一次运行才会重新填充。
         let upstream = null;
 
-        // 未锁定（允许覆盖）时发送常量空串：prompt 对本节点保持字节稳定，
-        // 缓存签名不变，本节点与下游都不会因为文本刷新而失效。
+        // text_in 的连接状态：ui 里「未接上游」和「上游输出空串」都是空串，
+        // 只能看输入槽有没有连线。序列化与 onExecuted 都要用。
+        // 槽位要现查：nodeCreated 执行时 node.inputs 可能还没填好，缓存会拿到 -1。
+        function textInConnected() {
+            const slot = node.inputs?.findIndex((i) => i.name === 'text_in') ?? -1;
+            if (slot < 0) return false;
+            return node.isInputConnected
+                ? node.isInputConnected(slot)
+                : node.inputs[slot].link != null;
+        }
+
+        // 未锁定（允许覆盖）：接了上游就发送常量空串，prompt 字节稳定、缓存不失效；
+        // 没接上游则发送真实文本，让后端把文本框内容作为输出兜底——此时文本框
+        // 就是唯一内容来源，编辑它本来就应该让下游重跑。
         // 锁定后发送真实文本，此时缓存从本节点起失效一次是预期行为。
-        textW.serializeValue = () => (lockW.value ? '' : textW.value);
+        textW.serializeValue = () => {
+            if (!lockW.value) return textW.value;   // 锁定：真实文本生效
+            return textInConnected() ? '' : textW.value;
+        };
 
         // ---------- 按钮区（DOM widget，2×2） ----------
         // 高度 min=max 钉死：布局分配里 maxSize 缺省是 Infinity（会吃掉节点拉高的
@@ -184,16 +200,7 @@ app.registerExtension({
         // serialize:false：按钮条不进 prompt；hideOnZoom:false：缩小时不变成占位矩形
         node.addDOMWidget('rtx_buttons', 'HTML', root, { serialize: false, hideOnZoom: false });
 
-        // 没接上游时 text_in 取后端默认空串，与「上游确实输出空串」在 ui 里长得一样；
-        // 用输入槽的连接状态区分：前者保留文本框，后者按空串处理（清空）。
-        const textInSlot = node.inputs?.findIndex((i) => i.name === 'text_in') ?? -1;
-        function textInConnected() {
-            if (textInSlot < 0) return false;
-            return node.isInputConnected
-                ? node.isInputConnected(textInSlot)
-                : node.inputs[textInSlot].link != null;
-        }
-
+        // 没接上游时 text_in 取后端默认 None，ui 里回传 null；上游输出空串时是 ""。
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
