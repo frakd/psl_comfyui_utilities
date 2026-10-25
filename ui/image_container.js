@@ -322,13 +322,20 @@ app.registerExtension({
             syncModeButtons();
         }
 
-        function writeState() {
-            poolW.value = JSON.stringify({ cols, items: pool, selected: selectedIds, mode: selMode });
+        // selected_json 的值一律从闭包状态现算，不要读 selectedW.value：
+        // 第三方扩展（如 pysssss PresetText）会给 text widget 包一层 serializeValue，
+        // 在回调返回后把 widget.value 恢复成调用前的快照，序列化期间的写入会被抹掉。
+        function buildSelectedJson() {
             const byId = new Map(pool.map((p) => [p.id, p]));
-            selectedW.value = JSON.stringify(
+            return JSON.stringify(
                 selectedIds.map((id) => byId.get(id)).filter(Boolean)
                     .map(({ name, subfolder, type }) => ({ name, subfolder, type }))
             );
+        }
+
+        function writeState() {
+            poolW.value = JSON.stringify({ cols, items: pool, selected: selectedIds, mode: selMode });
+            selectedW.value = buildSelectedJson();
         }
 
         // ---------- DOM ----------
@@ -631,8 +638,13 @@ app.registerExtension({
                 selectedIds = [pool[0].id];
                 refreshSelection();
             }
-            const val = selectedW.value;   // 本次运行用的选中集（推进前快照）
+            // 本次运行用推进前的选中集。必须从闭包状态现算：若读 selectedW.value，
+            // 被 PresetText 之类包装过的 widget 会把它恢复成旧快照，导致永远发第一张。
+            const val = buildSelectedJson();
             advanceSequential();           // 游标推进，UI 同步显示下一次将用的那张
+            // 包装器在回调返回后还会再恢复一次 widget.value，所以推进结果要等这一轮
+            // 宏任务结束再落盘（只影响工作流保存，不影响本次返回值）。
+            setTimeout(writeState, 0);
             return val;
         };
 
