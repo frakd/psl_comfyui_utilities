@@ -188,8 +188,12 @@ app.registerExtension({
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
             const t = output?.text;
-            if (Array.isArray(t) && t.length > 0) {
-                upstream = t[0];
+            const v = Array.isArray(t) && t.length > 0 ? t[0] : null;
+            // 没接上游时 text_in 取后端默认空串，上游返回 None 时就是 null：
+            // 这两种情况都没有可刷新的内容，不能覆盖文本框——否则允许覆盖模式下
+            // 跑一次就把已有文本清空了。"还原上游"也保留最近一次真实的上游文本。
+            if (typeof v === 'string' && v.length > 0) {
+                upstream = v;
                 // 只有「允许覆盖」时才刷新显示；锁定状态下绝不覆盖用户改过的文本
                 if (lockW.value) textW.value = upstream;
             }
