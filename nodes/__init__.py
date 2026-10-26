@@ -13,6 +13,7 @@ from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
 from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
+from .text_container import TextContainer
 from .video_match_v2 import PSLAdvancedVideoMatchV2
 
 _NODE_CLASSES = (
@@ -29,6 +30,7 @@ _NODE_CLASSES = (
     MaskPaintOutput,
     PersistentOutput,
     RefreshableTextBox,
+    TextContainer,
     ImageContainer,
     PSLLoRAStepSchedule,
     PSLVideoCombineMemory,
