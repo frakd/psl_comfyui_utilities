@@ -268,8 +268,8 @@ docs/model_reroute.md       Model Reroute 的用法、限制与兼容性表
   These nodes grew out of one person's workflows. They don't depend on each other — use any subset.
 - `audio_filter/dsp.py` 不依赖 ComfyUI，可直接 `python nodes/audio_filter/tests/test_dsp.py` 跑测试。
   `audio_filter/dsp.py` is ComfyUI-free; run `python nodes/audio_filter/tests/test_dsp.py` to test it standalone.
-- 多个节点会**主动输出 None 或阻断下游**（Any Switch / Image Container / Persistent Output / Mask Paint Output），这是设计而非 bug，相关小节各自说明了取舍。
-  Several nodes deliberately output None or block downstream (Any Switch / Image Container / Persistent Output / Mask Paint Output). That's design, not a bug — each section explains the trade-off.
+- 多个节点会**主动输出 None 或阻断下游**（Any Switch / Image Container / Text Container / Persistent Output / Mask Paint Output），这是设计而非 bug，相关小节各自说明了取舍。
+  Several nodes deliberately output None or block downstream (Any Switch / Image Container / Text Container / Persistent Output / Mask Paint Output). That's design, not a bug — each section explains the trade-off.
 
 ## License
 
