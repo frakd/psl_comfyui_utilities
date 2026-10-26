@@ -15,8 +15,9 @@ import { app } from '../../scripts/app.js';
 //      完整状态随工作流持久化，prompt 里永远只是一个常量，不改变缓存签名。
 //    - prompt 里只有 selection_json / manual_json / upstream_mode 三个派生字面量，
 //      外加 ui_state_json 的常量空串。
-//    - 上游接入期间 manual_json 恒为空数组、upstream_mode 恒为 linked；运行到此节点
-//      刷新列表只改 ui_state_json，prompt 字节不变 => 本节点与下游缓存不失效。
+//    - 上游接入且未被静音/绕过期间 manual_json 恒为空数组、upstream_mode 恒为 linked；
+//      运行到此节点刷新列表只改 ui_state_json，prompt 字节不变 => 本节点与下游缓存不失效。
+//    - 上游节点被静音/绕过时，排队改用 manual 模式并提交当前列表，运行不会清空列表。
 //    - 顺序模式的推进挂在 selection_json.serializeValue 上（每次排队构建 prompt 时
 //      调用）：本次仍用推进前的选中集，随后游标推进。这个字面量本来就会变，
 //      逐条步进必然重跑，这是顺序模式的内在代价。
@@ -435,6 +436,37 @@ app.registerExtension({
             return source === 'upstream' && textInConnected();
         }
 
+        function upstreamOriginNode() {
+            const slot = node.inputs?.findIndex((input) => input.name === 'text_in') ?? -1;
+            if (slot < 0) return null;
+            let link = null;
+            if (typeof node.getInputLink === 'function') {
+                link = node.getInputLink(slot);
+            } else {
+                const linkId = node.inputs?.[slot]?.link;
+                if (linkId != null) {
+                    const links = node.graph?.links;
+                    link = typeof links?.get === 'function' ? links.get(linkId) : links?.[linkId];
+                }
+            }
+            if (!link) return null;
+            return node.graph?.getNodeById?.(link.origin_id) ?? app.graph?.getNodeById?.(link.origin_id) ?? null;
+        }
+
+        function upstreamBlocked() {
+            const origin = upstreamOriginNode();
+            if (!origin) return false;
+            // LiteGraph 的 NEVER=2（静音）、BYPASS=4（绕过）。上游被禁用时
+            // ComfyUI 不会给出文本，这里回退到当前列表，避免把已有内容清空。
+            const neverMode = typeof LiteGraph !== 'undefined' && Number.isFinite(LiteGraph.NEVER) ? LiteGraph.NEVER : 2;
+            const bypassMode = typeof LiteGraph !== 'undefined' && Number.isFinite(LiteGraph.BYPASS) ? LiteGraph.BYPASS : 4;
+            return origin.mode === neverMode || origin.mode === bypassMode;
+        }
+
+        function useUpstreamSource() {
+            return textInConnected() && !upstreamBlocked();
+        }
+
         function clipSelection(list, length, fallbackOnMissing = false) {
             const before = list.length;
             let out = list.filter((index) => index >= 0 && index < length);
@@ -495,11 +527,12 @@ app.registerExtension({
             upstreamW.value = textInConnected() ? 'linked' : 'manual';
         }
 
-        // 上游接入期间 manual 内容不参与输出：提交常量空数组。
+        // 上游接入且可用期间 manual 内容不参与输出：提交常量空数组。
         // 这样从“预填手动内容”切到“上游结果”的那一次不会改变 prompt，
         // 后续每次运行到此节点刷新列表也保持 prompt 字节稳定。
-        manualW.serializeValue = () => (textInConnected() ? '[]' : JSON.stringify(slots));
-        upstreamW.serializeValue = () => (textInConnected() ? 'linked' : 'manual');
+        // 上游节点被静音/绕过时改用 manual，输出当前列表而不是空占位槽。
+        manualW.serializeValue = () => (useUpstreamSource() ? '[]' : JSON.stringify(slots));
+        upstreamW.serializeValue = () => (useUpstreamSource() ? 'linked' : 'manual');
 
         // 顺序模式：排队即推进。先从闭包取推进前的选中集作为本次运行的值，
         // 再推进游标供下次排队使用。取消/失败/缓存命中都已推进，与 Image Container 一致。
@@ -594,7 +627,10 @@ app.registerExtension({
             const filled = slots.reduce((count, text) => count + (text.trim() ? 1 : 0), 0);
             const label = upstreamView ? '上游' : '手动';
             let hint = '';
-            if (!upstreamView && textInConnected()) hint = ' · 上游已接入，运行到此节点刷新';
+            if (textInConnected()) {
+                if (upstreamBlocked()) hint = ' · 上游已禁用，运行将使用当前列表';
+                else if (!upstreamView) hint = ' · 上游已接入，运行到此节点刷新';
+            }
             const text =
                 `${label} ${filled} 条 / ${slots.length} 槽位 · 已选 ${selection.length}/${cap}` +
                 ` · ${MODE_NAMES[mode]} · 缺失槽 ${inertLabel}` +
