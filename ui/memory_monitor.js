@@ -37,8 +37,8 @@ function injectStyles() {
             position: relative;
             box-sizing: border-box;
             width: 100%;
-            height: 440px;
-            min-height: 400px;
+            height: 100%;
+            min-height: 0;
             padding: 7px 8px 6px;
             display: flex;
             flex-direction: column;
@@ -87,7 +87,8 @@ function injectStyles() {
         }
         .psl-mm-chart {
             flex: 1 1 0;
-            min-height: 128px;
+            min-height: 48px;
+            min-width: 0;
             display: flex;
             flex-direction: column;
             background: #171b1f;
@@ -101,10 +102,11 @@ function injectStyles() {
             flex: 0 0 auto;
             display: flex;
             align-items: center;
-            gap: 8px;
+            flex-wrap: wrap;
+            gap: 2px 8px;
+            min-height: 15px;
             font-size: 10px;
             color: #aab6c0;
-            height: 15px;
         }
         .psl-mm-chart-name { font-weight: 600; color: #d7e1e9; }
         .psl-mm-legend { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -147,22 +149,24 @@ function injectStyles() {
         .psl-mm-tt-pct { color: #8fb8cf; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
         .psl-mm-start {
             display: flex; flex-direction: column; gap: 4px;
-            box-sizing: border-box; width: 100%; height: 64px;
+            box-sizing: border-box; width: 100%; height: 100%; min-height: 0;
             padding: 5px 6px;
             background: #121518; border: 1px solid #2a3036; border-radius: 6px;
             color: ${COLORS.text};
             font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+            overflow: hidden;
         }
         .psl-mm-start-row { display: flex; align-items: center; gap: 6px; height: 22px; }
         .psl-mm-start-label { flex: 0 0 92px; color: ${COLORS.muted}; font-size: 10px; }
         .psl-mm-start-input {
-            width: 74px; height: 20px; box-sizing: border-box;
+            flex: 1 1 74px; width: 74px; min-width: 74px; max-width: 220px;
+            height: 20px; box-sizing: border-box;
             background: #1b2025; color: ${COLORS.text};
             border: 1px solid #343c44; border-radius: 4px;
             font-size: 10px; padding: 0 4px; outline: none;
         }
         .psl-mm-start-input:focus { border-color: #4a7ab0; }
-        .psl-mm-start-note { color: #5f6b75; font-size: 9px; line-height: 1; }
+        .psl-mm-start-note { margin-top: auto; color: #5f6b75; font-size: 9px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     `;
     document.head.appendChild(style);
 }
@@ -172,13 +176,15 @@ function readStartNumber(node, prop, fallback) {
     return Number.isFinite(value) ? value : fallback;
 }
 
-function setupStartUI(node) {
+function setupStartUI(node, { defaultSize = false } = {}) {
     // 纯前端 DOM 面板：值存 node.properties，不进 prompt，因此改采样参数
     // 不会改变缓存签名。node.widgets 还没建好也不影响，因为面板是自己加的。
     if (node.widgets?.some((w) => w.name === 'psl_start_controls')) return;
     injectStyles();
     const root = document.createElement('div');
     root.className = 'psl-mm-start';
+    // 面板高度跟随节点；下限只保证两行输入 + 底部说明不被压没。
+    root.style.setProperty('--comfy-widget-min-height', '84px');
     const inputs = new Map();
 
     const addRow = (label, prop, min, max, step, fallback) => {
@@ -219,8 +225,17 @@ function setupStartUI(node) {
     root.appendChild(note);
 
     node.addDOMWidget('psl_start_controls', 'HTML', root, { serialize: false, hideOnZoom: false });
-    if (node.size[0] < 300) node.size[0] = 300;
-    if (node.size[1] < 155) node.size[1] = 155;
+    if (defaultSize) {
+        // 节点创建时 DOM 还没被布局器量过，等一帧再给默认尺寸，避免被自动尺寸覆盖。
+        setTimeout(() => {
+            if (!node.graph) return;
+            const width = Math.max(node.size[0], 320);
+            const height = Math.max(node.size[1], 170);
+            if (width === node.size[0] && height === node.size[1]) return;
+            node.setSize([width, height]);
+            node.graph.setDirtyCanvas(true, true);
+        }, 80);
+    }
     node.onResize?.(node.size);
     node.setDirtyCanvas?.(true, true);
 
@@ -409,11 +424,13 @@ function seriesFor(sample, kind) {
     ];
 }
 
-function setupEndUI(node) {
+function setupEndUI(node, { defaultSize = false } = {}) {
     if (node.widgets?.some((w) => w.name === 'psl_memory_monitor')) return;
     injectStyles();
     const root = document.createElement('div');
     root.className = 'psl-mm-root';
+    // 面板跟着节点长/缩；两张图各自 flex，缩小到下限时仍留在面板内。
+    root.style.setProperty('--comfy-widget-min-height', '200px');
 
     const head = document.createElement('div');
     head.className = 'psl-mm-head';
@@ -496,8 +513,16 @@ function setupEndUI(node) {
     // Tooltip lives on body so the node's overflow:hidden cannot clip it.
     document.body.appendChild(tooltip);
 
-    if (node.size[0] < 440) node.size[0] = 440;
-    if (node.size[1] < 520) node.size[1] = 520;
+    if (defaultSize) {
+        setTimeout(() => {
+            if (!node.graph) return;
+            const width = Math.max(node.size[0], 560);
+            const height = Math.max(node.size[1], 560);
+            if (width === node.size[0] && height === node.size[1]) return;
+            node.setSize([width, height]);
+            node.graph.setDirtyCanvas(true, true);
+        }, 80);
+    }
     node.onResize?.(node.size);
     node.setDirtyCanvas?.(true, true);
 
@@ -910,13 +935,15 @@ app.registerExtension({
         setupMonitorEvents();
     },
     async nodeCreated(node) {
+        const defaultSize = !app.configuringGraph;
         if (node.comfyClass === 'MemoryMonitorStart') {
-            setupStartUI(node);
+            setupStartUI(node, { defaultSize });
         } else if (node.comfyClass === END_CLASS) {
-            setupEndUI(node);
+            setupEndUI(node, { defaultSize });
         }
     },
     async loadedGraphNode(node) {
+        // 加载工作流时保留节点自己保存的尺寸，不套默认尺寸。
         if (node.comfyClass === 'MemoryMonitorStart') {
             setupStartUI(node);
         } else if (node.comfyClass === END_CLASS) {
