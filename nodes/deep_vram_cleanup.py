@@ -881,6 +881,8 @@ class DeepVRAMCleanup(io.ComfyNode):
                     tooltip="【收尾】直接调用 CUDA Runtime 的 cudaMemPoolTrimTo(0)，强制将 cudaMallocAsync 内存池中所有未使用的内存归还给操作系统。\n\n这是对 torch.cuda.empty_cache() 的补充——在 CUDA 13.x + cudaMallocAsync 后端下，仅靠 empty_cache() 往往无法彻底释放 reserved 内存。此选项直接绕过 PyTorch 操作 CUDA 内存池。"),
                 io.Boolean.Input("purge_orphan_tensors", default=False,
                     tooltip="【收尾 · 暴力模式】遍历 Python 堆中所有 gc 追踪的对象，找出散落在类属性、全局变量等角落的 GPU tensor，强制 detach 或移动到 CPU。\n\n此操作慢且激进，可能影响其他节点的内部状态。仅在以上清理都无效时作为最后手段使用。"),
+                io.Boolean.Input("show_diagnostics", default=False,
+                    tooltip="【诊断 · 默认关闭】开启后才采集并显示下方诊断面板的信息（系统内存、执行缓存、GPU tensor 清单、dry-run 缓存估算等）。\n\n关闭时完全不执行这些查询：不遍历 Python 堆统计 GPU tensor、不扫描执行缓存、不做 source 缓存的 dry-run 估算，面板也不显示任何内容——无论其它清理开关是否开启、是否真的清理过。\n\n这些查询需要多次 gc.get_objects() 全堆扫描，模型加载较多时会明显拉长节点执行时间，只在排查问题时临时打开。"),
                 io.String.Input("run_nonce", default="", optional=True,
                     tooltip="内部防缓存机制：仅当 clear_source_node_cache 开启时，前端每次排队自增它使签名必变、"
                             "本节点必执行（带副作用的节点被缓存命中会跳过不跑）；开关关闭时保持空值，"
@@ -960,6 +962,7 @@ class DeepVRAMCleanup(io.ComfyNode):
         gc_empty_cache: bool,
         trim_cuda_pool: bool,
         purge_orphan_tensors: bool,
+        show_diagnostics: bool,
         passthrough1=None,
         passthrough2=None,
         passthrough3=None,
@@ -977,7 +980,7 @@ class DeepVRAMCleanup(io.ComfyNode):
         del run_nonce
         device = mm.get_torch_device()
         used_before, total = cls._vram(device)
-        sysmem_before = _sysmem_line()
+        sysmem_before = _sysmem_line() if show_diagnostics else ""
 
         # ===================== 第一组：运行缓存 =====================
         # 先丢引用（清缓存），再统一释放（第三组），这样释放才真的落到刚丢掉的 tensor 上。
@@ -1012,9 +1015,10 @@ class DeepVRAMCleanup(io.ComfyNode):
                         )
                         cache_lines.extend(lines)
                         need_trim = need_trim or removed > 0
-        elif cache_sources:
+        elif cache_sources and show_diagnostics:
             # 干跑模式：只统计各 source 节点当前可释放的缓存量，不动任何条目。
             # 结果进 diag（前端上屏），供决定是否开启 clear_source_node_cache。
+            # 纯查询，show_diagnostics 关闭时整段跳过。
             hidden = cls.hidden
             source_ids, why = _linked_source_node_ids(hidden.unique_id, hidden.prompt)
             if not source_ids:
@@ -1085,11 +1089,22 @@ class DeepVRAMCleanup(io.ComfyNode):
             n = _purge_cuda_orphans()
             log.debug("[DeepVRAMCleanup] Purged %d orphan CUDA tensors", n)
 
-        # Final GC + cache flush
-        for _ in range(3):
-            gc.collect()
-        if device.type == "cuda":
-            soft_empty_cache(force=True)
+        # Final GC + cache flush：只在有清理按钮开启时兜底；全关时纯查询/空转，
+        # 不做无意义的全堆 gc 与 CUDA 同步（show_diagnostics 不算清理按钮）。
+        any_cleanup = any((
+            clear_all_node_cache,
+            clear_source_node_cache,
+            unload_models,
+            unload_connected_models,
+            gc_empty_cache,
+            trim_cuda_pool,
+            purge_orphan_tensors,
+        ))
+        if any_cleanup:
+            for _ in range(3):
+                gc.collect()
+            if device.type == "cuda":
+                soft_empty_cache(force=True)
 
         if trim_cuda_pool and device.type == "cuda":
             _trim_cuda_mempool(device.index if hasattr(device, "index") else 0)
@@ -1108,27 +1123,28 @@ class DeepVRAMCleanup(io.ComfyNode):
         used_after, _ = cls._vram(device)
         freed = max(0.0, used_before - used_after)
 
-        lines = [
-            f"used: {used_before:.3f} -> {used_after:.3f} GB  (freed {freed:.3f})",
-            f"total: {total:.2f} GB",
-            f"sysRAM before: {sysmem_before}",
-            _sysmem_line(),
-            "",
-        ]
-        if ws_line:
-            lines.append(ws_line)
+        diag = ""
+        if show_diagnostics:
+            lines = [
+                f"used: {used_before:.3f} -> {used_after:.3f} GB  (freed {freed:.3f})",
+                f"total: {total:.2f} GB",
+                f"sysRAM before: {sysmem_before}",
+                _sysmem_line(),
+                "",
+            ]
+            if ws_line:
+                lines.append(ws_line)
+                lines.append("")
+            lines.extend(_inspect_comfy_caches())
+            if unload_lines:
+                lines.append("")
+                lines.extend(unload_lines)
+            if cache_lines:
+                lines.append("")
+                lines.extend(cache_lines)
             lines.append("")
-        lines.extend(_inspect_comfy_caches())
-        if unload_lines:
-            lines.append("")
-            lines.extend(unload_lines)
-        if cache_lines:
-            lines.append("")
-            lines.extend(cache_lines)
-        lines.append("")
-        lines.extend(_find_gpu_tensors_direct())
-
-        diag = "\n".join(lines)
+            lines.extend(_find_gpu_tensors_direct())
+            diag = "\n".join(lines)
         # diag 同时挂进 ui：前端扩展（ui/deep_vram_cleanup.js）把它渲染到节点上，
         # 命令行日志之外画布直接可见（清理/跳过原因一目了然）。
         return io.NodeOutput(

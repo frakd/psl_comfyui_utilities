@@ -37,6 +37,7 @@ function injectStyles() {
             overflow-x: hidden;
         }
         .dvc-diag:empty::before { content: '运行后显示诊断…'; color: #556; }
+        .dvc-diag.dvc-off:empty::before { content: none; }
     `;
     document.head.appendChild(s);
 }
@@ -54,6 +55,23 @@ app.registerExtension({
         pre.className = 'dvc-diag';
         root.appendChild(pre);
         node.addDOMWidget('dvc_diag', 'DIAG', root, { serialize: false, hideOnZoom: false });
+
+        // show_diagnostics 关闭时面板留空（连占位文案也不显示），切换立刻清掉旧内容
+        function renderDiag(text) {
+            pre.textContent = text;
+            pre.classList.toggle('dvc-off', !text.trim());
+        }
+        const diagToggle = node.widgets?.find((w) => w.name === 'show_diagnostics');
+        if (diagToggle) {
+            pre.classList.toggle('dvc-off', !diagToggle.value);
+            const prevCallback = diagToggle.callback;
+            diagToggle.callback = function (...args) {
+                const result = prevCallback?.apply(this, args);
+                if (diagToggle.value) pre.classList.remove('dvc-off');
+                else renderDiag('');
+                return result;
+            };
+        }
 
         // run_nonce：条件自增的防缓存签名（详见文件头注释）
         const nonceW = node.widgets?.find((w) => w.name === 'run_nonce');
@@ -102,9 +120,9 @@ app.registerExtension({
             prevOnExecuted?.apply(this, arguments);
             // 后端 ui 标量必须包 list：output.diag 是 [text]
             const d = Array.isArray(output?.diag) ? output.diag[0] : output?.diag;
-            if (typeof d === 'string' && d.trim()) {
-                pre.textContent = d;
-                growForContent();
+            if (typeof d === 'string') {
+                renderDiag(d);
+                if (d.trim()) growForContent();
             }
         };
 
