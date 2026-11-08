@@ -888,12 +888,13 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
             frozen = (A0, b0, lut0)
 
         ema_mean = ema_cov = ema_hist_raw = ema_hist_aff = None
-        corrected = []
+        # 单一输出缓冲: 参考段 + 目标段直接写入, 避免 corrected 列表 / stack / cat 多重整段复制。
+        ref_n = ref.shape[0]
+        output = torch.empty(ref_n + B, H, W, 3, dtype=ref.dtype, device=ref.device)
+        output[:ref_n] = ref
         out_luma = []
 
         for i in range(B):
-            x = vid[i].to(device)
-
             # 平滑强度曲线: 前 window 帧全强度, 之后余弦衰减到 fade_out。
             # 余弦曲线在两端导数为 0, 避免线性衰减的"拐点感", 过渡连续平滑。
             if i < window:
@@ -908,11 +909,13 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                 strength = 0.0
 
             if strength <= 1e-5:
-                corrected.append(x.cpu())
+                # 不变帧直接拷入输出, 不做 GPU 往返、不额外攒副本。
+                output[ref_n + i] = vid[i]
                 if stable_state is not None:
                     out_luma.append(float(stable_state[4][i]))
                 continue
 
+            x = vid[i].to(device)
             x_space = to_space(x)
             xi = x_space.reshape(-1, 3)
 
@@ -1067,7 +1070,7 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                     device,
                 )
                 out_luma.append(float(cls._luma_signal(out, str(color_space), device).mean()))
-            corrected.append(from_space(out).clamp(0, 1).cpu())
+            output[ref_n + i] = from_space(out).clamp(0, 1).cpu()
 
         # 瞬态过曝: 在输出亮度曲线上检测短促正向尖峰, 用高斯时域平滑把峰摊到前后帧
         if stable_state is not None and float(match_intensity) > 0 and len(out_luma) == B:
@@ -1084,12 +1087,11 @@ class PSLAdvancedVideoMatchV2(io.ComfyNode):
                 smoothed = cls._gaussian_smooth(luma_curve, cuts)
                 delta_l = (smoothed - luma_curve) * mask * _FLASH_STRENGTH
                 for i in torch.nonzero(delta_l.abs() > 1e-6, as_tuple=False).flatten().tolist():
-                    o = to_space(corrected[i].to(device))
+                    o = to_space(output[ref_n + i].to(device))
                     if str(color_space) == "srgb":
                         o = o + float(delta_l[i])
                     else:
                         o[..., 0] += float(delta_l[i])
-                    corrected[i] = from_space(o).clamp(0, 1).cpu()
+                    output[ref_n + i] = from_space(o).clamp(0, 1).cpu()
 
-        result = torch.stack(corrected, dim=0)
-        return io.NodeOutput(torch.cat([ref, result], dim=0))
+        return io.NodeOutput(output)
