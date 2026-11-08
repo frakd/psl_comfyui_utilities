@@ -1,3 +1,3 @@
-from .nodes import AudioHarshnessSuppressor
+from .nodes import AudioHarmonicNotch, AudioHarshnessSuppressor, AudioReferenceDePercuss
 
-__all__ = ["AudioHarshnessSuppressor"]
+__all__ = ["AudioHarshnessSuppressor", "AudioHarmonicNotch", "AudioReferenceDePercuss"]

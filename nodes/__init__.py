@@ -1,7 +1,7 @@
 from .ab_audio_compare import AudioABCompare
 from .any_switch import AnySwitch
 from .aspect_ratio_selector import AspectRatioSelectorNode
-from .audio_filter import AudioHarshnessSuppressor
+from .audio_filter import AudioHarmonicNotch, AudioHarshnessSuppressor, AudioReferenceDePercuss
 from .cached_clip_text_encode import CachedCLIPTextEncode
 from .deep_vram_cleanup import DeepVRAMCleanup
 from .h3_av_lora import MiniMaxH3AVLoRAStack
@@ -21,6 +21,8 @@ _NODE_CLASSES = (
     MemoryMonitorStart,
     MemoryMonitorEnd,
     AudioHarshnessSuppressor,
+    AudioHarmonicNotch,
+    AudioReferenceDePercuss,
     AudioABCompare,
     CachedCLIPTextEncode,
     AnySwitch,
