@@ -34,6 +34,7 @@ Typing `psl` or `personal` in the node search box filters out every node in this
 | [Persistent Output](#persistent-output) | 三槽位记住前几趟运行的图/音频，断线后仍可复现做对比 |
 | [Refreshable Text Box](#refreshable-text-box) | 文本框自动刷新显示上游文本，且不污染运行缓存 |
 | [CLIP Text Encode (Cached)](#clip-text-encode-cached) | 文本编码结果按 (CLIP, 文本) 缓存，上游重跑但文本没变时不再重编码 |
+| [MOSS-Image Prompt Weight (Presets)](#moss-image-prompt-weight-presets) | 预设短语列表合并进正面提示词并逐 token 加权，改权重不重编码 |
 | [Image Container (6 Outputs)](#image-container-6-outputs) | 图片池 + 点选排序（多选/单选/顺序单选），输出 6 路单图与 1 个 batch |
 | [Text Container (6 Outputs)](#text-container-6-outputs) | 文本按分隔符切条 + 点选（多选/单选/顺序），输出 6 路字符串，刷新不污染缓存 |
 | [Video Combine (Memory)](#video-combine-memory) | 帧+音频直接在内存合成 MP4 不落盘（NVENC 加速引擎），合并/落盘接官方节点 |
@@ -192,6 +193,18 @@ Typical loop: leave "allow overwrite" on → run up to this node → edit the te
 **EN** — Drop-in equivalent of the core CLIP Text Encode that caches the encoded conditioning by (CLIP object, text). Same root cause as Refreshable Text Box: ComfyUI's cache signature includes input literals plus ancestor signatures, so toggling a LoRA, syncing metadata, or refreshing a text box re-runs the downstream text encode even when the final text is byte-identical. With a Qwen3.5-9B text encoder that costs seconds per run. This node wraps `encode` in a 4-entry LRU: on a hit it returns the previous conditioning without tokenizing/encoding again; a real text or CLIP change still re-encodes. Conditioning that carries hooks is never cached, and `cache_mode=disabled` bypasses the cache. It only affects encodes that explicitly use this node — no global monkey-patching.
 Usage: replace a core CLIP Text Encode with this node, wire `clip` / `text` as before, and leave `cache_mode` on `enabled`. The cache holds conditioning only; the CLIP model is referenced through a `weakref`, so it won't block unloading or swapping. The cache key also includes `patcher.patches_uuid`: a standard `add_patches` call changes that uuid even when it patches the same object in place, so an in-place LoRA with an unchanged patch count still invalidates correctly. Only extreme cases that bypass `add_patches` — direct base-weight edits such as `load_state_dict`, direct edits to `patcher.patches`, or replacing `cond_stage_model` / `patcher` — need `cache_mode=disabled`.
 Caveat: the node itself is still executed by ComfyUI (its ancestor signature changed); the cost drops to a dict lookup. Making the node not execute at all requires decoupling the trigger-word source from the loader (a separate node plus front-end syncing), which is out of scope here.
+
+---
+
+### MOSS-Image Prompt Weight (Presets)
+
+`nodes/prompt_weight.py` · `nodes/prompt_weight_core.py` · `ui/prompt_weight.js` · 分类 Category：`MOSS-Image/prompt`
+
+**中** —— 把工作流里保存的预设条目列表（纯文本 + 权重滑块，可拖动排序、可逐条启用）合并到正面提示词的前面或后面，再做逐 token 的注意力加权：权重 >1 给该 token 的 attention logits 加正偏置，<1 缩放 value 向量（0 等于移除，负值反向减去概念），1 为中性；同一短语的每一次出现都会生效。文本里仍然可以写 `(phrase:weight)` 语法，列表条目和它们会被一起定位。编码结果按 (CLIP, patch 状态, 合并文本) 做 4 条 LRU 缓存，只改权重不会触发 Qwen 文本编码器重跑，权重每次都会重新施加。
+它只适用于官方 ComfyUI MOSS-Image 扩散模型（会校验 `diffusion_model` 的 `_forward` / `layers` / `text_embedder`）；`model` 与 `conditioning` 两路输出都要接给采样器，conditioning 长度对不上时权重会被跳过并打印 warning。模型支持 `context_attention_bias` 时 bias 走 conditioning 元数据；否则由 transformer block 的 attention override 施加，value 缩放也走同一个 override。本节点原先属于 moss-image 包，节点类型 ID `MOSSImagePromptWeightPreset` 与显示名未变，旧工作流可以直接加载。
+
+**EN** — Merges a workflow-persisted list of preset entries (plain text + weight slider, reorderable, individually toggleable) into the positive prompt before or after the user text, then applies per-token attention weighting: a weight >1 adds a positive bias to that token's attention logits, <1 scales its value vector (0 removes it, negatives subtract the concept), and 1 is neutral; every occurrence of the matched phrase is weighted. `(phrase:weight)` syntax in the prompt text still works and is located together with the preset entries. The encoded result is cached in a 4-entry LRU keyed by (CLIP, patch state, merged text), so changing only weights never re-runs the Qwen text encoder while the weights are re-applied every run.
+It only works with the official ComfyUI MOSS-Image diffusion model (it validates `diffusion_model`'s `_forward` / `layers` / `text_embedder`). Wire both the `model` and `conditioning` outputs to the sampler; when the conditioning length doesn't match, weighting is skipped with a warning. If the model supports `context_attention_bias`, the bias rides in the conditioning metadata; otherwise it is applied by an attention override in every transformer block, which also handles value scaling. This node used to live in the moss-image pack; its node type ID `MOSSImagePromptWeightPreset` and display name are unchanged, so existing workflows load as-is.
 
 ---
 

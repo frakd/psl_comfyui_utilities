@@ -11,6 +11,7 @@ from .mask_paint_output import MaskPaintOutput
 from .memory_monitor import MemoryMonitorEnd, MemoryMonitorStart
 from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
+from .prompt_weight import MOSSImagePromptWeightPreset
 from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
 from .text_container import TextContainer
@@ -37,6 +38,7 @@ _NODE_CLASSES = (
     PSLLoRAStepSchedule,
     PSLVideoCombineMemory,
     PSLAdvancedVideoMatchV2,
+    MOSSImagePromptWeightPreset,
 )
 
 NODE_CLASS_MAPPINGS = {}
