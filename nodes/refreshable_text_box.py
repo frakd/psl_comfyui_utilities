@@ -9,10 +9,11 @@
 - 后端**没有**任何「某个输入不参与缓存」的机制；IS_CHANGED 也救不了——变化的
   字面量照样进签名，它只能增加失效、不能减少。
 
-所以由 ui/refreshable_text_box.js 给文本 widget 挂 serializeValue：允许覆盖且接了
-上游时一律发送空串常量 => prompt 字节稳定 => 本节点与下游缓存不失效；锁定后才发送
-真实文本（此时失效是预期的，用户就是要让改过的文本生效）。未接上游时文本框是唯一
-内容来源，也发送真实文本，后端在 text_in 为 None 时回退输出它。
+所以由 ui/refreshable_text_box.js 给文本 widget 挂 serializeValue：允许覆盖且上游
+可用（已连接、未被静音/绕过）时一律发送空串常量 => prompt 字节稳定 => 本节点与
+下游缓存不失效；锁定后才发送真实文本（此时失效是预期的，用户就是要让改过的文本
+生效）。未接上游、或上游被静音/绕过时文本框是唯一内容来源，也发送真实文本，后端在
+text_in 为 None 时回退输出它——这两种情况仍发空串的话，节点就会什么都不输出。
 
 widget.serialize（存进工作流 json）与 widget.options.serialize（是否进 prompt）
 是两个独立开关（见前端 widgets.ts:501-512，存盘走 widget.value 而非 serializeValue），
@@ -33,9 +34,10 @@ class RefreshableTextBox(io.ComfyNode):
                 "可自刷新的文本框：运行时把上游文本刷进文本框显示，并原样输出。"
                 "「允许覆盖」开启时刷新只改显示、不改进 prompt 的值，因此本节点与下游的"
                 "运行缓存不会因为文本变化而失效；关掉（锁定）后文本框内容才会真正生效并输出。"
-                "上游没接、或上游输出 None 时不刷新，保留文本框里已有的内容；"
+                "上游没接、上游输出 None、或上游被静音/绕过时不刷新，保留文本框里已有的内容；"
                 "上游已连接并输出空串时按空串处理（清空文本框）。"
-                "允许覆盖时若未接上游，输出回退到文本框内容（此时文本框才是唯一来源）。"
+                "允许覆盖时若未接上游或上游被静音/绕过，输出回退到文本框内容"
+                "（此时文本框才是唯一来源）。"
                 "典型用法：开着允许覆盖 → 运行到此节点 → 编辑文本 → 锁定 → 再运行。"
             ),
             # 必须是输出节点：前端 isOutputNode 过滤 + 后端 execution.py:1181-1183
@@ -49,7 +51,7 @@ class RefreshableTextBox(io.ComfyNode):
                     default=None,
                     force_input=True,
                     tooltip=(
-                        "上游来的文本。不连或输出 None 时视为“没有上游内容”："
+                        "上游来的文本。不连、输出 None 或被静音/绕过时视为“没有上游内容”："
                         "不刷新文本框，输出回退到文本框内容。"
                     ),
                 ),
@@ -61,7 +63,7 @@ class RefreshableTextBox(io.ComfyNode):
                     tooltip=(
                         "文本框内容。「允许覆盖」开启时它只显示、不参与运行缓存；"
                         "锁定后它的内容会真正提交并作为本节点的输出。"
-                        "「允许覆盖」且未接上游时，它也作为输出兜底。"
+                        "「允许覆盖」且未接上游或上游被静音/绕过时，它也作为输出兜底。"
                     ),
                 ),
                 io.Boolean.Input(
@@ -69,8 +71,8 @@ class RefreshableTextBox(io.ComfyNode):
                     display_name="允许覆盖",
                     default=True,
                     tooltip=(
-                        "开启：接到上游时用上游文本刷新显示，提交给后端的值固定为空串，"
-                        "因此不会让运行缓存失效；未接上游时提交文本框真实内容并原样输出。\n"
+                        "开启：接到上游且上游可用时用上游文本刷新显示，提交给后端的值固定为空串，"
+                        "因此不会让运行缓存失效；未接上游或上游被静音/绕过时提交文本框真实内容并原样输出。\n"
                         "关闭（锁定）：文本框当前内容生效并输出，切换这一下会让缓存从本节点起失效一次"
                         "（这是预期的——你就是要让新文本生效）。"
                     ),
@@ -83,8 +85,9 @@ class RefreshableTextBox(io.ComfyNode):
 
     @classmethod
     def execute(cls, text_in=None, locked_text="", allow_overwrite=True):
-        # 允许覆盖：上游有文本（非 None）就用上游；未接上游 / 上游输出 None 时
-        # 回退到文本框内容。锁定：只用文本框内容。
+        # 允许覆盖：上游有文本（非 None）就用上游；未接上游 / 上游输出 None
+        # （包含被静音、被绕过且没有同类型输入）时回退到文本框内容。
+        # 锁定：只用文本框内容。
         text = text_in if (allow_overwrite and text_in is not None) else locked_text
         # ui 回传原始上游值：None 表示“没有内容”，前端据此保留文本框显示。
         # 不能回传 text —— 允许覆盖且接了上游时它是空串常量，前端会误判成清空。

@@ -2,9 +2,10 @@ import { app } from '../../scripts/app.js';
 
 // ============================================================
 //  Refreshable Text Box — 自刷新文本框
-//  核心是 serializeValue：接了上游且允许覆盖时，发给后端的值恒为空串常量，
-//  于是 prompt 字节稳定、运行缓存不失效；未接上游时文本框是唯一内容来源，
-//  发送真实文本并作为输出兜底；锁定后同样发送真实文本。
+//  核心是 serializeValue：接了上游、上游可用（未被静音/绕过）且允许覆盖时，
+//  发给后端的值恒为空串常量，于是 prompt 字节稳定、运行缓存不失效；
+//  未接上游或上游被静音/绕过时文本框是唯一内容来源，发送真实文本并作为输出兜底；
+//  锁定后同样发送真实文本。
 //
 //  按钮区是 DOM widget（2×2 网格，serialize:false，不进 prompt/工作流）：
 //    第一行  锁定开关 + 还原上游（状态类操作）
@@ -127,13 +128,49 @@ app.registerExtension({
                 : node.inputs[slot].link != null;
         }
 
-        // 未锁定（允许覆盖）：接了上游就发送常量空串，prompt 字节稳定、缓存不失效；
-        // 没接上游则发送真实文本，让后端把文本框内容作为输出兜底——此时文本框
-        // 就是唯一内容来源，编辑它本来就应该让下游重跑。
+        // text_in 的直接上游节点。槽位要现查，和 textInConnected 同理。
+        function upstreamOriginNode() {
+            const slot = node.inputs?.findIndex((i) => i.name === 'text_in') ?? -1;
+            if (slot < 0) return null;
+            let link = null;
+            if (typeof node.getInputLink === 'function') {
+                link = node.getInputLink(slot);
+            } else {
+                const linkId = node.inputs?.[slot]?.link;
+                if (linkId != null) {
+                    const links = node.graph?.links;
+                    link = typeof links?.get === 'function' ? links.get(linkId) : links?.[linkId];
+                }
+            }
+            if (!link) return null;
+            return node.graph?.getNodeById?.(link.origin_id) ?? app.graph?.getNodeById?.(link.origin_id) ?? null;
+        }
+
+        // 上游被静音/绕过时 ComfyUI 不会给 text_in 任何值：静音节点不产出，
+        // 绕过只透传同类型输入。后端拿到的是 None，此时若仍发空串常量，
+        // 输出就会是空串；所以按“没有上游内容”处理，改发文本框真实内容兜底。
+        // 判定只走一层，和 Text Container 保持一致；绕过即使透传出文本，
+        // 后端也优先用非 None 的 text_in，输出仍然正确。
+        function upstreamBlocked() {
+            const origin = upstreamOriginNode();
+            if (!origin) return false;
+            // LiteGraph 的 NEVER=2（静音）、BYPASS=4（绕过）。
+            const neverMode = typeof LiteGraph !== 'undefined' && Number.isFinite(LiteGraph.NEVER) ? LiteGraph.NEVER : 2;
+            const bypassMode = typeof LiteGraph !== 'undefined' && Number.isFinite(LiteGraph.BYPASS) ? LiteGraph.BYPASS : 4;
+            return origin.mode === neverMode || origin.mode === bypassMode;
+        }
+
+        function upstreamActive() {
+            return textInConnected() && !upstreamBlocked();
+        }
+
+        // 未锁定（允许覆盖）：上游可用时发送常量空串，prompt 字节稳定、缓存不失效；
+        // 没接上游或被静音/绕过则发送真实文本，让后端把文本框内容作为输出兜底——
+        // 此时文本框就是唯一内容来源，编辑它本来就应该让下游重跑。
         // 锁定后发送真实文本，此时缓存从本节点起失效一次是预期行为。
         textW.serializeValue = () => {
             if (!lockW.value) return textW.value;   // 锁定：真实文本生效
-            return textInConnected() ? '' : textW.value;
+            return upstreamActive() ? '' : textW.value;
         };
 
         // ---------- 按钮区（DOM widget，2×2） ----------
