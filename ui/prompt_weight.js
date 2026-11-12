@@ -15,7 +15,17 @@ const ROW_H = 27;
 const ADD_H = 24;
 const WIDGET_MIN_H = 40;
 const WIDGET_SLACK = 24;
+// The edit options only matter with a reference image; until one is wired the
+// node behaves like the plain text preset node.
+const EDIT_WIDGETS = ["edit_format", "image_strength"];
+const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
 let styleReady = false;
+
+function hasConnectedImage(node) {
+  return (node.inputs || []).some(
+    (input) => input && IMAGE_INPUT_RE.test(input.name || "") && input.link != null
+  );
+}
 
 function injectStyle() {
   if (styleReady || document.getElementById("moss-pw-style")) return;
@@ -261,6 +271,57 @@ function setup(node) {
       fitGrow = false;
       requestAnimationFrame(correctOverflow);
     });
+  }
+
+  function setWidgetShown(widget, shown) {
+    if (!widget) return false;
+    // Standard widgets have no computeSize at all, so `in` is the sentinel:
+    // storing `undefined` and checking `=== undefined` would latch the hidden
+    // function as the "original" size.
+    if (!("_pslComputeSize" in widget)) widget._pslComputeSize = widget.computeSize;
+    const hide = !shown;
+    if (Boolean(widget._pslHidden) === hide) return false;
+    widget._pslHidden = hide;
+    widget.computeSize = hide ? () => [0, -4] : widget._pslComputeSize;
+    return true;
+  }
+
+  let settleTimer = null;
+
+  // computeSize lags a widget visibility flip by a frame or two, so a single
+  // fit can lock the wrong height. Poll a few short rounds until it stops moving.
+  function settleEditLayout(attempts = 5) {
+    if (settleTimer) {
+      clearTimeout(settleTimer);
+      settleTimer = null;
+    }
+    const step = (left) => {
+      if (!node.graph) return;
+      const width = node.size?.[0];
+      if (!Number.isFinite(width) || width <= 0) return;
+      const total = node.computeSize?.([width, 0]);
+      const height = Array.isArray(total) ? total[1] : null;
+      if (Number.isFinite(height) && height > 0 && Math.abs(height - node.size[1]) > 0.5) {
+        node.size = [width, height];
+        node.graph.setDirtyCanvas(true, true);
+      }
+      if (left > 1) settleTimer = setTimeout(() => step(left - 1), 40);
+    };
+    step(attempts);
+  }
+
+  function refreshEditWidgets() {
+    const show = hasConnectedImage(node);
+    let changed = false;
+    for (const name of EDIT_WIDGETS) {
+      const widget = node.widgets?.find((candidate) => candidate.name === name);
+      changed = setWidgetShown(widget, show) || changed;
+    }
+    if (!changed) return;
+    lastFitH = 0;
+    scheduleFit();
+    settleEditLayout();
+    node.graph?.setDirtyCanvas(true, true);
   }
 
   function commit() {
@@ -650,9 +711,10 @@ function setup(node) {
     scheduleFit();
   }
 
-  node._mossPresetUI = { restore };
+  node._mossPresetUI = { restore, refreshEditWidgets };
   render();
   commit();
+  refreshEditWidgets();
   if (node.size) node.setSize?.([Math.max(node.size[0], 380), node.size[1]]);
 
   if (typeof ResizeObserver === "function") {
@@ -661,6 +723,10 @@ function setup(node) {
     const previousRemoved = node.onRemoved;
     node.onRemoved = function () {
       observer.disconnect();
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
       document.querySelectorAll(".moss-pw-ghost").forEach((ghost) => ghost.remove());
       return previousRemoved?.apply(this, arguments);
     };
@@ -686,6 +752,21 @@ app.registerExtension({
       if (!this._mossPresetUI) setup(this);
       this._mossPresetUI?.restore(arguments[0]);
       if (this.size) this.setSize?.([Math.max(this.size[0], 380), this.size[1]]);
+      // Links are restored before onConfigure, but autogrow groups may settle
+      // on the next frame; refresh once now and once after the frame.
+      this._mossPresetUI?.refreshEditWidgets?.();
+      requestAnimationFrame(() => this._mossPresetUI?.refreshEditWidgets?.());
+      return result;
+    };
+
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function (type, slot, connected, linkInfo, input) {
+      const result = onConnectionsChange?.apply(this, arguments);
+      if (type === (typeof LiteGraph !== "undefined" ? LiteGraph.INPUT : 1)) {
+        const refresh = () => this._mossPresetUI?.refreshEditWidgets?.();
+        refresh();
+        requestAnimationFrame(refresh);
+      }
       return result;
     };
   },

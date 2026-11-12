@@ -27,8 +27,12 @@ _MISS = object()
 _CACHE = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 
+# Expanded vision tokens occupy several positions; the marker keeps them from
+# ever matching a phrase while preserving one list index per conditioning row.
+_VISION_SLOT = -1
 
-def _cache_key(clip, text):
+
+def _cache_key(clip, text, extra=()):
     patcher = getattr(clip, "patcher", None)
     patches = getattr(patcher, "patches", None)
     try:
@@ -41,6 +45,7 @@ def _cache_key(clip, text):
         getattr(patcher, "patches_uuid", None),
         patch_count,
         text,
+        tuple(extra),
     )
 
 
@@ -56,28 +61,31 @@ def _conditioning_has_hooks(conditioning):
     return False
 
 
-def _cache_get(clip, text):
-    key = _cache_key(clip, text)
+def _cache_get(clip, text, extra, identity):
+    key = _cache_key(clip, text, extra)
     with _CACHE_LOCK:
         entry = _CACHE.get(key)
         if entry is None:
             return _MISS
-        clip_ref, value = entry
-        if clip_ref() is not clip:
+        clip_ref, identity_refs, value = entry
+        # An id() key alone can alias a recycled object, so the weakrefs must
+        # still resolve to the exact tensors (or CLIP) that produced the entry.
+        if clip_ref() is not clip or any(ref() is not obj for ref, obj in zip(identity_refs, identity)):
             _CACHE.pop(key, None)
             return _MISS
         _CACHE.move_to_end(key)
         return value
 
 
-def _cache_put(clip, text, value):
+def _cache_put(clip, text, value, extra, identity):
     try:
         clip_ref = weakref.ref(clip)
+        identity_refs = [weakref.ref(obj) for obj in identity]
     except TypeError:
         return
-    key = _cache_key(clip, text)
+    key = _cache_key(clip, text, extra)
     with _CACHE_LOCK:
-        _CACHE[key] = (clip_ref, value)
+        _CACHE[key] = (clip_ref, identity_refs, value)
         _CACHE.move_to_end(key)
         while len(_CACHE) > _MAX_CACHE_ENTRIES:
             _CACHE.popitem(last=False)
@@ -88,21 +96,45 @@ def clear_cache():
         _CACHE.clear()
 
 
-def _encode_cached(clip, text, enabled):
-    tokens = clip.tokenize(text)
-    ids = _token_ids(tokens)
-    if enabled:
-        cached = _cache_get(clip, text)
+def _token_entries(tokens):
+    key = next(iter(tokens))
+    return tokens[key][0]
+
+
+def _expand_entries(entries, vision_slots=None):
+    """Token ids with every vision entry expanded into its conditioning slots.
+
+    Returns None when a vision entry is present but its slot count is unknown;
+    positions would then be wrong, so the caller must skip weighting.
+    """
+    ids = []
+    for entry in entries:
+        token = entry[0]
+        if not isinstance(token, dict):
+            ids.append(token)
+            continue
+        count = vision_slots(token) if vision_slots is not None else None
+        if not isinstance(count, int) or count < 1:
+            return None
+        ids.extend([_VISION_SLOT] * count)
+    return ids
+
+
+def _encode_cached(clip, text, enabled, images=None, vision_slots=None, extra=(), identity=()):
+    tokens = clip.tokenize(text, images=list(images)) if images else clip.tokenize(text)
+    ids = _expand_entries(_token_entries(tokens), vision_slots)
+    if enabled and ids is not None:
+        cached = _cache_get(clip, text, extra, identity)
         if cached is not _MISS:
             cond, cached_ids, cond_len = cached
-            # Re-tokenizing is cheap; a changed tokenizer/template must not
-            # return a conditioning computed from the old token ids.
+            # Re-tokenizing is cheap; a changed tokenizer/template or a
+            # different image must not return the old conditioning.
             if cached_ids == ids:
                 return cached
     cond = clip.encode_from_tokens_scheduled(tokens)
     cond_len = cond[0][0].shape[1]
-    if enabled and not _conditioning_has_hooks(cond):
-        _cache_put(clip, text, (cond, ids, cond_len))
+    if enabled and ids is not None and not _conditioning_has_hooks(cond):
+        _cache_put(clip, text, (cond, ids, cond_len), extra, identity)
     return cond, ids, cond_len
 
 
@@ -242,16 +274,23 @@ def _phrase_candidates(clip, phrase, specials=SPECIALS):
     return candidates
 
 
-def locate_pairs(clip, merged_text, terms, specials=SPECIALS, cache=True):
-    """Encode the merged text and locate every phrase's conditioning positions.
+def encode_layout(clip, text, cache=True, images=None, vision_slots=None,
+                  extra=(), identity=()):
+    """Tokenize (optionally with images), encode, and expand the token layout.
 
-    The encoder result is cached by (CLIP object, patch state, merged text);
-    cache=False forces a fresh encode. Returns
-    (conditioning, [(position, value_factor, logit_bias)], text_length).
+    `images` are passed to `clip.tokenize` as vision inputs; `vision_slots`
+    maps a vision token to the number of conditioning positions it occupies.
+    The result is cached by (CLIP, patch state, text, extra) and identity-checked
+    against the CLIP object and `identity` tensors. Returns
+    (conditioning, expanded token ids or None, conditioning length).
     """
-    cond, ids, cond_len = _encode_cached(clip, merged_text, cache)
+    return _encode_cached(clip, text, cache, images, vision_slots, extra, identity)
+
+
+def positions_from_ids(clip, ids, cond_len, terms, specials=SPECIALS):
+    """[(position, value_factor, logit_bias)] for every phrase occurrence."""
     if not ids:
-        return cond, [], cond_len
+        return []
 
     visible_start = max(0, len(ids) - cond_len)
     start, end = _user_span(ids, specials)
@@ -275,4 +314,27 @@ def locate_pairs(clip, merged_text, terms, specials=SPECIALS, cache=True):
         value_factor, logit_bias = weight_pair(weight)
         pairs.extend((position, value_factor, logit_bias) for position in positions)
 
-    return cond, merge_pairs(pairs), cond_len
+    return merge_pairs(pairs)
+
+
+def locate_pairs(clip, merged_text, terms, specials=SPECIALS, cache=True, images=None,
+                 vision_slots=None, cache_extra=(), cache_identity=()):
+    """Encode the merged text and locate every phrase's conditioning positions.
+
+    The encoder result is cached by (CLIP object, patch state, merged text,
+    cache_extra); cache=False forces a fresh encode. When vision images are
+    used, the expanded layout must match the conditioning length exactly,
+    otherwise weighting is skipped. Returns
+    (conditioning, [(position, value_factor, logit_bias)], text_length).
+    """
+    cond, ids, cond_len = encode_layout(clip, merged_text, cache=cache, images=images,
+                                        vision_slots=vision_slots, extra=cache_extra,
+                                        identity=cache_identity)
+    if ids is None:
+        _warn("the prompt contains vision tokens this node cannot measure; weighting skipped")
+        return cond, [], cond_len
+    if vision_slots is not None and len(ids) != cond_len:
+        _warn(f"expanded prompt has {len(ids)} positions but the conditioning has {cond_len}; "
+              "weighting skipped")
+        return cond, [], cond_len
+    return cond, positions_from_ids(clip, ids, cond_len, terms, specials), cond_len

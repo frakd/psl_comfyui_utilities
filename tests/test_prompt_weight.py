@@ -183,6 +183,79 @@ core.locate_pairs(changing, "a photo of a cat", [])
 check("tokenizer 变化时缓存重新编码", changing.encode_calls == 2, str(changing.encode_calls))
 
 
+# ---------- 视觉 token 展开（编辑参考图） ----------
+class VisionFakeClip(FakeClip):
+    """每个 image 在模板位置插入一个 dict 条目，占 slots 个 conditioning 位置。"""
+
+    def __init__(self, slots=5, trim=0):
+        super().__init__()
+        self.slots = slots
+        self.trim = trim
+
+    def tokenize(self, text, images=None):
+        tokens = super().tokenize(text)
+        if not images:
+            return tokens
+        seq = tokens["fake"][0]
+        insert = 3
+        for image in images:
+            seq.insert(insert, ({"type": "image", "data": image, "slots": self.slots}, 1.0, 0))
+            insert += 1
+        return tokens
+
+    def encode_from_tokens_scheduled(self, tokens):
+        self.encode_calls += 1
+        length = 0
+        for entry in tokens["fake"][0]:
+            token = entry[0]
+            length += token["slots"] if isinstance(token, dict) else 1
+        return [[FakeTensor(length - self.trim), {}]]
+
+
+def slots_of(token):
+    return token["slots"]
+
+
+def image_key(image):
+    return (id(image), tuple(image.shape))
+
+
+vision_clip = VisionFakeClip()
+image = FakeTensor(5)
+cond, pairs, cond_len = core.locate_pairs(
+    vision_clip, "a cat blurry", [("a cat", 2.0), ("blurry", 0.5)],
+    images=[image], vision_slots=slots_of,
+    cache_extra=(image_key(image),), cache_identity=(image,),
+)
+check("视觉槽位展开后短语位置后移",
+      pairs == [(8, 1.0, 2.0), (9, 1.0, 2.0), (10, 0.5, 0.0)], repr(pairs))
+check("展开长度等于 conditioning 长度", cond_len == 18, str(cond_len))
+
+core.clear_cache()
+cached_clip = VisionFakeClip()
+core.locate_pairs(cached_clip, "a cat", [("a cat", 2.0)], images=[image], vision_slots=slots_of,
+                  cache_extra=(image_key(image),), cache_identity=(image,))
+core.locate_pairs(cached_clip, "a cat", [("a cat", 2.0)], images=[image], vision_slots=slots_of,
+                  cache_extra=(image_key(image),), cache_identity=(image,))
+check("同一图片命中编码缓存", cached_clip.encode_calls == 1, str(cached_clip.encode_calls))
+
+other = FakeTensor(5)
+core.locate_pairs(cached_clip, "a cat", [("a cat", 2.0)], images=[other], vision_slots=slots_of,
+                  cache_extra=(image_key(other),), cache_identity=(other,))
+check("不同图片不复用缓存", cached_clip.encode_calls == 2, str(cached_clip.encode_calls))
+
+trimmed = VisionFakeClip(trim=1)
+_, trimmed_pairs, trimmed_len = core.locate_pairs(
+    trimmed, "a cat", [("a cat", 2.0)], images=[FakeTensor(5)], vision_slots=slots_of,
+)
+check("展开长度与 conditioning 不一致时不施加权重", trimmed_pairs == [], repr(trimmed_pairs))
+check("不一致时仍返回 condition 长度", trimmed_len > 0, str(trimmed_len))
+
+unknown_clip = VisionFakeClip()
+_, unknown_pairs, _ = core.locate_pairs(unknown_clip, "a cat", [("a cat", 2.0)], images=[FakeTensor(5)])
+check("无法测量视觉槽位时不施加权重", unknown_pairs == [], repr(unknown_pairs))
+
+
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
     raise SystemExit(1)

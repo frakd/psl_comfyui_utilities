@@ -10,21 +10,48 @@ prompt, then applies per-token attention weighting:
 The conditioning carries the emphasis bias through `context_attention_bias`
 when the core model supports it; value scaling is applied by an attention
 override inside every transformer block.
+
+Optional edit inputs mirror the official TextEncodeMOSSImageEdit node: images
+can be sent to the text encoder as vision tokens (with the same "Picture N:"
+prefix and 384 px cap) and, when a VAE is wired, encoded as reference latents
+for the edit LoRA. The per-token weights ride in the same attention bias as
+the official image_strength, so text weighting and image conditioning apply
+together.
 """
 
 import inspect
 import logging
+import math
 
 import comfy.patcher_extension
 import torch
 
 from comfy_api.latest import io
 
-from .prompt_weight_core import extract_weighted_terms, locate_pairs, merge_prompt, parse_presets
+from .prompt_weight_core import (
+    encode_layout,
+    extract_weighted_terms,
+    merge_prompt,
+    parse_presets,
+    positions_from_ids,
+)
+
+try:
+    from comfy_extras.nodes_moss_image import EDIT_FORMATS
+except ImportError:  # unit tests run without ComfyUI's comfy_extras on sys.path
+    EDIT_FORMATS = {
+        "ai-toolkit": ("index_timestep_zero_isolated", True),
+        "ai-toolkit (kv_cache off)": ("index_timestep_zero", True),
+        "Moss-Image-Edit": ("index_timestep_zero_text_start", False),
+    }
 
 _NODE = "MOSSImagePromptWeightPreset"
 _WRAPPER_KEY = _NODE
 _STATE_KEY = "moss_prompt_preset"
+
+_VISION_SIZE = 384
+_VISION_PREFIX = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+_DEFAULT_EDIT_FORMAT = "Moss-Image-Edit"
 
 
 def _positive_rows(transformer_options, batch):
@@ -42,6 +69,71 @@ def _has_context_bias(diffusion_model):
         return "context_attention_bias" in inspect.signature(type(diffusion_model)._forward).parameters
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _collect_images(images):
+    if not isinstance(images, dict):
+        return []
+    return [images[name] for name in sorted(images) if images.get(name) is not None]
+
+
+def _resize_for_vision(image):
+    import comfy.utils
+
+    # The text encoder sees each reference downscaled to at most 384x384 pixels,
+    # exactly like the official editor.
+    scale = min(1.0, math.sqrt(_VISION_SIZE * _VISION_SIZE / (image.shape[1] * image.shape[2])))
+    return comfy.utils.common_upscale(
+        image.movedim(-1, 1), round(image.shape[2] * scale), round(image.shape[1] * scale), "area", "disabled"
+    ).movedim(1, -1)
+
+
+def _vision_slot_counter():
+    import comfy.text_encoders.qwen_vl
+
+    counts = {}
+
+    def slots(token):
+        data = token.get("data")
+        if not torch.is_tensor(data):
+            return None
+        key = (id(data), tuple(data.shape))
+        if key in counts:
+            return counts[key]
+        try:
+            # Qwen3.5 merges 2x2 patches of 16 px into one conditioning token.
+            _, grid = comfy.text_encoders.qwen_vl.process_qwen2vl_images(data, patch_size=16)
+            count = int(grid[0, 1] * grid[0, 2]) // 4
+        except Exception as exc:
+            counts[key] = None
+            logging.warning(f"{_NODE}: cannot measure a vision token ({exc}); per-token weighting skipped")
+            return None
+        counts[key] = count
+        return count
+
+    return slots
+
+
+def _image_bias(ids, strength):
+    if not ids or strength == 1.0:
+        return None
+    weight = math.log(strength)
+    if not math.isfinite(weight):
+        return None
+    # Vision slots are the only negative markers in the expanded layout; log()
+    # scales their attention share, text tokens stay unbiased here.
+    return torch.tensor([[weight if slot < 0 else 0.0 for slot in ids]])
+
+
+def _attach_references(cond, vae, images, method):
+    if vae is None or not images:
+        return cond
+    import node_helpers
+
+    refs = [vae.encode(image[:, :, :, :3]) for image in images]
+    return node_helpers.conditioning_set_values(
+        cond, {"reference_latents": refs, "reference_latents_method": method}
+    )
 
 
 def _make_forward_wrapper(pairs, text_len):
@@ -188,8 +280,10 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                         "applies KJ-style per-token attention weighting; weights apply to every occurrence of the "
                         "matched phrase. Entry weight 1 = neutral, >1 emphasizes, <1 weakens, 0 removes, <0 "
                         "subtracts the concept. The merged-text encoding is cached by CLIP, patch state and text, "
-                        "so upstream re-runs skip the text encoder while weight changes still apply. Requires the "
-                        "official ComfyUI MOSS-Image model; wire both model and conditioning outputs to the sampler.",
+                        "so upstream re-runs skip the text encoder while weight changes still apply. Optional "
+                        "images/vae/edit_format/image_strength mirror the official TextEncodeMOSSImageEdit node, so "
+                        "text weighting and image conditioning apply in one node. Requires the official ComfyUI "
+                        "MOSS-Image model; wire both model and conditioning outputs to the sampler.",
             inputs=[
                 io.Clip.Input("clip"),
                 io.Model.Input("model"),
@@ -203,17 +297,71 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                                        "只改预设权重不会使缓存失效，权重仍会重新计算并施加。"),
                 io.String.Input("presets_data", default="[]", socketless=True, advanced=True,
                                 tooltip="由节点前端管理的 JSON 条目列表 [{enabled, text, weight}]；text 是纯文本，weight 由滑块设置（-2..2，负值反向缩放 value 以抑制概念），一般不需要手动修改。"),
+                io.Vae.Input("vae", optional=True,
+                             tooltip="可选。接入后参考图会编码成 reference latents 供编辑 LoRA 使用；不接则图片只进入文本编码器（与官方编辑节点一致）。"),
+                io.Combo.Input("edit_format", display_name="编辑格式", options=list(EDIT_FORMATS),
+                               default=_DEFAULT_EDIT_FORMAT,
+                               tooltip="编辑 LoRA 训练时的布局：ai-toolkit 的两种（参考图同时进入文本编码器）或 Moss-Image-Edit。"
+                                       "仅在接入图片时生效，未接图片时该选项与 image_strength 会自动隐藏。"),
+                io.Autogrow.Input("images", optional=True,
+                                  template=io.Autogrow.TemplatePrefix(input=io.Image.Input("image"),
+                                                                      prefix="image_", min=0, max=10),
+                                  tooltip="可选。参考图按接入尺寸使用，建议先缩放；文本编码器看到的是缩到最长边 384 像素的副本。"),
+                io.Float.Input("image_strength", default=1.0, min=0.0, max=100.0, step=0.05,
+                               tooltip="图片在文本编码器注意力里的权重（ai-toolkit 格式，或不接 VAE 时）：0 忽略，1 不变，>1 强调。"
+                                       "Moss-Image-Edit 格式下图片不进入文本编码器，该值不生效。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="conditioning")],
         )
 
     @classmethod
-    def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]"):
+    def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
+                vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
-        cond, pairs, cond_len = locate_pairs(clip, merged, user_terms + entries, cache=cache_mode == "enabled")
+
+        image_list = _collect_images(images)
+        method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])
+        strength = float(image_strength)
+        # ai-toolkit formats, or a missing VAE, send the images through the text
+        # encoder; strength 0 removes them there entirely.
+        use_vision = bool(image_list) and (vision or vae is None) and strength > 0.0
+
+        prompt = merged
+        vl = []
+        slots = None
+        cache_extra = ()
+        cache_identity = ()
+        if image_list:
+            cache_extra = (str(edit_format), len(image_list),
+                           tuple((id(image), tuple(image.shape)) for image in image_list))
+            cache_identity = tuple(image_list)
+        if use_vision:
+            vl = [_resize_for_vision(image) for image in image_list]
+            prompt = "".join(_VISION_PREFIX.format(index + 1) for index in range(len(vl))) + merged
+            slots = _vision_slot_counter()
+
+        cond, ids, cond_len = encode_layout(
+            clip, prompt, cache=cache_mode == "enabled", images=vl or None,
+            vision_slots=slots, extra=cache_extra, identity=cache_identity,
+        )
+        layout_ok = ids is not None and (slots is None or len(ids) == cond_len)
+        if ids is None:
+            logging.warning(f"{_NODE}: the prompt contains vision tokens this node cannot measure; "
+                            "per-token weighting skipped")
+        elif not layout_ok:
+            logging.warning(f"{_NODE}: expanded prompt has {len(ids)} positions but the conditioning has "
+                            f"{cond_len}; per-token weighting skipped")
+        if vl and layout_ok:
+            bias = _image_bias(ids, strength)
+            if bias is not None:
+                import node_helpers
+                cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": bias})
+        cond = _attach_references(cond, vae, image_list, method)
+
+        pairs = positions_from_ids(clip, ids, cond_len, user_terms + entries) if layout_ok else []
         if not pairs:
             return io.NodeOutput(model, cond)
 
