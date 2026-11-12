@@ -17,7 +17,7 @@ const WIDGET_MIN_H = 40;
 const WIDGET_SLACK = 24;
 // The edit options only matter with a reference image; until one is wired the
 // node behaves like the plain text preset node.
-const EDIT_WIDGETS = ["edit_format", "image_strength"];
+const EDIT_WIDGETS = ["edit_format", "image_strength", "index_reference"];
 const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
 const DEFAULT_EDIT_FORMAT = "Moss-Image-Edit";
 let styleReady = false;

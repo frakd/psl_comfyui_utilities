@@ -92,6 +92,13 @@ check("4D v [B,N,H,D] 保持兼容",
       [round(v4[0, i, 0, 0].item(), 3) for i in range(8)] == [1.0, 1.0, 1.0, 0.5, 0.25, 0.1, 0.0, 1.0],
       repr([round(v4[0, i, 0, 0].item(), 3) for i in range(8)]))
 
+check("默认编辑格式映射", mod._reference_method("Moss-Image-Edit", False) == ("index_timestep_zero_text_start", False),
+      repr(mod._reference_method("Moss-Image-Edit", False)))
+check("实验开关改为 index 方法", mod._reference_method("ai-toolkit", True) == ("index", True),
+      repr(mod._reference_method("ai-toolkit", True)))
+check("未知格式退回默认", mod._reference_method("bogus", False)[0] == "index_timestep_zero_text_start",
+      repr(mod._reference_method("bogus", False)))
+
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
     raise SystemExit(1)
