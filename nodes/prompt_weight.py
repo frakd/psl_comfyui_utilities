@@ -33,6 +33,7 @@ from .prompt_weight_core import (
     extract_weighted_terms,
     merge_prompt,
     parse_presets,
+    parse_strength_schedule,
     positions_from_ids,
 )
 
@@ -117,7 +118,9 @@ def _vision_slot_counter():
 def _image_bias(ids, strength):
     if not ids or strength == 1.0:
         return None
-    weight = math.log(strength)
+    # A zero strength inside a schedule keeps the vision tokens in the context
+    # but mutes them; log(0) is -inf, so floor it instead.
+    weight = math.log(strength) if strength > 0.0 else math.log(1e-6)
     if not math.isfinite(weight):
         return None
     # Vision slots are the only negative markers in the expanded layout; log()
@@ -239,34 +242,22 @@ def _patch_model(model, pairs, text_len):
     return patched
 
 
-def _apply_conditioning_bias(cond, pairs, cond_len):
-    bias_terms = [(position, bias) for position, _, bias in pairs if bias != 0.0]
-    if not bias_terms:
-        return cond, pairs
+def _bias_tensor(pairs, cond_len):
+    terms = [(position, bias) for position, _, bias in pairs if bias != 0.0]
+    if not terms:
+        return None
     added = torch.zeros(1, cond_len)
-    for position, value in bias_terms:
+    for position, value in terms:
         added[0, position] = value
+    return added
 
-    combined = []
-    for tensor, metadata in cond:
-        metadata = dict(metadata) if isinstance(metadata, dict) else {}
-        existing = metadata.get("context_attention_bias")
-        if torch.is_tensor(existing):
-            if existing.shape[-1] == added.shape[-1]:
-                # The official edit encoder also uses this field for image_strength;
-                # both biases are additive, so keep both.
-                metadata["context_attention_bias"] = existing.to(added.dtype) + added.to(existing.device)
-            else:
-                logging.warning(f"{_NODE}: existing context_attention_bias has length {existing.shape[-1]}, "
-                                f"expected {added.shape[-1]}; replacing it")
-                metadata["context_attention_bias"] = added
-        elif existing is not None:
-            logging.warning(f"{_NODE}: existing context_attention_bias is not a tensor; replacing it")
-            metadata["context_attention_bias"] = added
-        else:
-            metadata["context_attention_bias"] = added
-        combined.append([tensor, metadata])
-    return combined, [(position, factor, 0.0) for position, factor, _ in pairs if factor != 1.0]
+
+def _sum_bias(first, second):
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return first + second
 
 
 class MOSSImagePromptWeightPreset(io.ComfyNode):
@@ -282,8 +273,9 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                         "subtracts the concept. The merged-text encoding is cached by CLIP, patch state and text, "
                         "so upstream re-runs skip the text encoder while weight changes still apply. Optional "
                         "images/vae/edit_format/image_strength mirror the official TextEncodeMOSSImageEdit node, so "
-                        "text weighting and image conditioning apply in one node. Requires the official ComfyUI "
-                        "MOSS-Image model; wire both model and conditioning outputs to the sampler.",
+                        "text weighting and image conditioning apply in one node; strength_schedule splits "
+                        "image_strength into equal Sigma-percent slices of the sampling trajectory. Requires the "
+                        "official ComfyUI MOSS-Image model; wire both model and conditioning outputs to the sampler.",
             inputs=[
                 io.Clip.Input("clip"),
                 io.Model.Input("model"),
@@ -310,6 +302,11 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                 io.Float.Input("image_strength", default=1.0, min=0.0, max=100.0, step=0.05,
                                tooltip="图片在文本编码器注意力里的权重（ai-toolkit 格式，或不接 VAE 时）：0 忽略，1 不变，>1 强调。"
                                        "Moss-Image-Edit 格式下图片不进入文本编码器，该值不生效。"),
+                io.String.Input("strength_schedule", display_name="强度分段(列表)", default="",
+                                tooltip="可选。填数字列表（JSON），如 [0.3, 0.6, 1.2]：把整条采样轨迹等分成 3 段，"
+                                        "第 1 段用 0.3、第 2 段 0.6、第 3 段 1.2；不需要知道总步数（按 sigma 百分比等分，"
+                                        "换步数自动适配）。留空则全程使用上面的 image_strength。只在文本编码器视觉通道"
+                                        "（ai-toolkit 格式，或不接 VAE）生效，VAE 参考 latent 通道不受影响。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="conditioning")],
@@ -317,7 +314,8 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
-                vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0):
+                vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0,
+                strength_schedule=""):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
@@ -325,9 +323,12 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
         image_list = _collect_images(images)
         method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])
         strength = float(image_strength)
+        schedule = parse_strength_schedule(strength_schedule)
         # ai-toolkit formats, or a missing VAE, send the images through the text
-        # encoder; strength 0 removes them there entirely.
-        use_vision = bool(image_list) and (vision or vae is None) and strength > 0.0
+        # encoder; strength 0 removes them there entirely unless the schedule
+        # turns them back on for a later segment.
+        wants_vision = strength > 0.0 or any(value > 0.0 for _, _, value in schedule)
+        use_vision = bool(image_list) and (vision or vae is None) and wants_vision
 
         prompt = merged
         vl = []
@@ -354,26 +355,56 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
         elif not layout_ok:
             logging.warning(f"{_NODE}: expanded prompt has {len(ids)} positions but the conditioning has "
                             f"{cond_len}; per-token weighting skipped")
-        if vl and layout_ok:
-            bias = _image_bias(ids, strength)
-            if bias is not None:
-                import node_helpers
-                cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": bias})
-        cond = _attach_references(cond, vae, image_list, method)
 
+        if schedule and not layout_ok:
+            logging.warning(f"{_NODE}: strength_schedule cannot be applied because the vision layout "
+                            "is unknown; schedule ignored")
+            schedule = []
+        if schedule and not use_vision:
+            logging.warning(f"{_NODE}: strength_schedule only affects the text-encoder vision path "
+                            "(ai-toolkit formats, or no VAE); schedule ignored")
+            schedule = []
+
+        image_bias = _image_bias(ids, strength) if vl and layout_ok else None
         pairs = positions_from_ids(clip, ids, cond_len, user_terms + entries) if layout_ok else []
+        text_bias = _bias_tensor(pairs, cond_len)
+
+        diffusion_model = model.get_model_object("diffusion_model") if model is not None else None
+        supports_bias = diffusion_model is not None and _has_context_bias(diffusion_model)
+        if schedule and not supports_bias:
+            logging.warning(f"{_NODE}: strength_schedule needs the official MOSS model "
+                            "(context_attention_bias support); schedule ignored")
+            schedule = []
+        if supports_bias:
+            import node_helpers
+
+            base = _sum_bias(image_bias, text_bias)
+            if base is not None:
+                cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": base})
+            if schedule:
+                for start, end, value in schedule:
+                    segment = _sum_bias(_image_bias(ids, value), text_bias)
+                    cond = node_helpers.conditioning_set_values_with_timestep_range(
+                        cond, {"context_attention_bias": segment}, start, end
+                    )
+                logging.info("%s: image_strength scheduled over %d segments", _NODE, len(schedule))
+            # The bias now lives in the conditioning metadata; keep only the
+            # value factors for the attention override.
+            pairs = [(position, factor, 0.0) for position, factor, _ in pairs]
+        elif image_bias is not None:
+            # Non-official models ignore the field; keep the old behaviour and
+            # let the attention override handle text biases only.
+            import node_helpers
+            cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": image_bias})
+
+        cond = _attach_references(cond, vae, image_list, method)
         if not pairs:
             return io.NodeOutput(model, cond)
 
-        diffusion_model = model.get_model_object("diffusion_model")
         if (diffusion_model is None or not hasattr(diffusion_model, "_forward")
                 or not hasattr(diffusion_model, "layers") or not hasattr(diffusion_model, "text_embedder")):
             raise ValueError(f"{_NODE}: model is not the official ComfyUI MOSS-Image diffusion model; "
                              "use the official MOSS-Image loader")
 
         logging.info("%s: weighting %d text positions", _NODE, len(pairs))
-        if _has_context_bias(diffusion_model):
-            cond, pairs = _apply_conditioning_bias(cond, pairs, cond_len)
-            if not pairs:
-                return io.NodeOutput(model, cond)
         return io.NodeOutput(_patch_model(model, pairs, cond_len), cond)

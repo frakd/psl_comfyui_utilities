@@ -8,6 +8,7 @@ phrase-location logic can be unit tested. `clip` is duck-typed and only needs
 
 import json
 import logging
+import math
 import re
 import threading
 import weakref
@@ -187,6 +188,47 @@ def parse_presets(raw):
         weight = max(_MIN_ENTRY_WEIGHT, min(_MAX_ENTRY_WEIGHT, weight))
         entries.append((text, weight))
     return entries
+
+
+def parse_strength_schedule(raw):
+    """Split a list of strengths into equal trajectory slices.
+
+    [0.4, 0.8, 1.2] -> [(0.0, 1/3, 0.4), (1/3, 2/3, 0.8), (2/3, 1.0, 1.2)].
+    Empty, invalid or non-positive-length lists return []; values clamp to 0..100.
+    """
+    if isinstance(raw, (list, tuple)):
+        data = list(raw)
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            _warn(f"strength_schedule is not valid JSON ({exc}); schedule ignored")
+            return []
+    if isinstance(data, (int, float)) and not isinstance(data, bool):
+        data = [data]
+    if not isinstance(data, list):
+        _warn("strength_schedule must be a JSON list of numbers; schedule ignored")
+        return []
+
+    values = []
+    for index, item in enumerate(data):
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            _warn(f"strength_schedule entry {index} is not a number; schedule ignored")
+            return []
+        if not math.isfinite(value):
+            _warn(f"strength_schedule entry {index} is not finite; schedule ignored")
+            return []
+        values.append(max(0.0, min(100.0, value)))
+    if not values:
+        return []
+
+    width = 1.0 / len(values)
+    return [(index * width, (index + 1) * width, value) for index, value in enumerate(values)]
 
 
 def extract_weighted_terms(text):

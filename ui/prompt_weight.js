@@ -17,7 +17,7 @@ const WIDGET_MIN_H = 40;
 const WIDGET_SLACK = 24;
 // The edit options only matter with a reference image; until one is wired the
 // node behaves like the plain text preset node.
-const EDIT_WIDGETS = ["edit_format", "image_strength"];
+const EDIT_WIDGETS = ["edit_format", "image_strength", "strength_schedule"];
 const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
 const DEFAULT_EDIT_FORMAT = "Moss-Image-Edit";
 let styleReady = false;
@@ -42,6 +42,9 @@ function sanitizeEditWidgets(node) {
     const value = Number(strength.value);
     strength.value = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 1;
   }
+  // A boolean from the removed experiment switch could have landed in this slot.
+  const schedule = node.widgets?.find((widget) => widget.name === "strength_schedule");
+  if (schedule && typeof schedule.value !== "string") schedule.value = "";
 }
 
 function injectStyle() {

@@ -256,6 +256,20 @@ _, unknown_pairs, _ = core.locate_pairs(unknown_clip, "a cat", [("a cat", 2.0)],
 check("无法测量视觉槽位时不施加权重", unknown_pairs == [], repr(unknown_pairs))
 
 
+# ---------- image_strength 分段 ----------
+slices = core.parse_strength_schedule("[0.3, 0.6, 1.2]")
+check("强度分段按轨迹等分",
+      [(round(a, 3), round(b, 3), value) for a, b, value in slices]
+      == [(0.0, 0.333, 0.3), (0.333, 0.667, 0.6), (0.667, 1.0, 1.2)], repr(slices))
+check("强度分段单值等价常量", core.parse_strength_schedule("0.5") == [(0.0, 1.0, 0.5)],
+      repr(core.parse_strength_schedule("0.5")))
+check("强度分段空值", core.parse_strength_schedule("") == [])
+check("强度分段非法 JSON", core.parse_strength_schedule("{oops") == [])
+check("强度分段钳制范围", [value for _, _, value in core.parse_strength_schedule("[-1, 1000]")] == [0.0, 100.0],
+      repr(core.parse_strength_schedule("[-1, 1000]")))
+check("强度分段拒绝非数字", core.parse_strength_schedule('[1, "x"]') == [])
+
+
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
     raise SystemExit(1)

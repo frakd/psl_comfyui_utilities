@@ -92,6 +92,13 @@ check("4D v [B,N,H,D] 保持兼容",
       [round(v4[0, i, 0, 0].item(), 3) for i in range(8)] == [1.0, 1.0, 1.0, 0.5, 0.25, 0.1, 0.0, 1.0],
       repr([round(v4[0, i, 0, 0].item(), 3) for i in range(8)]))
 
+zero = mod._image_bias([-1, -1, 7], 0.0)
+check("strength 0 静音视觉槽位",
+      zero is not None and float(zero[0, 0]) < -10 and float(zero[0, 2]) == 0.0,
+      repr(zero.tolist() if zero is not None else None))
+check("bias 相加", torch.allclose(mod._sum_bias(zero, torch.ones(1, 3)), zero + 1))
+check("None 项不改变结果", mod._sum_bias(None, zero) is zero)
+
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
     raise SystemExit(1)
