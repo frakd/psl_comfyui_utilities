@@ -279,10 +279,15 @@ function setup(node) {
     // storing `undefined` and checking `=== undefined` would latch the hidden
     // function as the "original" size.
     if (!("_pslComputeSize" in widget)) widget._pslComputeSize = widget.computeSize;
+    if (!("_pslHiddenProp" in widget)) widget._pslHiddenProp = widget.hidden;
     const hide = !shown;
     if (Boolean(widget._pslHidden) === hide) return false;
     widget._pslHidden = hide;
+    // DOM/visibility-aware frontends only collapse a widget through `hidden`
+    // (computeSize alone left float widgets drawn); older frontends only honor
+    // computeSize. Set both so every surface hides the row.
     widget.computeSize = hide ? () => [0, -4] : widget._pslComputeSize;
+    widget.hidden = hide ? true : widget._pslHiddenProp;
     return true;
   }
 
