@@ -125,13 +125,6 @@ def _image_bias(ids, strength):
     return torch.tensor([[weight if slot < 0 else 0.0 for slot in ids]])
 
 
-def _reference_method(edit_format, index_reference):
-    method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])
-    # Experimental: "index" keeps the references in the sequence and modulates
-    # them at the current timestep instead of pinning them at t = 0.
-    return ("index" if index_reference else method), vision
-
-
 def _attach_references(cond, vae, images, method):
     if vae is None or not images:
         return cond
@@ -317,10 +310,6 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                 io.Float.Input("image_strength", default=1.0, min=0.0, max=100.0, step=0.05,
                                tooltip="图片在文本编码器注意力里的权重（ai-toolkit 格式，或不接 VAE 时）：0 忽略，1 不变，>1 强调。"
                                        "Moss-Image-Edit 格式下图片不进入文本编码器，该值不生效。"),
-                io.Boolean.Input("index_reference", display_name="参考随当前步调制(实验)", default=False,
-                                 tooltip="实验开关：把参考 latent 改成 ai-toolkit 的 index 方法——参考 token 留在序列里，"
-                                         "每步用当前时间步的调制重新计算，而不是固定在 t=0。预期会减弱参考图对构图的锁定，"
-                                         "但多数编辑 LoRA 没按这种方式训练，结果可能不稳定。仅接入图片和 VAE 时生效。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="conditioning")],
@@ -328,16 +317,13 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
-                vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0,
-                index_reference=False):
+                vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
 
         image_list = _collect_images(images)
-        method, vision = _reference_method(edit_format, index_reference)
-        if index_reference and image_list and vae is not None:
-            logging.info("%s: experimental reference method 'index' (current timestep modulation)", _NODE)
+        method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])
         strength = float(image_strength)
         # ai-toolkit formats, or a missing VAE, send the images through the text
         # encoder; strength 0 removes them there entirely.
