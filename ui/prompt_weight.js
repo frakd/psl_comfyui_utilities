@@ -19,12 +19,29 @@ const WIDGET_SLACK = 24;
 // node behaves like the plain text preset node.
 const EDIT_WIDGETS = ["edit_format", "image_strength"];
 const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
+const DEFAULT_EDIT_FORMAT = "Moss-Image-Edit";
 let styleReady = false;
 
 function hasConnectedImage(node) {
   return (node.inputs || []).some(
     (input) => input && IMAGE_INPUT_RE.test(input.name || "") && input.link != null
   );
+}
+
+function sanitizeEditWidgets(node) {
+  const format = node.widgets?.find((widget) => widget.name === "edit_format");
+  const values = format?.options?.values;
+  // Workflows saved before the edit inputs existed carry a stray "" (the DOM
+  // panel used to serialize one value per widget) in the slot edit_format took
+  // over; ComfyUI rejects it as an invalid combo value, so fall back to a real one.
+  if (format && Array.isArray(values) && values.length && !values.includes(format.value)) {
+    format.value = values.includes(DEFAULT_EDIT_FORMAT) ? DEFAULT_EDIT_FORMAT : values[0];
+  }
+  const strength = node.widgets?.find((widget) => widget.name === "image_strength");
+  if (strength) {
+    const value = Number(strength.value);
+    strength.value = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 1;
+  }
 }
 
 function injectStyle() {
@@ -690,15 +707,19 @@ function setup(node) {
     list.scrollTop = list.scrollHeight;
   });
 
-  node.addDOMWidget("prompt_weight_presets", "HTML", root, {
+  const panel = node.addDOMWidget("prompt_weight_presets", "HTML", root, {
     serialize: false,
     hideOnZoom: false,
     getMinHeight: contentHeight,
   });
+  // This frontend serializes `widget.serialize`, not `options.serialize`; without
+  // this the panel adds a stray "" to widgets_values and shifts every later widget.
+  panel.serialize = false;
 
   hidden.serializeValue = () => JSON.stringify(items);
 
   function restore(info) {
+    sanitizeEditWidgets(node);
     let raw = hidden.value;
     if (raw == null || raw === "") {
       for (const candidate of info?.widgets_values || []) {
@@ -717,6 +738,7 @@ function setup(node) {
   }
 
   node._mossPresetUI = { restore, refreshEditWidgets };
+  sanitizeEditWidgets(node);
   render();
   commit();
   refreshEditWidgets();
