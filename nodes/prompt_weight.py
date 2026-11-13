@@ -51,6 +51,7 @@ _WRAPPER_KEY = _NODE
 _STATE_KEY = "moss_prompt_preset"
 
 _VISION_SIZE = 384
+_VISION_SIZES = ["384", "512", "768", "1024"]
 _VISION_PREFIX = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 _DEFAULT_EDIT_FORMAT = "Moss-Image-Edit"
 
@@ -78,12 +79,13 @@ def _collect_images(images):
     return [images[name] for name in sorted(images) if images.get(name) is not None]
 
 
-def _resize_for_vision(image):
+def _resize_for_vision(image, vision_size=_VISION_SIZE):
     import comfy.utils
 
-    # The text encoder sees each reference downscaled to at most 384x384 pixels,
-    # exactly like the official editor.
-    scale = min(1.0, math.sqrt(_VISION_SIZE * _VISION_SIZE / (image.shape[1] * image.shape[2])))
+    # The text encoder sees each reference downscaled to an area budget. Only
+    # shrink: upscaling a small reference just burns vision tokens.
+    size = max(1, int(vision_size))
+    scale = min(1.0, math.sqrt(size * size / (image.shape[1] * image.shape[2])))
     return comfy.utils.common_upscale(
         image.movedim(-1, 1), round(image.shape[2] * scale), round(image.shape[1] * scale), "area", "disabled"
     ).movedim(1, -1)
@@ -275,7 +277,8 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                         "so upstream re-runs skip the text encoder while weight changes still apply. Optional "
                         "images/vae/edit_format/image_strength mirror the official TextEncodeMOSSImageEdit node, so "
                         "text weighting and image conditioning apply in one node; strength_schedule splits "
-                        "image_strength into equal Sigma-percent slices of the sampling trajectory. Requires the "
+                        "image_strength into equal Sigma-percent slices of the sampling trajectory. vision_size "
+                        "sets the area budget of the text-encoder vision copy (384/512/768/1024). Requires the "
                         "official ComfyUI MOSS-Image model; wire both model and conditioning outputs to the sampler.",
             inputs=[
                 io.Clip.Input("clip"),
@@ -299,7 +302,7 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                 io.Autogrow.Input("images", optional=True,
                                   template=io.Autogrow.TemplatePrefix(input=io.Image.Input("image"),
                                                                       prefix="image_", min=0, max=10),
-                                  tooltip="可选。参考图按接入尺寸使用，建议先缩放；文本编码器看到的是缩到最长边 384 像素的副本。"),
+                                  tooltip="可选。参考图按接入尺寸使用，建议先缩放；文本编码器看到的是按视觉尺寸面积预算缩放后的副本。"),
                 io.Float.Input("image_strength", default=1.0, min=0.0, max=100.0, step=0.05,
                                tooltip="图片在文本编码器注意力里的权重（ai-toolkit 格式，或不接 VAE 时）：0 忽略，1 不变，>1 强调。"
                                        "Moss-Image-Edit 格式下图片不进入文本编码器，该值不生效。"),
@@ -308,6 +311,10 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                                         "第 1 段用 0.3、第 2 段 0.6、第 3 段 1.2；不需要知道总步数（按 sigma 百分比等分，"
                                         "换步数自动适配）。留空则全程使用上面的 image_strength。只在文本编码器视觉通道"
                                         "（ai-toolkit 格式，或不接 VAE）生效，VAE 参考 latent 通道不受影响。"),
+                io.Combo.Input("vision_size", display_name="视觉尺寸", options=_VISION_SIZES,
+                               default=str(_VISION_SIZE),
+                               tooltip="图片进入文本编码器时的面积预算：384 保持原行为，512/768/1024 会增加 vision token 数。"
+                                       "只缩小不放大；仅在图片进入文本编码器时生效。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="conditioning")],
@@ -316,13 +323,17 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
                 vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0,
-                strength_schedule=""):
+                strength_schedule="", vision_size=str(_VISION_SIZE)):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
 
         image_list = _collect_images(images)
         method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])
+        try:
+            vision_budget = int(vision_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{_NODE}: invalid vision_size {vision_size!r}") from exc
         strength = float(image_strength)
         schedule = parse_strength_schedule(strength_schedule)
         # ai-toolkit formats, or a missing VAE, send the images through the text
@@ -337,11 +348,14 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
         cache_extra = ()
         cache_identity = ()
         if image_list:
-            cache_extra = (str(edit_format), len(image_list),
-                           tuple((id(image), tuple(image.shape)) for image in image_list))
+            cache_parts = [str(edit_format), len(image_list),
+                           tuple((id(image), tuple(image.shape)) for image in image_list)]
+            if use_vision:
+                cache_parts.append(vision_budget)
+            cache_extra = tuple(cache_parts)
             cache_identity = tuple(image_list)
         if use_vision:
-            vl = [_resize_for_vision(image) for image in image_list]
+            vl = [_resize_for_vision(image, vision_budget) for image in image_list]
             prompt = "".join(_VISION_PREFIX.format(index + 1) for index in range(len(vl))) + merged
             slots = _vision_slot_counter()
 
