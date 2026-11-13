@@ -316,12 +316,10 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                                default=str(_VISION_SIZE),
                                tooltip="图片进入文本编码器时的面积预算：384 保持原行为，512/768/1024 会增加 vision token 数。"
                                        "只缩小不放大；仅在图片进入文本编码器时生效。"),
-                io.Combo.Input("merge_separator", display_name="条目分隔", options=list(MERGE_SEPARATORS),
+                io.Combo.Input("merge_separator", display_name="分隔符", options=list(MERGE_SEPARATORS),
                                default="space",
-                               tooltip="preset 条目之间的分隔符，默认 space 保持原行为；中文条目可用 none 避免空格影响模型对文本的解析。"),
-                io.Combo.Input("prompt_separator", display_name="提示词分隔", options=list(MERGE_SEPARATORS),
-                               default="space",
-                               tooltip="preset 块与用户提示词之间的分隔符；默认 space 保持原行为，选 none 可完全无空格拼接。"),
+                               tooltip="preset 条目之间、以及 preset 块与用户提示词之间的分隔符；默认 space 保持原行为，"
+                                       "中文条目可用 none 避免空格影响模型对文本的解析。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="conditioning")],
@@ -330,14 +328,11 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
                 vae=None, edit_format=_DEFAULT_EDIT_FORMAT, images=None, image_strength=1.0,
-                strength_schedule="", vision_size=str(_VISION_SIZE), merge_separator="space",
-                prompt_separator="space"):
+                strength_schedule="", vision_size=str(_VISION_SIZE), merge_separator="space"):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         separator = MERGE_SEPARATORS.get(str(merge_separator), " ")
-        boundary = MERGE_SEPARATORS.get(str(prompt_separator), " ")
-        merged = merge_prompt(clean_text, entries, merge_order, separator=separator,
-                              boundary_separator=boundary)
+        merged = merge_prompt(clean_text, entries, merge_order, separator=separator)
 
         image_list = _collect_images(images)
         method, vision = EDIT_FORMATS.get(str(edit_format), EDIT_FORMATS[_DEFAULT_EDIT_FORMAT])

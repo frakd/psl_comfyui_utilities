@@ -447,12 +447,14 @@ h3.MiniMaxH3ImagePromptWeightPreset.execute(
     clip=execute_clip, model=execute_model, text="cat", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
     width=64, height=64,
 )
-check("H3 默认提示词边界空格", FakeH3Conditioning.last_prompt == "ab cat", repr(FakeH3Conditioning.last_prompt))
+check("H3 默认分隔符也作用于提示词边界", FakeH3Conditioning.last_prompt == "abcat",
+      repr(FakeH3Conditioning.last_prompt))
 h3.MiniMaxH3ImagePromptWeightPreset.execute(
     clip=execute_clip, model=execute_model, text="cat", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
-    width=64, height=64, prompt_separator="none",
+    width=64, height=64, merge_separator="space",
 )
-check("H3 提示词边界可无分隔", FakeH3Conditioning.last_prompt == "abcat", repr(FakeH3Conditioning.last_prompt))
+check("H3 space 分隔符同时作用于两处", FakeH3Conditioning.last_prompt == "a b cat",
+      repr(FakeH3Conditioning.last_prompt))
 h3.MiniMaxH3ImagePromptWeightPreset.execute(
     clip=execute_clip, model=execute_model, text="", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
     width=64, height=64, merge_separator="space",

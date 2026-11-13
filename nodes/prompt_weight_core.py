@@ -245,21 +245,20 @@ def extract_weighted_terms(text):
     return clean, terms
 
 
-def merge_prompt(user_text, entries, order="before", separator=" ", boundary_separator=" "):
+def merge_prompt(user_text, entries, order="before", separator=" "):
     """Put the entry block before or after the user prompt; weights stay out of the text.
 
-    `separator` joins the entries; `boundary_separator` joins the entry block and
-    the user text. The default boundary space keeps a trailing ')' from merging
-    with the separator comma in BPE.
+    `separator` is used both between entries and between the entry block and the
+    user text. The default space keeps the previous behavior.
     """
     user_text = str(user_text or "").strip()
-    block = str(separator or "").join(text for text, _ in entries if text)
+    separator = str(separator or "")
+    block = separator.join(text for text, _ in entries if text)
     if not block:
         return user_text
     if not user_text:
         return block
-    boundary = str(boundary_separator or "")
-    return f"{block}{boundary}{user_text}" if str(order).lower() != "after" else f"{user_text}{boundary}{block}"
+    return f"{block}{separator}{user_text}" if str(order).lower() != "after" else f"{user_text}{separator}{block}"
 
 
 def weight_pair(weight):

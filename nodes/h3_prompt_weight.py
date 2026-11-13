@@ -504,13 +504,10 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                                step=0.05,
                                tooltip="仅在视觉短边为自定义值时生效，作用在 vision token 的 attention logit 上："
                                        "0 静音，1 中性，>1 强化。VAE reference latent 不受影响。"),
-                io.Combo.Input("merge_separator", display_name="条目分隔", options=list(MERGE_SEPARATORS),
+                io.Combo.Input("merge_separator", display_name="分隔符", options=list(MERGE_SEPARATORS),
                                default="none",
-                               tooltip="preset 条目之间的分隔符。H3 对中文条目建议 none，空格可能让模型把条目文字画进画面；"
-                                       "英文条目可用 space 或 newline。"),
-                io.Combo.Input("prompt_separator", display_name="提示词分隔", options=list(MERGE_SEPARATORS),
-                               default="space",
-                               tooltip="preset 块与用户提示词之间的分隔符；默认 space 保持原行为，选 none 可完全无空格拼接。"),
+                               tooltip="preset 条目之间、以及 preset 块与用户提示词之间的分隔符。H3 对中文条目建议 none，"
+                                       "空格可能让模型把条目文字画进画面；英文条目可用 space 或 newline。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="positive"),
@@ -521,13 +518,11 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
                 width=0, height=0, empty_image=False, empty_start=0.0, empty_end=0.25,
                 vae=None, images=None, vision_short_edge="auto", image_strength=1.0,
-                merge_separator="none", prompt_separator="space"):
+                merge_separator="none"):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         separator = MERGE_SEPARATORS.get(str(merge_separator), "")
-        boundary = MERGE_SEPARATORS.get(str(prompt_separator), " ")
-        merged = merge_prompt(clean_text, entries, merge_order, separator=separator,
-                              boundary_separator=boundary)
+        merged = merge_prompt(clean_text, entries, merge_order, separator=separator)
         terms = user_terms + entries
         image_list = _collect_images(images)
 

@@ -60,9 +60,8 @@ check("没有预设", core.merge_prompt("user prompt", [], "before") == "user pr
 check("没有用户文本", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "after") == "a b")
 check("条目无分隔", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "before", separator="") == "ab")
 check("条目换行分隔", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "before", separator="\n") == "a\nb")
-check("条目逗号分隔", core.merge_prompt("u", [("a", 1.0), ("b", 2.0)], "before", separator=", ") == "a, b u")
-check("提示词边界无分隔", core.merge_prompt("u", [("a", 1.0)], "before", boundary_separator="") == "au")
-check("提示词边界换行", core.merge_prompt("u", [("a", 1.0)], "after", boundary_separator="\n") == "u\na")
+check("条目逗号分隔", core.merge_prompt("u", [("a", 1.0), ("b", 2.0)], "before", separator=", ") == "a, b, u")
+check("分隔符也作用于提示词边界", core.merge_prompt("u", [("a", 1.0)], "before", separator="") == "au")
 
 
 # ---------- 短语定位（假 clip，验证算法；真实 tokenizer 另行核对） ----------
