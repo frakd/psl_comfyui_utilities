@@ -99,6 +99,32 @@ check("strength 0 静音视觉槽位",
 check("bias 相加", torch.allclose(mod._sum_bias(zero, torch.ones(1, 3)), zero + 1))
 check("None 项不改变结果", mod._sum_bias(None, zero) is zero)
 
+captured = {}
+
+
+class FakeAttention:
+    def __init__(self, function):
+        self.function = function
+
+
+def preferred(_q, _k, v, _heads, mask=None, **_kwargs):
+    captured["mask"] = mask
+    return v
+
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("global attention backend should not be used")
+
+
+bias = torch.zeros(1, 3)
+bias[0, 2] = 3.0
+mod._make_attention_override(([0], None, None, bias), FakeAttention(preferred), None)(
+    forbidden, torch.zeros(1, 3, 4), torch.zeros(1, 3, 4), torch.ones(1, 3, 4), 2,
+)
+check("MOSS 有 bias 时保留 checkpoint attention 后端",
+      captured.get("mask") is not None and captured["mask"][0, 2].item() == 3.0,
+      repr(captured.get("mask")))
+
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
     raise SystemExit(1)

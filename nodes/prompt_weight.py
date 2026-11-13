@@ -178,7 +178,7 @@ def _make_forward_wrapper(pairs, text_len):
     return wrapper
 
 
-def _make_attention_override(weights, previous):
+def _make_attention_override(weights, comfy_attention=None, previous=None):
     rows, v_idx, v_factor, bias = weights
 
     def override(func, q, k, v, heads, mask=None, **kwargs):
@@ -196,17 +196,17 @@ def _make_attention_override(weights, previous):
                 current = torch.nn.functional.pad(current, (0, key_count - current.shape[-1]))
             elif current.shape[-1] > key_count:
                 current = current[..., :key_count]
-            # A backend that ignores attn_mask through **kwargs cannot apply the
-            # bias; comfy's own backends either take it or fall back to sdpa.
-            return func(q, k, v, heads, mask=current.to(q.dtype), **kwargs)
+            mask = current.to(q.dtype)
         if previous is not None:
             return previous(func, q, k, v, heads, mask=mask, **kwargs)
-        return func(q, k, v, heads, mask=mask, **kwargs)
+        # Keep the checkpoint's own backend (MOSS ships comfy_kitchen_int8).
+        attention = comfy_attention.function if comfy_attention is not None else None
+        return (attention or func)(q, k, v, heads, mask=mask, **kwargs)
 
     return override
 
 
-def _make_block_patch(previous):
+def _make_block_patch(comfy_attention=None, previous=None):
     def patch(args, extra):
         options = args["transformer_options"]
         weights = options.get(_STATE_KEY)
@@ -214,7 +214,7 @@ def _make_block_patch(previous):
             options = {
                 **options,
                 "optimized_attention_override": _make_attention_override(
-                    weights, options.get("optimized_attention_override")
+                    weights, comfy_attention, options.get("optimized_attention_override")
                 ),
             }
             args = {**args, "transformer_options": options}
@@ -235,9 +235,10 @@ def _patch_model(model, pairs, text_len):
     )
     diffusion_model = patched.get_model_object("diffusion_model")
     existing = patched.model_options.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
-    for index in range(len(diffusion_model.layers)):
+    for index, block in enumerate(diffusion_model.layers):
+        comfy_attention = getattr(block, "comfy_attention", None)
         patched.set_model_patch_replace(
-            _make_block_patch(existing.get(("single_block", index))), "dit", "single_block", index
+            _make_block_patch(comfy_attention, existing.get(("single_block", index))), "dit", "single_block", index
         )
     return patched
 
