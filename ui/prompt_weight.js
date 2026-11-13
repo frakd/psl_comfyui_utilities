@@ -19,6 +19,7 @@ const WIDGET_SLACK = 24;
 // node behaves like the plain text preset node.
 const EDIT_WIDGETS = ["edit_format", "image_strength", "strength_schedule"];
 const EMPTY_IMAGE_WIDGETS = ["empty_start", "empty_end"];
+const OFFICIAL_VISION_EDGES = new Set(["auto", "1024"]);
 const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
 const DEFAULT_EDIT_FORMAT = "Moss-Image-Edit";
 let styleReady = false;
@@ -41,7 +42,11 @@ function sanitizeEditWidgets(node) {
   const strength = node.widgets?.find((widget) => widget.name === "image_strength");
   if (strength) {
     const value = Number(strength.value);
-    strength.value = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 1;
+    const min = Number(strength.options?.min);
+    const max = Number(strength.options?.max);
+    const lo = Number.isFinite(min) ? min : 0;
+    const hi = Number.isFinite(max) ? max : 100;
+    strength.value = Number.isFinite(value) ? Math.min(hi, Math.max(lo, value)) : 1;
   }
   // A boolean from the removed experiment switch could have landed in this slot.
   const schedule = node.widgets?.find((widget) => widget.name === "strength_schedule");
@@ -351,6 +356,17 @@ function setup(node) {
     return changed;
   }
 
+  function refreshVisionWidgets() {
+    const edge = node.widgets?.find((widget) => widget.name === "vision_short_edge");
+    if (!edge) return false;
+    const hasImage = hasConnectedImage(node);
+    let changed = setWidgetShown(edge, hasImage);
+    const strength = node.widgets?.find((widget) => widget.name === "image_strength");
+    const custom = hasImage && !OFFICIAL_VISION_EDGES.has(String(edge.value));
+    changed = setWidgetShown(strength, custom) || changed;
+    return changed;
+  }
+
   function refreshEditWidgets(emptyValue) {
     const show = hasConnectedImage(node);
     let changed = false;
@@ -359,6 +375,7 @@ function setup(node) {
       changed = setWidgetShown(widget, show) || changed;
     }
     changed = refreshConditionalWidgets(emptyValue) || changed;
+    changed = refreshVisionWidgets() || changed;
     if (!changed) return;
     lastFitH = 0;
     scheduleFit();
@@ -757,7 +774,7 @@ function setup(node) {
     scheduleFit();
   }
 
-  node._mossPresetUI = { restore, refreshEditWidgets, refreshConditionalWidgets };
+  node._mossPresetUI = { restore, refreshEditWidgets, refreshConditionalWidgets, refreshVisionWidgets };
   const emptyToggle = node.widgets?.find((widget) => widget.name === "empty_image");
   if (emptyToggle && !emptyToggle._pslEmptyHooked) {
     emptyToggle._pslEmptyHooked = true;
@@ -765,6 +782,16 @@ function setup(node) {
     emptyToggle.callback = function (value) {
       const result = originalEmptyCallback?.apply(this, arguments);
       refreshEditWidgets(value);
+      return result;
+    };
+  }
+  const visionEdge = node.widgets?.find((widget) => widget.name === "vision_short_edge");
+  if (visionEdge && !visionEdge._pslVisionHooked) {
+    visionEdge._pslVisionHooked = true;
+    const originalEdgeCallback = visionEdge.callback;
+    visionEdge.callback = function (value) {
+      const result = originalEdgeCallback?.apply(this, arguments);
+      refreshEditWidgets();
       return result;
     };
   }

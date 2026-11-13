@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """验证 H3 preset 节点的纯逻辑：token 定位、empty-image 组装、offset 与 attention override。"""
 import importlib.util
+import math
 import re
 import sys
 import types
@@ -269,6 +270,33 @@ ordered = h3._collect_images(images)
 check("参考图按数字顺序", ordered[0] is right and ordered[1] is left,
       repr([id(image) for image in ordered]))
 
+vision_cond = [(torch.zeros(1, 5, 4), {"minimax_token_tags": torch.tensor([0, 0, 1, 1, 1])})]
+vision_mapping = h3._vision_positions_by_length(vision_cond)
+check("从 token tags 找出 vision 位置",
+      vision_mapping.get(5) is not None and vision_mapping[5].tolist() == [0, 1],
+      repr(vision_mapping))
+
+multiplier, bias = h3._build_weight_tensors(
+    [], [], [4], [2.0], 0, 6, "cpu", torch.float32, torch.tensor([1, 3]), 0.5
+)
+check("image_strength 写入 vision 位置",
+      multiplier is None and abs(bias[0, 0, 0, 1].item() - math.log(0.5)) < 1e-6
+      and abs(bias[0, 0, 0, 3].item() - math.log(0.5)) < 1e-6 and bias[0, 0, 0, 4].item() == 2.0,
+      repr(bias[0, 0, 0].tolist() if bias is not None else None))
+
+strength_wrapper = h3._make_forward_wrapper(
+    [], 4, "test", 0.5, {4: torch.tensor([0, 1])}
+)
+strength_result = strength_wrapper(
+    executor, None, None, torch.zeros(1, 4, 4), {"cond_or_uncond": [0]},
+    minimax_payload={"layout": types.SimpleNamespace(seq_len=6)},
+)
+strength_state = strength_result.get(h3._STATE_KEY)
+check("wrapper 把 image_strength 合入预计算 mask",
+      strength_state is not None and strength_state[1] is not None
+      and abs(strength_state[1][0, 0, 0, 0].item() - math.log(0.5)) < 1e-6,
+      repr(strength_state))
+
 
 # ---------- execute 全流程（假 H3 core / clip / model） ----------
 class FakeH3Conditioning:
@@ -291,6 +319,21 @@ class ExecuteClip(FakeClip):
     def encode_from_tokens_scheduled(self, _tokens):
         self.picture_calls += 1
         return [[torch.zeros(1, 2, 4), {"minimax_token_tags": torch.zeros(2, dtype=torch.long)}]]
+
+
+class CustomExecuteClip(ExecuteClip):
+    def __init__(self):
+        super().__init__()
+        self.image_tokenize_calls = 0
+
+    def tokenize(self, text, images=None, **_kwargs):
+        if images is not None:
+            self.image_tokenize_calls += 1
+            return {"h3": [[(1, 1.0)]]}
+        return super().tokenize(text)
+
+    def encode_from_tokens_scheduled(self, _tokens):
+        return [[torch.zeros(1, 4, 4), {"minimax_token_tags": torch.tensor([0, 0, 1, 1])}]]
 
 
 class FakeModel:
@@ -322,6 +365,29 @@ comfy_extras = types.ModuleType("comfy_extras")
 comfy_extras.__path__ = []
 fake_minimax = types.ModuleType("comfy_extras.nodes_minimax_h3")
 fake_minimax.MiniMaxH3ImageConditioning = FakeH3Conditioning
+fake_minimax.IMAGE_REF_SHORT_EDGE = 1024
+fake_minimax.IMAGE_REF_VAE_MAX_SHORT_EDGE = 2048
+fake_minimax.IMAGE_SIZE = 2048
+
+
+def _fake_size_short_edge(width, height, low, high):
+    scale = min(max(min(width, height), low), high) / min(width, height)
+    return (max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32))
+
+
+def _fake_image_refs(images, vae, vision_size, vae_size):
+    names = sorted(images or {}, key=lambda name: int(name.rsplit("_", 1)[-1]))
+    image_list = [images[name][:1] for name in names if images[name] is not None]
+    vision_images = [
+        torch.zeros(1, vision_size(image.shape[2], image.shape[1])[1],
+                    vision_size(image.shape[2], image.shape[1])[0], 3)
+        for image in image_list
+    ]
+    return image_list, vision_images, []
+
+
+fake_minimax._size_short_edge = _fake_size_short_edge
+fake_minimax._image_refs = _fake_image_refs
 comfy_extras.nodes_minimax_h3 = fake_minimax
 sys.modules["comfy_extras"] = comfy_extras
 sys.modules["comfy_extras.nodes_minimax_h3"] = fake_minimax
@@ -369,6 +435,34 @@ h3.MiniMaxH3ImagePromptWeightPreset.execute(
     width=64, height=64, empty_image=True, empty_start=0.0, empty_end=0.25,
 )
 check("文本变化后重新编码", FakeH3Conditioning.calls == 2, str(FakeH3Conditioning.calls))
+
+# ---------- 自定义 vision 尺寸 ----------
+official_calls = FakeH3Conditioning.calls
+custom_clip = CustomExecuteClip()
+custom_model = FakeModel()
+custom_output = h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=custom_clip, model=custom_model, text="cat", presets_data="[]",
+    width=64, height=64, vision_short_edge="384", image_strength=0.5,
+    images={"image_0": torch.zeros(1, 64, 64, 3)},
+).result
+check("自定义尺寸不走官方核心", FakeH3Conditioning.calls == official_calls,
+      str(FakeH3Conditioning.calls))
+check("自定义尺寸把图片送进 tokenizer", custom_clip.image_tokenize_calls == 1,
+      str(custom_clip.image_tokenize_calls))
+check("自定义尺寸输出 latent 形状", tuple(custom_output[2]["samples"].shape) == (1, 24, 1, 4, 4),
+      str(tuple(custom_output[2]["samples"].shape)))
+custom_wrapper = custom_model.wrappers.get(("diffusion_model", h3._WRAPPER_KEY))
+check("自定义尺寸注册 wrapper", custom_wrapper is not None, repr(list(custom_model.wrappers)))
+if custom_wrapper is not None:
+    custom_state = custom_wrapper(
+        lambda _x, _t, _context, options, **_kwargs: options,
+        None, None, torch.zeros(1, 4, 4), {"cond_or_uncond": [0]},
+        minimax_payload={"layout": types.SimpleNamespace(seq_len=6)},
+    ).get(h3._STATE_KEY)
+    check("自定义尺寸应用 image_strength",
+          custom_state is not None and custom_state[1] is not None
+          and abs(custom_state[1][0, 0, 0, 0].item() - math.log(0.5)) < 1e-6,
+          repr(custom_state))
 
 
 if FAIL:

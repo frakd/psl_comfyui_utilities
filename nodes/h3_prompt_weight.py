@@ -17,6 +17,7 @@ percent.
 """
 
 import logging
+import math
 import threading
 import weakref
 from collections import OrderedDict
@@ -43,6 +44,9 @@ _STATE_KEY = "minimax_h3_prompt_preset"
 _H3_SPECIALS = (151644, 872, 198, 151645)
 _MAX_RESOLUTION = 16384
 _EMPTY_IMAGE_SIZE = 512
+_VISION_SHORT_EDGES = ["auto", "384", "512", "768", "1024", "1280", "1536", "1792", "2048"]
+_OFFICIAL_VISION_EDGES = {"auto", "1024"}
+_VISION_TOKEN_WARN = 2048
 
 _MISS = object()
 
@@ -144,6 +148,78 @@ def _encode_conditioning(clip, prompt, width, height, vae, images, cache_enabled
     return cond, _empty_h3_image_latent(width, height, image_list)
 
 
+def _estimate_vision_tokens(vision_images):
+    try:
+        from comfy.text_encoders.qwen_vl import smart_resize
+    except ImportError:
+        return None
+    total = 0
+    for image in vision_images:
+        height, width = int(image.shape[1]), int(image.shape[2])
+        h_bar, w_bar = smart_resize(height, width, 32, 3136, 12845056)
+        total += max(1, (h_bar // 32) * (w_bar // 32))
+    return total
+
+
+def _encode_custom_conditioning(clip, prompt, width, height, vae, images, vision_edge, cache_enabled):
+    image_list = _collect_images(images)
+    identity = tuple([clip, *image_list] + ([vae] if vae is not None else []))
+    extra = (
+        "h3-custom",
+        int(vision_edge),
+        len(image_list),
+        tuple((id(image), tuple(image.shape)) for image in image_list),
+    )
+    key = cache_key(clip, prompt, extra)
+    if cache_enabled:
+        cached = _COND_CACHE.get(key, identity)
+        if cached is not _MISS:
+            return cached, _empty_h3_image_latent(width, height, image_list)
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import (
+            IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE, _image_refs, _size_short_edge,
+        )
+    except ImportError as exc:
+        raise RuntimeError(f"{_NODE} requires a ComfyUI version with MiniMax H3 Image support") from exc
+
+    vae_size = lambda w, h: _size_short_edge(w, h, IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE)
+    vision_size = lambda w, h: _size_short_edge(w, h, vision_edge, vision_edge)
+    image_list, vision_images, refs = _image_refs(images, vae, vision_size, vae_size)
+    total_tokens = _estimate_vision_tokens(vision_images)
+    if total_tokens is not None:
+        logging.info("%s: custom vision short edge %d -> ~%d vision tokens",
+                     _NODE, vision_edge, total_tokens)
+        if total_tokens > _VISION_TOKEN_WARN:
+            logging.warning("%s: custom vision short edge %d produces ~%d vision tokens; "
+                            "the text prompt may be diluted", _NODE, vision_edge, total_tokens)
+
+    cond = clip.encode_from_tokens_scheduled(
+        clip.tokenize(prompt, images=vision_images, picture_label="Picture %d: ")
+    )
+    if refs:
+        import node_helpers
+        cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": refs})
+    if cache_enabled:
+        _COND_CACHE.put(key, cond, identity)
+    return cond, _empty_h3_image_latent(width, height, image_list)
+
+
+def _vision_positions_by_length(conditioning):
+    mapping = {}
+    for item in conditioning:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        states, metadata = item[0], item[1]
+        tags = metadata.get("minimax_token_tags") if isinstance(metadata, dict) else None
+        if not torch.is_tensor(tags) or tags.shape[-1] != states.shape[1]:
+            continue
+        positions = (tags == 0).nonzero(as_tuple=False).flatten()
+        if positions.numel():
+            mapping[int(states.shape[1])] = positions
+    return mapping
+
+
 def _encode_empty_picture(clip, cache_enabled):
     identity = (clip,)
     key = cache_key(clip, "\0minimax_h3_empty_picture")
@@ -203,7 +279,8 @@ def _apply_empty_image(cond, picture, picture_dict, start, end):
     return with_picture
 
 
-def _build_weight_tensors(value_pos, value_factor, bias_pos, bias_value, offset, seq_len, device, dtype):
+def _build_weight_tensors(value_pos, value_factor, bias_pos, bias_value, offset, seq_len, device, dtype,
+                          vision_positions=None, image_strength=1.0):
     multiplier = None
     if value_pos:
         positions = torch.tensor(value_pos, device=device) + offset
@@ -211,17 +288,25 @@ def _build_weight_tensors(value_pos, value_factor, bias_pos, bias_value, offset,
             return None
         multiplier = torch.ones(1, 1, seq_len, 1, device=device, dtype=dtype)
         multiplier[0, 0, positions, 0] = torch.tensor(value_factor, device=device, dtype=dtype)
+    use_image_bias = vision_positions is not None and image_strength != 1.0
     bias = None
-    if bias_pos:
-        positions = torch.tensor(bias_pos, device=device) + offset
-        if int(positions.max()) >= seq_len:
-            return None
+    if bias_pos or use_image_bias:
         bias = torch.zeros(1, 1, 1, seq_len, device=device, dtype=dtype)
-        bias[0, 0, 0, positions] = torch.tensor(bias_value, device=device, dtype=dtype)
+        if bias_pos:
+            positions = torch.tensor(bias_pos, device=device) + offset
+            if int(positions.max()) >= seq_len:
+                return None
+            bias[0, 0, 0, positions] = torch.tensor(bias_value, device=device, dtype=dtype)
+        if use_image_bias:
+            positions = vision_positions.to(device, dtype=torch.long)
+            positions = positions[positions < seq_len]
+            if positions.numel():
+                weight = math.log(image_strength) if image_strength > 0.0 else math.log(1e-6)
+                bias[0, 0, 0, positions] += weight
     return multiplier, bias
 
 
-def _make_forward_wrapper(pairs, prompt_len, name):
+def _make_forward_wrapper(pairs, prompt_len, name, image_strength=1.0, vision_positions_by_len=None):
     value_pos = [position for position, factor, _ in pairs if factor != 1.0]
     value_factor = [factor for _, factor, _ in pairs if factor != 1.0]
     bias_pos = [position for position, _, bias in pairs if bias != 0.0]
@@ -243,14 +328,19 @@ def _make_forward_wrapper(pairs, prompt_len, name):
                 payload = kwargs.get("minimax_payload") or {}
                 layout = payload.get("layout") if isinstance(payload, dict) else None
                 seq_len = getattr(layout, "seq_len", None)
+                vision_positions = None
+                if image_strength != 1.0 and vision_positions_by_len:
+                    vision_positions = vision_positions_by_len.get(int(context.shape[1]))
                 tensors = None
                 if isinstance(seq_len, int) and seq_len > 0:
-                    cache_key_ = (seq_len, context.device, context.dtype)
+                    cache_key_ = (seq_len, context.device, context.dtype, image_strength,
+                                  id(vision_positions) if vision_positions is not None else None)
                     tensors = tensor_cache.get(cache_key_)
                     if tensors is None:
                         tensors = _build_weight_tensors(
                             value_pos, value_factor, bias_pos, bias_value,
                             offset, seq_len, context.device, context.dtype,
+                            vision_positions, image_strength,
                         )
                         if tensors is not None:
                             tensor_cache[cache_key_] = tensors
@@ -258,12 +348,14 @@ def _make_forward_wrapper(pairs, prompt_len, name):
                     # Precomputed outside the per-block allocation scopes: blocks
                     # only do an in-place multiply and reuse the bias mask.
                     transformer_options[_STATE_KEY] = (tensors[0], tensors[1], None, None, None, None)
-                elif not value_pos and not bias_pos:
+                elif not value_pos and not bias_pos and vision_positions is None:
                     transformer_options[_STATE_KEY] = (None, None, None, None, None, None)
                 elif seq_len is not None:
                     warn_once("layout", f"packed layout length {seq_len} cannot hold the prompt positions; "
                                         "weighting skipped")
                 else:
+                    if image_strength != 1.0 and vision_positions is not None:
+                        warn_once("vision", "image_strength needs the packed layout; it is ignored")
                     # Fallback for a sampler that does not expose the packed layout.
                     device = context.device
                     transformer_options[_STATE_KEY] = (
@@ -336,13 +428,13 @@ def _make_block_patch(comfy_attention, previous):
     return patch
 
 
-def _patch_model(model, pairs, prompt_len):
+def _patch_model(model, pairs, prompt_len, image_strength=1.0, vision_positions_by_len=None):
     patched = model.clone()
     patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _WRAPPER_KEY)
     patched.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
         _WRAPPER_KEY,
-        _make_forward_wrapper(pairs, prompt_len, _NODE),
+        _make_forward_wrapper(pairs, prompt_len, _NODE, image_strength, vision_positions_by_len),
     )
     diffusion_model = patched.get_model_object("diffusion_model")
     if not hasattr(diffusion_model, "blocks"):
@@ -370,6 +462,8 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                         "weakens, 0 removes, <0 subtracts the concept. The merged-text encoding is cached by CLIP, "
                         "patch state, text, image identities and VAE, so weight changes still apply without "
                         "re-encoding. Optional images/vae mirror the official MiniMaxH3ImageConditioning node; "
+                        "vision_short_edge customizes the Qwen vision copy for experiments (auto/1024 keep the "
+                        "official path), and image_strength biases vision tokens only in custom modes. "
                         "empty_image prepends a blank picture block for an early sampling window. Wire model, "
                         "conditioning and latent to the sampler.",
             inputs=[
@@ -387,6 +481,14 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                 io.Int.Input("width", default=0, min=0, max=_MAX_RESOLUTION, step=32,
                              tooltip="0 使用 image_1 的尺寸；没有图片时使用 2048。"),
                 io.Int.Input("height", default=0, min=0, max=_MAX_RESOLUTION, step=32),
+                io.Combo.Input("vision_short_edge", display_name="视觉短边", options=_VISION_SHORT_EDGES,
+                               default="auto",
+                               tooltip="auto/1024 完全走官方 H3 Image 路径；其他值是实验性：只改 Qwen vision 编码的短边，"
+                                       "VAE reference latent 仍按官方 1024~2048 编码。接图时生效。"),
+                io.Float.Input("image_strength", display_name="图片条件权重", default=1.0, min=0.0, max=4.0,
+                               step=0.05,
+                               tooltip="仅在视觉短边为自定义值时生效，作用在 vision token 的 attention logit 上："
+                                       "0 静音，1 中性，>1 强化。VAE reference latent 不受影响。"),
                 io.Boolean.Input("empty_image", display_name="空图条件", default=False,
                                  label_on="on", label_off="off",
                                  tooltip="纯文生图时，在采样早期给文本编码器一个空白图片槽位，软化 H3 偏硬的文生图渲染。"
@@ -409,8 +511,8 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
-                width=0, height=0, empty_image=False, empty_start=0.0, empty_end=0.25,
-                vae=None, images=None):
+                width=0, height=0, vision_short_edge="auto", image_strength=1.0, empty_image=False,
+                empty_start=0.0, empty_end=0.25, vae=None, images=None):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
@@ -423,12 +525,30 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
         start = max(0.0, min(1.0, float(empty_start)))
         end = max(0.0, min(1.0, float(empty_end)))
 
+        edge_value = str(vision_short_edge)
+        if edge_value in _OFFICIAL_VISION_EDGES:
+            custom_edge = None
+        else:
+            try:
+                custom_edge = int(edge_value)
+            except ValueError as exc:
+                raise ValueError(f"{_NODE}: invalid vision_short_edge {edge_value!r}") from exc
+        vision_strength = float(image_strength)
+        if custom_edge is None and vision_strength != 1.0:
+            logging.info("%s: image_strength only applies to a custom vision_short_edge; ignored", _NODE)
+            vision_strength = 1.0
+
         diffusion_model = model.get_model_object("diffusion_model") if model is not None else None
         if diffusion_model is None or not hasattr(diffusion_model, "blocks"):
             raise ValueError(f"{_NODE}: model is not a MiniMax H3 diffusion model")
 
         cache_enabled = cache_mode == "enabled"
-        cond, latent = _encode_conditioning(clip, merged, width, height, vae, images, cache_enabled)
+        if custom_edge is None:
+            cond, latent = _encode_conditioning(clip, merged, width, height, vae, images, cache_enabled)
+        else:
+            cond, latent = _encode_custom_conditioning(
+                clip, merged, width, height, vae, images, custom_edge, cache_enabled
+            )
 
         ids = _token_ids(clip.tokenize(merged))
         prompt_len = len(ids)
@@ -442,8 +562,17 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                 logging.warning("%s: empty_end (%s) must be greater than empty_start (%s); "
                                 "empty-image mode skipped", _NODE, end, start)
 
-        if not pairs:
+        vision_positions_by_len = None
+        if custom_edge is not None and vision_strength != 1.0:
+            vision_positions_by_len = _vision_positions_by_length(cond)
+
+        if not pairs and not vision_positions_by_len:
             return io.NodeOutput(model, cond, latent)
 
-        logging.info("%s: weighting %d text positions", _NODE, len(pairs))
-        return io.NodeOutput(_patch_model(model, pairs, prompt_len), cond, latent)
+        logging.info("%s: weighting %d text positions; vision_short_edge=%s; image_strength=%s",
+                     _NODE, len(pairs), custom_edge if custom_edge is not None else "official",
+                     vision_strength)
+        return io.NodeOutput(
+            _patch_model(model, pairs, prompt_len, vision_strength, vision_positions_by_len),
+            cond, latent,
+        )
