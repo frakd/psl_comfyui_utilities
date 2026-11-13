@@ -444,6 +444,16 @@ h3.MiniMaxH3ImagePromptWeightPreset.execute(
 )
 check("H3 默认条目无分隔", FakeH3Conditioning.last_prompt == "ab", repr(FakeH3Conditioning.last_prompt))
 h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=execute_clip, model=execute_model, text="cat", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
+    width=64, height=64,
+)
+check("H3 默认提示词边界空格", FakeH3Conditioning.last_prompt == "ab cat", repr(FakeH3Conditioning.last_prompt))
+h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=execute_clip, model=execute_model, text="cat", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
+    width=64, height=64, prompt_separator="none",
+)
+check("H3 提示词边界可无分隔", FakeH3Conditioning.last_prompt == "abcat", repr(FakeH3Conditioning.last_prompt))
+h3.MiniMaxH3ImagePromptWeightPreset.execute(
     clip=execute_clip, model=execute_model, text="", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
     width=64, height=64, merge_separator="space",
 )
