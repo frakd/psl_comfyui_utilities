@@ -21,6 +21,7 @@ import threading
 import weakref
 from collections import OrderedDict
 
+import comfy.model_management
 import comfy.patcher_extension
 import torch
 
@@ -93,13 +94,34 @@ def _token_ids(tokens):
     return [item[0] for item in tokens[key][0]]
 
 
+def _empty_h3_image_latent(width, height, image_list):
+    if not (width and height):
+        try:
+            from comfy_extras.nodes_minimax_h3 import (
+                IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE, IMAGE_SIZE, _size_short_edge,
+            )
+        except ImportError as exc:
+            raise RuntimeError(f"{_NODE} requires a ComfyUI version with MiniMax H3 Image support") from exc
+        if image_list:
+            image = image_list[0]
+            size = _size_short_edge(image.shape[2], image.shape[1],
+                                    IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE)
+        else:
+            size = (IMAGE_SIZE, IMAGE_SIZE)
+        width, height = width or size[0], height or size[1]
+    return {"samples": torch.zeros(
+        [1, 24, 1, height // 16, width // 16],
+        device=comfy.model_management.intermediate_device(),
+    )}
+
+
 def _encode_conditioning(clip, prompt, width, height, vae, images, cache_enabled):
     image_list = _collect_images(images)
     identity = tuple([clip, *image_list] + ([vae] if vae is not None else []))
+    # Width/height only change the zero target latent, never the text/image
+    # conditioning, so they stay out of the encode-cache key.
     extra = (
         "h3",
-        int(width),
-        int(height),
         len(image_list),
         tuple((id(image), tuple(image.shape)) for image in image_list),
     )
@@ -107,19 +129,19 @@ def _encode_conditioning(clip, prompt, width, height, vae, images, cache_enabled
     if cache_enabled:
         cached = _COND_CACHE.get(key, identity)
         if cached is not _MISS:
-            return cached
+            return cached, _empty_h3_image_latent(width, height, image_list)
 
     try:
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageConditioning
     except ImportError as exc:
         raise RuntimeError(f"{_NODE} requires a ComfyUI version with MiniMax H3 Image support") from exc
 
-    cond, latent = MiniMaxH3ImageConditioning.execute(
+    cond = MiniMaxH3ImageConditioning.execute(
         clip, prompt, width, height, vae=vae, images=images
-    ).result
+    ).result[0]
     if cache_enabled:
-        _COND_CACHE.put(key, (cond, latent), identity)
-    return cond, latent
+        _COND_CACHE.put(key, cond, identity)
+    return cond, _empty_h3_image_latent(width, height, image_list)
 
 
 def _encode_empty_picture(clip, cache_enabled):

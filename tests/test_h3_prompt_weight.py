@@ -33,8 +33,12 @@ class _WrappersMP:
 
 patcher.WrappersMP = _WrappersMP
 comfy.patcher_extension = patcher
+model_management = types.ModuleType("comfy.model_management")
+model_management.intermediate_device = lambda: "cpu"
+comfy.model_management = model_management
 sys.modules["comfy"] = comfy
 sys.modules["comfy.patcher_extension"] = patcher
+sys.modules["comfy.model_management"] = model_management
 
 comfy_api = types.ModuleType("comfy_api")
 comfy_api.__path__ = []
@@ -305,6 +309,14 @@ h3.MiniMaxH3ImagePromptWeightPreset.execute(
 )
 check("只改权重不重编码", FakeH3Conditioning.calls == 1, str(FakeH3Conditioning.calls))
 check("只改权重不重编码空图", execute_clip.picture_calls == 1, str(execute_clip.picture_calls))
+
+resized = h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=execute_clip, model=execute_model, text="(cat:0.3)", presets_data="[]",
+    width=128, height=96, empty_image=True, empty_start=0.0, empty_end=0.25,
+).result
+check("只改宽高不重编码", FakeH3Conditioning.calls == 1, str(FakeH3Conditioning.calls))
+check("只改宽高重建 latent", tuple(resized[2]["samples"].shape) == (1, 24, 1, 6, 8),
+      str(tuple(resized[2]["samples"].shape)))
 
 h3.MiniMaxH3ImagePromptWeightPreset.execute(
     clip=execute_clip, model=execute_model, text="dog", presets_data="[]",
