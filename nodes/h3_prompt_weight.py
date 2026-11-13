@@ -46,7 +46,7 @@ _H3_SPECIALS = (151644, 872, 198, 151645)
 _MAX_RESOLUTION = 16384
 _EMPTY_IMAGE_SIZE = 512
 _VISION_SHORT_EDGES = ["auto", "384", "512", "768", "1024", "1280", "1536", "1792", "2048"]
-_OFFICIAL_VISION_EDGES = {"auto", "1024"}
+_OFFICIAL_VISION_EDGES = {"auto"}
 _VISION_TOKEN_WARN = 2048
 
 _MISS = object()
@@ -463,8 +463,9 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                         "weakens, 0 removes, <0 subtracts the concept. The merged-text encoding is cached by CLIP, "
                         "patch state, text, image identities and VAE, so weight changes still apply without "
                         "re-encoding. Optional images/vae mirror the official MiniMaxH3ImageConditioning node; "
-                        "vision_short_edge customizes the Qwen vision copy for experiments (auto/1024 keep the "
-                        "official path), and image_strength biases vision tokens only in custom modes. "
+                        "vision_short_edge customizes the Qwen vision copy for experiments (auto keeps the "
+                        "official path), and image_strength biases vision tokens in every explicit size, "
+                        "including 1024. "
                         "empty_image prepends a blank picture block for an early sampling window. Wire model, "
                         "conditioning and latent to the sampler.",
             inputs=[
@@ -498,11 +499,11 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                                   tooltip="可选。参考图；image_1 是编辑底图，提示词里可用 <Picture 1> 引用。"),
                 io.Combo.Input("vision_short_edge", display_name="视觉短边", options=_VISION_SHORT_EDGES,
                                default="auto",
-                               tooltip="auto/1024 完全走官方 H3 Image 路径；其他值是实验性：只改 Qwen vision 编码的短边，"
-                                       "VAE reference latent 仍按官方 1024~2048 编码。接图时生效。"),
+                               tooltip="auto 完全走官方 H3 Image 路径；其他值（含 1024）走自定义 vision 路径，"
+                                       "可调图片条件权重；VAE reference latent 仍按官方 1024~2048 编码。接图时生效。"),
                 io.Float.Input("image_strength", display_name="图片条件权重", default=1.0, min=0.0, max=4.0,
                                step=0.05,
-                               tooltip="仅在视觉短边为自定义值时生效，作用在 vision token 的 attention logit 上："
+                               tooltip="仅在视觉短边为显式尺寸（含 1024）时生效，作用在 vision token 的 attention logit 上："
                                        "0 静音，1 中性，>1 强化。VAE reference latent 不受影响。"),
                 io.Combo.Input("merge_separator", display_name="分隔符", options=list(MERGE_SEPARATORS),
                                default="none",

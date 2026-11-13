@@ -275,6 +275,9 @@ vision_mapping = h3._vision_positions_by_length(vision_cond)
 check("从 token tags 找出 vision 位置",
       vision_mapping.get(5) is not None and vision_mapping[5].tolist() == [0, 1],
       repr(vision_mapping))
+check("只有 auto 视为官方 vision 路径",
+      h3._OFFICIAL_VISION_EDGES == {"auto"} and "1024" not in h3._OFFICIAL_VISION_EDGES,
+      repr(h3._OFFICIAL_VISION_EDGES))
 
 multiplier, bias = h3._build_weight_tensors(
     [], [], [4], [2.0], 0, 6, "cpu", torch.float32, torch.tensor([1, 3]), 0.5
