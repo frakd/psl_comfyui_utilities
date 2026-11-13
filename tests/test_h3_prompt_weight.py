@@ -301,10 +301,12 @@ check("wrapper 把 image_strength 合入预计算 mask",
 # ---------- execute 全流程（假 H3 core / clip / model） ----------
 class FakeH3Conditioning:
     calls = 0
+    last_prompt = None
 
     @classmethod
     def execute(cls, clip, prompt, width, height, vae=None, images=None):
         cls.calls += 1
+        cls.last_prompt = prompt
         rows = len(clip.tokenize(prompt)["h3"][0])
         cond = [(torch.zeros(1, rows, 4), {"minimax_token_tags": torch.ones(rows, dtype=torch.long)})]
         latent = {"samples": torch.zeros(1, 24, 1, max(1, int(height) // 16), max(1, int(width) // 16))}
@@ -435,6 +437,17 @@ h3.MiniMaxH3ImagePromptWeightPreset.execute(
     width=64, height=64, empty_image=True, empty_start=0.0, empty_end=0.25,
 )
 check("文本变化后重新编码", FakeH3Conditioning.calls == 2, str(FakeH3Conditioning.calls))
+
+h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=execute_clip, model=execute_model, text="", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
+    width=64, height=64,
+)
+check("H3 默认条目无分隔", FakeH3Conditioning.last_prompt == "ab", repr(FakeH3Conditioning.last_prompt))
+h3.MiniMaxH3ImagePromptWeightPreset.execute(
+    clip=execute_clip, model=execute_model, text="", presets_data='[{"enabled":true,"text":"a"},{"enabled":true,"text":"b"}]',
+    width=64, height=64, merge_separator="space",
+)
+check("H3 可切换空格分隔", FakeH3Conditioning.last_prompt == "a b", repr(FakeH3Conditioning.last_prompt))
 
 # ---------- 自定义 vision 尺寸 ----------
 official_calls = FakeH3Conditioning.calls

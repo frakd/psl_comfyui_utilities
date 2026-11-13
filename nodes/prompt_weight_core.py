@@ -21,6 +21,7 @@ _WEIGHT_RE = re.compile(r"\(([^():]+):(-?\d*\.?\d+)\)")
 # The slider exposes -2..2: >1 emphasizes, 1 is neutral, 0 removes, <0 subtracts.
 _MIN_ENTRY_WEIGHT = -2.0
 _MAX_ENTRY_WEIGHT = 2.0
+MERGE_SEPARATORS = {"space": " ", "none": "", "newline": "\n", "comma": ", "}
 
 # Conditioning cache: merged text in, (cond, token ids, cond_len) out.
 _MAX_CACHE_ENTRIES = 4
@@ -244,12 +245,14 @@ def extract_weighted_terms(text):
     return clean, terms
 
 
-def merge_prompt(user_text, entries, order="before"):
-    """Put the entry block before or after the user prompt; weights stay out of the text."""
+def merge_prompt(user_text, entries, order="before", separator=" "):
+    """Put the entry block before or after the user prompt; weights stay out of the text.
+
+    `separator` joins the entries only; the block/user-text boundary keeps a
+    space so a trailing ')' cannot merge with the separator comma in BPE.
+    """
     user_text = str(user_text or "").strip()
-    # Spaces keep a trailing ')' from merging with the separator comma in BPE,
-    # so the phrase keeps the same tokens as in its standalone template.
-    block = " ".join(text for text, _ in entries if text)
+    block = str(separator or "").join(text for text, _ in entries if text)
     if not block:
         return user_text
     if not user_text:

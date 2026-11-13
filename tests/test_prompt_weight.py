@@ -58,6 +58,9 @@ check("预设在前", core.merge_prompt("user prompt", [("a", 1.0), ("b", 2.0)],
 check("预设在后", core.merge_prompt("user prompt", [("a", 1.0), ("b", 2.0)], "after") == "user prompt a b")
 check("没有预设", core.merge_prompt("user prompt", [], "before") == "user prompt")
 check("没有用户文本", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "after") == "a b")
+check("条目无分隔", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "before", separator="") == "ab")
+check("条目换行分隔", core.merge_prompt("", [("a", 1.0), ("b", 2.0)], "before", separator="\n") == "a\nb")
+check("条目逗号分隔", core.merge_prompt("u", [("a", 1.0), ("b", 2.0)], "before", separator=", ") == "a, b u")
 
 
 # ---------- 短语定位（假 clip，验证算法；真实 tokenizer 另行核对） ----------
