@@ -481,14 +481,6 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                 io.Int.Input("width", default=0, min=0, max=_MAX_RESOLUTION, step=32,
                              tooltip="0 使用 image_1 的尺寸；没有图片时使用 2048。"),
                 io.Int.Input("height", default=0, min=0, max=_MAX_RESOLUTION, step=32),
-                io.Combo.Input("vision_short_edge", display_name="视觉短边", options=_VISION_SHORT_EDGES,
-                               default="auto",
-                               tooltip="auto/1024 完全走官方 H3 Image 路径；其他值是实验性：只改 Qwen vision 编码的短边，"
-                                       "VAE reference latent 仍按官方 1024~2048 编码。接图时生效。"),
-                io.Float.Input("image_strength", display_name="图片条件权重", default=1.0, min=0.0, max=4.0,
-                               step=0.05,
-                               tooltip="仅在视觉短边为自定义值时生效，作用在 vision token 的 attention logit 上："
-                                       "0 静音，1 中性，>1 强化。VAE reference latent 不受影响。"),
                 io.Boolean.Input("empty_image", display_name="空图条件", default=False,
                                  label_on="on", label_off="off",
                                  tooltip="纯文生图时，在采样早期给文本编码器一个空白图片槽位，软化 H3 偏硬的文生图渲染。"
@@ -503,6 +495,14 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
                                   template=io.Autogrow.TemplatePrefix(input=io.Image.Input("image"),
                                                                       prefix="image_", min=0, max=100),
                                   tooltip="可选。参考图；image_1 是编辑底图，提示词里可用 <Picture 1> 引用。"),
+                io.Combo.Input("vision_short_edge", display_name="视觉短边", options=_VISION_SHORT_EDGES,
+                               default="auto",
+                               tooltip="auto/1024 完全走官方 H3 Image 路径；其他值是实验性：只改 Qwen vision 编码的短边，"
+                                       "VAE reference latent 仍按官方 1024~2048 编码。接图时生效。"),
+                io.Float.Input("image_strength", display_name="图片条件权重", default=1.0, min=0.0, max=4.0,
+                               step=0.05,
+                               tooltip="仅在视觉短边为自定义值时生效，作用在 vision token 的 attention logit 上："
+                                       "0 静音，1 中性，>1 强化。VAE reference latent 不受影响。"),
             ],
             outputs=[io.Model.Output(display_name="model"),
                      io.Conditioning.Output(display_name="positive"),
@@ -511,8 +511,8 @@ class MiniMaxH3ImagePromptWeightPreset(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, model, text="", merge_order="before", cache_mode="enabled", presets_data="[]",
-                width=0, height=0, vision_short_edge="auto", image_strength=1.0, empty_image=False,
-                empty_start=0.0, empty_end=0.25, vae=None, images=None):
+                width=0, height=0, empty_image=False, empty_start=0.0, empty_end=0.25,
+                vae=None, images=None, vision_short_edge="auto", image_strength=1.0):
         entries = parse_presets(presets_data)
         clean_text, user_terms = extract_weighted_terms(text or "")
         merged = merge_prompt(clean_text, entries, merge_order)
