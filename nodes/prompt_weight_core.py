@@ -50,6 +50,11 @@ def _cache_key(clip, text, extra=()):
     )
 
 
+def cache_key(clip, text, extra=()):
+    """Stable encode-cache key; callers must still verify object identity."""
+    return _cache_key(clip, text, extra)
+
+
 def _conditioning_has_hooks(conditioning):
     try:
         for item in conditioning:

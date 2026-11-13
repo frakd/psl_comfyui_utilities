@@ -5,6 +5,7 @@ from .audio_filter import AudioHarmonicNotch, AudioHarshnessSuppressor, AudioRef
 from .cached_clip_text_encode import CachedCLIPTextEncode
 from .deep_vram_cleanup import DeepVRAMCleanup
 from .h3_av_lora import MiniMaxH3AVLoRAStack
+from .h3_prompt_weight import MiniMaxH3ImagePromptWeightPreset
 from .image_container import ImageContainer
 from .lora_step_schedule import PSLLoRAStepSchedule
 from .mask_paint_output import MaskPaintOutput
@@ -28,6 +29,7 @@ _NODE_CLASSES = (
     CachedCLIPTextEncode,
     AnySwitch,
     MiniMaxH3AVLoRAStack,
+    MiniMaxH3ImagePromptWeightPreset,
     AspectRatioSelectorNode,
     ModelReroute,
     MaskPaintOutput,

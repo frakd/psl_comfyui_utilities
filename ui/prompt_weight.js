@@ -6,7 +6,7 @@
 
 import { app } from '../../scripts/app.js';
 
-const NODE_NAME = "MOSSImagePromptWeightPreset";
+const NODE_NAMES = ["MOSSImagePromptWeightPreset", "MiniMaxH3ImagePromptWeightPreset"];
 const MIN_WEIGHT = -2;
 const MAX_WEIGHT = 2;
 const WEIGHT_STEP = 0.05;
@@ -18,6 +18,7 @@ const WIDGET_SLACK = 24;
 // The edit options only matter with a reference image; until one is wired the
 // node behaves like the plain text preset node.
 const EDIT_WIDGETS = ["edit_format", "image_strength", "strength_schedule"];
+const EMPTY_IMAGE_WIDGETS = ["empty_start", "empty_end"];
 const IMAGE_INPUT_RE = /(?:^|\.)image_\d+$/;
 const DEFAULT_EDIT_FORMAT = "Moss-Image-Edit";
 let styleReady = false;
@@ -335,13 +336,29 @@ function setup(node) {
     step(attempts);
   }
 
-  function refreshEditWidgets() {
+  function refreshConditionalWidgets(emptyValue) {
+    const empty = node.widgets?.find((widget) => widget.name === "empty_image");
+    if (!empty) return false;
+    const hasImage = hasConnectedImage(node);
+    let changed = false;
+    // Empty-image is a text-to-image trick; an edit reference supersedes it.
+    changed = setWidgetShown(empty, !hasImage) || changed;
+    const showRange = !hasImage && Boolean(emptyValue === undefined ? empty.value : emptyValue);
+    for (const name of EMPTY_IMAGE_WIDGETS) {
+      const widget = node.widgets?.find((candidate) => candidate.name === name);
+      changed = setWidgetShown(widget, showRange) || changed;
+    }
+    return changed;
+  }
+
+  function refreshEditWidgets(emptyValue) {
     const show = hasConnectedImage(node);
     let changed = false;
     for (const name of EDIT_WIDGETS) {
       const widget = node.widgets?.find((candidate) => candidate.name === name);
       changed = setWidgetShown(widget, show) || changed;
     }
+    changed = refreshConditionalWidgets(emptyValue) || changed;
     if (!changed) return;
     lastFitH = 0;
     scheduleFit();
@@ -740,7 +757,17 @@ function setup(node) {
     scheduleFit();
   }
 
-  node._mossPresetUI = { restore, refreshEditWidgets };
+  node._mossPresetUI = { restore, refreshEditWidgets, refreshConditionalWidgets };
+  const emptyToggle = node.widgets?.find((widget) => widget.name === "empty_image");
+  if (emptyToggle && !emptyToggle._pslEmptyHooked) {
+    emptyToggle._pslEmptyHooked = true;
+    const originalEmptyCallback = emptyToggle.callback;
+    emptyToggle.callback = function (value) {
+      const result = originalEmptyCallback?.apply(this, arguments);
+      refreshEditWidgets(value);
+      return result;
+    };
+  }
   sanitizeEditWidgets(node);
   render();
   commit();
@@ -767,7 +794,7 @@ function setup(node) {
 app.registerExtension({
   name: "PSL.PromptWeightPresets",
   beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData?.name !== NODE_NAME) return;
+    if (!NODE_NAMES.includes(nodeData?.name)) return;
 
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
