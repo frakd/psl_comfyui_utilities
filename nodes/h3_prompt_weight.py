@@ -203,12 +203,31 @@ def _apply_empty_image(cond, picture, picture_dict, start, end):
     return with_picture
 
 
+def _build_weight_tensors(value_pos, value_factor, bias_pos, bias_value, offset, seq_len, device, dtype):
+    multiplier = None
+    if value_pos:
+        positions = torch.tensor(value_pos, device=device) + offset
+        if int(positions.max()) >= seq_len:
+            return None
+        multiplier = torch.ones(1, 1, seq_len, 1, device=device, dtype=dtype)
+        multiplier[0, 0, positions, 0] = torch.tensor(value_factor, device=device, dtype=dtype)
+    bias = None
+    if bias_pos:
+        positions = torch.tensor(bias_pos, device=device) + offset
+        if int(positions.max()) >= seq_len:
+            return None
+        bias = torch.zeros(1, 1, 1, seq_len, device=device, dtype=dtype)
+        bias[0, 0, 0, positions] = torch.tensor(bias_value, device=device, dtype=dtype)
+    return multiplier, bias
+
+
 def _make_forward_wrapper(pairs, prompt_len, name):
     value_pos = [position for position, factor, _ in pairs if factor != 1.0]
     value_factor = [factor for _, factor, _ in pairs if factor != 1.0]
     bias_pos = [position for position, _, bias in pairs if bias != 0.0]
     bias_value = [bias for _, _, bias in pairs if bias != 0.0]
     warned = set()
+    tensor_cache = {}
 
     def warn_once(key, message):
         if key not in warned:
@@ -221,13 +240,39 @@ def _make_forward_wrapper(pairs, prompt_len, name):
         if transformer_options.get("cond_or_uncond") == [0]:
             offset = context.shape[1] - prompt_len
             if offset >= 0:
-                device = context.device
-                transformer_options[_STATE_KEY] = (
-                    torch.tensor(value_pos, device=device) + offset if value_pos else None,
-                    torch.tensor(value_factor, device=device)[:, None] if value_pos else None,
-                    torch.tensor(bias_pos, device=device) + offset if bias_pos else None,
-                    torch.tensor(bias_value, device=device) if bias_pos else None,
-                )
+                payload = kwargs.get("minimax_payload") or {}
+                layout = payload.get("layout") if isinstance(payload, dict) else None
+                seq_len = getattr(layout, "seq_len", None)
+                tensors = None
+                if isinstance(seq_len, int) and seq_len > 0:
+                    cache_key_ = (seq_len, context.device, context.dtype)
+                    tensors = tensor_cache.get(cache_key_)
+                    if tensors is None:
+                        tensors = _build_weight_tensors(
+                            value_pos, value_factor, bias_pos, bias_value,
+                            offset, seq_len, context.device, context.dtype,
+                        )
+                        if tensors is not None:
+                            tensor_cache[cache_key_] = tensors
+                if tensors is not None:
+                    # Precomputed outside the per-block allocation scopes: blocks
+                    # only do an in-place multiply and reuse the bias mask.
+                    transformer_options[_STATE_KEY] = (tensors[0], tensors[1], None, None, None, None)
+                elif not value_pos and not bias_pos:
+                    transformer_options[_STATE_KEY] = (None, None, None, None, None, None)
+                elif seq_len is not None:
+                    warn_once("layout", f"packed layout length {seq_len} cannot hold the prompt positions; "
+                                        "weighting skipped")
+                else:
+                    # Fallback for a sampler that does not expose the packed layout.
+                    device = context.device
+                    transformer_options[_STATE_KEY] = (
+                        None, None,
+                        torch.tensor(value_pos, device=device) + offset if value_pos else None,
+                        torch.tensor(value_factor, device=device)[:, None] if value_pos else None,
+                        torch.tensor(bias_pos, device=device) + offset if bias_pos else None,
+                        torch.tensor(bias_value, device=device) if bias_pos else None,
+                    )
             else:
                 warn_once("length", f"conditioning length {context.shape[1]} is shorter than the prompt "
                                     f"({prompt_len}); weighting skipped")
@@ -237,22 +282,35 @@ def _make_forward_wrapper(pairs, prompt_len, name):
 
 
 def _make_attention_override(weights, comfy_attention, previous):
-    value_idx, value_factor, bias_idx, bias_value = weights
+    multiplier, bias_tensor, value_idx, value_factor, bias_idx, bias_value = weights
 
     def override(func, q, k, v, heads, mask=None, **kwargs):
-        if value_idx is not None:
+        if multiplier is not None:
+            current = multiplier
+            if current.dtype != v.dtype:
+                current = current.to(v.dtype)
+            if v.ndim == 3 and current.ndim == 4:
+                current = current.view(current.shape[0], current.shape[2], current.shape[3])
+            v.mul_(current)
+        elif value_idx is not None:
             factor = value_factor.to(v.dtype)
             v[..., value_idx, :] = v[..., value_idx, :] * factor
-        if bias_idx is not None and mask is None:
+        if bias_tensor is not None and mask is None:
             key_count = k.shape[-2] if kwargs.get("skip_reshape") else k.shape[1]
-            bias = q.new_zeros(1, 1, 1, key_count)
-            bias[..., bias_idx] = bias_value.to(q.dtype)
-            # The default comfy backend understands additive masks; a custom
-            # sparse/int8 backend may drop them, so avoid the preferred backend
-            # when an emphasis bias has to ride along.
-            return func(q, k, v, heads, mask=bias, **kwargs)
+            mask = bias_tensor
+            if mask.shape[-1] != key_count:
+                if mask.shape[-1] < key_count:
+                    mask = torch.nn.functional.pad(mask, (0, key_count - mask.shape[-1]))
+                else:
+                    mask = mask[..., :key_count]
+        elif bias_idx is not None and mask is None:
+            key_count = k.shape[-2] if kwargs.get("skip_reshape") else k.shape[1]
+            mask = q.new_zeros(1, 1, 1, key_count)
+            mask[..., bias_idx] = bias_value.to(q.dtype)
         if previous is not None:
             return previous(func, q, k, v, heads, mask=mask, **kwargs)
+        # Keep the checkpoint's own backend (H3 Image ships comfy_kitchen_int8):
+        # int8 attention accepts an additive mask; sol/sage fall back internally.
         attention = comfy_attention.function if comfy_attention is not None else None
         return (attention or func)(q, k, v, heads, mask=mask, **kwargs)
 

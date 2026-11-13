@@ -182,10 +182,27 @@ result = wrapper(executor, None, None, torch.zeros(1, 6, 4), options)
 weights = result.get(h3._STATE_KEY)
 check("positive 条件写入权重", weights is not None, repr(weights))
 if weights is not None:
-    check("value 位置加 offset", weights[0].tolist() == [3], repr(weights[0].tolist()))
-    check("value 因子形状", tuple(weights[1].shape) == (1, 1), repr(tuple(weights[1].shape)))
-    check("bias 位置加 offset", weights[2].tolist() == [5], repr(weights[2].tolist()))
-    check("bias 数值", weights[3].tolist() == [2.0], repr(weights[3].tolist()))
+    check("无 layout 时回退到位置索引", weights[0] is None and weights[1] is None, repr(weights))
+    check("value 位置加 offset", weights[2].tolist() == [3], repr(weights[2].tolist()))
+    check("value 因子形状", tuple(weights[3].shape) == (1, 1), repr(tuple(weights[3].shape)))
+    check("bias 位置加 offset", weights[4].tolist() == [5], repr(weights[4].tolist()))
+    check("bias 数值", weights[5].tolist() == [2.0], repr(weights[5].tolist()))
+
+precomputed = wrapper(
+    executor, None, None, torch.zeros(1, 6, 4),
+    {"cond_or_uncond": [0]},
+    minimax_payload={"layout": types.SimpleNamespace(seq_len=8)},
+)
+state = precomputed.get(h3._STATE_KEY)
+check("有 layout 时预计算乘子/mask", state is not None and state[0] is not None and state[1] is not None,
+      repr(state))
+if state is not None and state[0] is not None:
+    check("预计算 value 乘子", state[0].shape == (1, 1, 8, 1) and state[0][0, 0, 3, 0].item() == 0.5
+          and state[0][0, 0, 2, 0].item() == 1.0, repr(state[0][0, 0, :, 0].tolist()))
+    check("预计算 bias mask", state[1][0, 0, 0, 5].item() == 2.0 and state[1][0, 0, 0, 4].item() == 0.0,
+          repr(state[1].tolist()))
+    check("预计算后不再使用位置索引", state[2] is None and state[3] is None and state[4] is None,
+          repr(state))
 
 skipped = wrapper(executor, None, None, torch.zeros(1, 6, 4), {"cond_or_uncond": [0, 1]})
 check("非纯正条件不写入权重", h3._STATE_KEY not in skipped, repr(skipped))
@@ -198,22 +215,51 @@ def passthrough(_q, _k, v, _heads, mask=None, **_kwargs):
     return v if mask is None else mask
 
 
-value_weights = (torch.tensor([3]), torch.tensor([[0.5]]), None, None)
+multiplier = torch.ones(1, 1, 8, 1)
+multiplier[0, 0, 3, 0] = 0.5
+value_weights = (multiplier, None, None, None, None, None)
 v = torch.ones(1, 2, 8, 4)
 h3._make_attention_override(value_weights, None, None)(
     passthrough, torch.zeros(1, 2, 8, 4), torch.zeros(1, 2, 8, 4), v, 2, skip_reshape=True
 )
-check("4D v 按位置缩放", v[0, 0, 3, 0].item() == 0.5 and v[0, 0, 2, 0].item() == 1.0,
+check("4D v 按预计算乘子缩放", v[0, 0, 3, 0].item() == 0.5 and v[0, 0, 2, 0].item() == 1.0,
       repr(v[0, 0, :4, 0].tolist()))
 
-bias_weights = (None, None, torch.tensor([4]), torch.tensor([2.0]))
+bias_tensor = torch.zeros(1, 1, 1, 8)
+bias_tensor[0, 0, 0, 4] = 2.0
+bias_weights = (None, bias_tensor, None, None, None, None)
 bias = h3._make_attention_override(bias_weights, None, None)(
     passthrough, torch.zeros(1, 2, 8, 4), torch.zeros(1, 2, 8, 4), torch.ones(1, 2, 8, 4),
     2, skip_reshape=True,
 )
-check("additive mask 写到目标位置",
+check("预计算 additive mask 直接复用",
       tuple(bias.shape) == (1, 1, 1, 8) and bias[0, 0, 0, 4].item() == 2.0
       and bias[0, 0, 0, 3].item() == 0.0, repr(bias.tolist()))
+
+captured = {}
+
+
+class FakeAttention:
+    def __init__(self, function):
+        self.function = function
+
+
+def preferred(_q, _k, v, _heads, mask=None, **_kwargs):
+    captured["mask"] = mask
+    return v
+
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("global attention backend should not be used")
+
+
+h3._make_attention_override(bias_weights, FakeAttention(preferred), None)(
+    forbidden, torch.zeros(1, 2, 8, 4), torch.zeros(1, 2, 8, 4), torch.ones(1, 2, 8, 4),
+    2, skip_reshape=True,
+)
+check("有 bias 时保留 checkpoint 的 attention 后端",
+      captured.get("mask") is not None and captured["mask"][0, 0, 0, 4].item() == 2.0,
+      repr(captured.get("mask")))
 
 # ---------- 图片顺序 ----------
 left = torch.zeros(1, 2, 2, 3)
