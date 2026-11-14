@@ -413,6 +413,12 @@ app.registerExtension({
 
         // ── 渲染 ──
         function render() {
+            // 载入工作流后比例可能晚于初始矩形更新（initRectSize 用的是默认比例），
+            // 渲染前校验一次，确保画出的矩形始终等于当前宽高比
+            const wantRatio = state.dragW / state.dragH;
+            if (Math.abs(state.rectW / state.rectH / wantRatio - 1) > 0.001) {
+                fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
+            }
             const rw = state.rectW;
             const rh = state.rectH;
             rectEl.style.width  = rw + 'px';
