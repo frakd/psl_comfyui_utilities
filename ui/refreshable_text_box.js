@@ -8,12 +8,12 @@ import { app } from '../../scripts/app.js';
 //  锁定后同样发送真实文本。
 //
 //  按钮区是 DOM widget（2×2 网格，serialize:false，不进 prompt/工作流）：
-//    第一行  锁定开关 + 还原上游（状态类操作）
+//    第一行  锁定开关 + 清空文本（状态类操作）
 //    第二行  复制 + 粘贴（剪贴板操作，按「复制粘贴」阅读顺序排列）
-//  复制/粘贴的区分靠三重编码，扫一眼即可分辨：
-//    颜色：蓝 = 内容出去（复制），绿 = 内容进来（粘贴）
-//    图标：双方块 = 复制，写字板 = 粘贴
-//    tooltip：明写「文本框 → 剪贴板 / 剪贴板 → 文本框」
+//  复制/粘贴/清空的区分靠三重编码，扫一眼即可分辨：
+//    颜色：蓝 = 内容出去（复制），绿 = 内容进来（粘贴），红 = 清空
+//    图标：双方块 = 复制，写字板 = 粘贴，垃圾桶 = 清空
+//    tooltip：明写「文本框 → 剪贴板 / 剪贴板 → 文本框 / 清空文本框内容」
 //  锁定态：锁定按钮琥珀色填充 + 光晕，锁没锁一眼可见。
 // ============================================================
 
@@ -55,9 +55,10 @@ function injectStyles() {
         .rtx-btn:hover { filter: brightness(1.18); }
         .rtx-btn:active { filter: brightness(0.92); }
         .rtx-btn svg { width: 14px; height: 14px; flex: 0 0 auto; }
-        /* 剪贴板行：蓝 = 内容出去（复制），绿 = 内容进来（粘贴） */
+        /* 剪贴板行：蓝 = 内容出去（复制），绿 = 内容进来（粘贴）；红 = 清空 */
         .rtx-btn.copy { background: #2c5d8f; border-color: #3f79ad; }
         .rtx-btn.paste { background: #2c7a4b; border-color: #3f9a63; }
+        .rtx-btn.clear { background: #8f2c2c; border-color: #b03f3f; }
         /* 锁定态：琥珀色填充 + 光晕 */
         .rtx-btn.lock.locked {
             background: #b57a10;
@@ -76,7 +77,7 @@ const ICONS = {
     lockOpen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>',
     copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
     paste: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>',
-    restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
+    clear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
 };
 
 async function readClipboard() {
@@ -113,7 +114,7 @@ app.registerExtension({
         // 界面上再显示一份就重了。hidden 不影响它进 prompt 和存工作流。
         lockW.hidden = true;
 
-        // 最近一次从上游收到的文本，供「还原上游」按钮使用。
+        // 最近一次从上游收到的文本，允许覆盖时用它刷新文本框显示。
         // 只在运行时存在，刷新页面后要等下一次运行才会重新填充。
         let upstream = null;
 
@@ -201,13 +202,9 @@ app.registerExtension({
             '未锁定：运行时自动用上游文本刷新显示，且不影响运行缓存（点击锁定）',
             () => { lockW.value = !lockW.value; syncLockUI(); });
 
-        const restoreBtn = makeBtn('', ICONS.restore, '还原上游',
-            '把文本框内容还原成最近一次运行从上游收到的文本（没跑过则不动）',
-            () => {
-                // 没跑过（例如刚刷新页面）时 upstream 为 null，此时不动文本，
-                // 免得一键把用户内容清成空。
-                if (upstream !== null) textW.value = upstream;
-            });
+        const clearBtn = makeBtn('clear', ICONS.clear, '清空文本',
+            '清空文本：把文本框内容清空',
+            () => { textW.value = ''; });
 
         const copyBtn = makeBtn('copy', ICONS.copy, '复制全部',
             '复制全部：文本框 → 剪贴板',
@@ -220,8 +217,8 @@ app.registerExtension({
                 if (t !== null) textW.value = t;
             });
 
-        // 网格按行填充：第一行 锁定/还原，第二行 复制/粘贴
-        root.append(lockBtn, restoreBtn, copyBtn, pasteBtn);
+        // 网格按行填充：第一行 锁定/清空，第二行 复制/粘贴
+        root.append(lockBtn, clearBtn, copyBtn, pasteBtn);
 
         function syncLockUI() {
             const locked = !lockW.value;   // allow_overwrite=false 即锁定
