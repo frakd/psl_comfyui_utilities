@@ -33,6 +33,11 @@ def test_schema_defaults():
     schema = Node.GET_SCHEMA()
     assert schema.node_id == "AspectRatioSelectorNode"
     assert [output.id for output in schema.outputs] == ["width", "height", "actual_megapixels", "image"]
+    # 位置敏感：前端按位置恢复 widgets_values，新 widget 必须排在 aspect_data_json 之后，
+    # 否则旧工作流的比例 JSON 会被灌进 upscale_method
+    assert [item.id for item in schema.inputs] == [
+        "image", "total_megapixels", "min_step", "aspect_data_json", "upscale_method", "crop",
+    ]
     inputs = {item.id: item.as_dict() for item in schema.inputs}
     assert inputs["image"]["optional"] is True
     assert inputs["upscale_method"]["default"] == "lanczos"

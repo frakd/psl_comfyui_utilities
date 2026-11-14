@@ -82,25 +82,27 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     max=64,
                     tooltip="输出的宽高必须是此值的整数倍。ComfyUI 中常设为 8 以适配 VAE 编码",
                 ),
+                # 新 widget 必须追加在 aspect_data_json 之后：前端按位置恢复
+                # widgets_values，插在它前面会让旧工作流的比例 JSON 错位进新 widget
+                io.String.Input(
+                    "aspect_data_json",
+                    display_name="比例数据",
+                    optional=True,
+                    tooltip="JS 前端写入的比例数据，不要手填",
+                ),
                 io.Combo.Input(
                     "upscale_method",
                     display_name="缩放算法",
                     options=UPSCALE_METHODS,
                     default="lanczos",
-                    tooltip="缩放输入图时使用的插值算法，与官方缩放图像节点一致",
+                    tooltip="缩放输入图时使用的插值算法，与官方缩放图像节点一致（未接输入图时隐藏）",
                 ),
                 io.Combo.Input(
                     "crop",
                     display_name="裁剪",
                     options=CROP_METHODS,
                     default="disabled",
-                    tooltip="disabled：直接拉伸到目标尺寸；center：先按目标比例中心裁剪再缩放，不改变画面比例",
-                ),
-                io.String.Input(
-                    "aspect_data_json",
-                    display_name="比例数据",
-                    optional=True,
-                    tooltip="JS 前端写入的比例数据，不要手填",
+                    tooltip="disabled：直接拉伸到目标尺寸；center：先按目标比例中心裁剪再缩放，不改变画面比例（未接输入图时隐藏）",
                 ),
             ],
             outputs=[

@@ -204,6 +204,8 @@ app.registerExtension({
         const totalMpW = node.widgets.find(w => w.name === 'total_megapixels');
         const minStepW = node.widgets.find(w => w.name === 'min_step');
         const dataW     = node.widgets.find(w => w.name === 'aspect_data_json');
+        const upscaleW  = node.widgets.find(w => w.name === 'upscale_method');
+        const cropW     = node.widgets.find(w => w.name === 'crop');
         if (dataW) dataW.hidden = true;
 
         // ── 状态 ──
@@ -453,8 +455,53 @@ app.registerExtension({
         function refreshInputPresetAvailability() {
             if (state.useInput && !imageConnected()) fallbackFromInput();
             if (state.useInput) applyInputAspect();
+            updateScaleWidgetsVisibility();
             rebuildDropdown();
             updateAll();
+        }
+
+        // ── 缩放算法 / 裁剪只在接入图片时显示 ──
+        // 新前端只认 hidden，老前端只认 computeSize；两边都设（同 prompt_weight），
+        // 否则某个渲染面会留下空行或残留控件。
+        function setWidgetShown(widget, shown) {
+            if (!widget) return false;
+            if (!("_pslComputeSize" in widget)) widget._pslComputeSize = widget.computeSize;
+            if (!("_pslHiddenProp" in widget)) widget._pslHiddenProp = widget.hidden;
+            const hide = !shown;
+            if (Boolean(widget._pslHidden) === hide) return false;
+            widget._pslHidden = hide;
+            widget.computeSize = hide ? () => [0, -4] : widget._pslComputeSize;
+            widget.hidden = hide ? true : widget._pslHiddenProp;
+            return true;
+        }
+
+        let settleTimer = null;
+        // 只长不缩：显隐 widget 后若当前高度装不下就补高，用户手动拉大的尺寸不动
+        function settleNodeHeight(attempts = 5) {
+            if (settleTimer) {
+                clearTimeout(settleTimer);
+                settleTimer = null;
+            }
+            const step = (left) => {
+                if (!node.graph) return;
+                const width = node.size?.[0];
+                if (!Number.isFinite(width) || width <= 0) return;
+                const total = node.computeSize?.([width, 0]);
+                const height = Array.isArray(total) ? total[1] : null;
+                if (Number.isFinite(height) && height > node.size[1] + 0.5) {
+                    node.size = [width, height];
+                    node.graph.setDirtyCanvas(true, true);
+                }
+                if (left > 1) settleTimer = setTimeout(() => step(left - 1), 40);
+            };
+            step(attempts);
+        }
+
+        function updateScaleWidgetsVisibility() {
+            const shown = imageConnected();
+            const a = setWidgetShown(upscaleW, shown);
+            const b = setWidgetShown(cropW, shown);
+            if (a || b) settleNodeHeight();
         }
 
         // ── 预设选择 ──
