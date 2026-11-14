@@ -8,6 +8,10 @@ import { app } from '../../scripts/app.js';
 
 const INPUT_LABEL = '输入图比例';
 
+// 与后端 schema 的 Combo options 保持一致，用于识别并纠正被错位写入的旧值
+const UPSCALE_VALUES = ['nearest-exact', 'bilinear', 'area', 'bicubic', 'lanczos'];
+const CROP_VALUES = ['disabled', 'center'];
+
 const PRESETS = [
     { label: '自由比例', w: null, h: null },
     { label: '1:1 正方形',  w: 1, h: 1 },
@@ -207,6 +211,44 @@ app.registerExtension({
         const upscaleW  = node.widgets.find(w => w.name === 'upscale_method');
         const cropW     = node.widgets.find(w => w.name === 'crop');
         if (dataW) dataW.hidden = true;
+
+        function parseAspectJson(raw) {
+            try {
+                const ex = JSON.parse(raw || '{}');
+                return ex && typeof ex === 'object' ? ex : null;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // 中间版本把缩放算法插在隐藏 JSON 前面，旧工作流的比例 JSON 会被恢复进
+        // upscale_method（旧 schema 下也可能是 crop）。这里把 JSON 搬回隐藏 widget，
+        // 再按枚举表纠正两个下拉，避免坏值继续进 prompt 导致校验失败。
+        function looksLikeAspectData(value) {
+            if (typeof value !== 'string') return false;
+            const ex = parseAspectJson(value);
+            return !!ex && Number.isFinite(ex.w) && Number.isFinite(ex.h);
+        }
+
+        function repairStaleWidgetValues() {
+            const cur = parseAspectJson(dataW?.value);
+            const dataMissing = !cur || !Number.isFinite(cur.w) || !Number.isFinite(cur.h);
+            if (dataMissing && dataW) {
+                for (const candidate of [upscaleW?.value, cropW?.value]) {
+                    if (looksLikeAspectData(candidate)) {
+                        dataW.value = candidate;
+                        break;
+                    }
+                }
+            }
+            if (upscaleW && !UPSCALE_VALUES.includes(upscaleW.value)) {
+                upscaleW.value = 'lanczos';
+            }
+            if (cropW && !CROP_VALUES.includes(cropW.value)) {
+                cropW.value = 'disabled';
+            }
+        }
+        repairStaleWidgetValues();
 
         // ── 状态 ──
         let state = {
@@ -634,7 +676,9 @@ app.registerExtension({
         if (minStepW) minStepW.callback = onWidgetChanged;
 
         // ==================== 连接变化：输入图比例选项随连接状态增删 ====================
-        // 载入工作流时连线可能晚于 onConfigure 完成，统一延后一帧刷新
+        // 载入工作流时连线与 widget 值都可能晚于 nodeCreated 完成，统一延后一帧刷新。
+        // 注意：新前端在 nodeCreated / onConfigure 时 widget 值尚未恢复，读取比例和
+        // 纠正错位值都必须放在这里，否则会拿默认值覆盖已保存的数据。
         let refreshQueued = false;
         function scheduleRefresh() {
             if (refreshQueued) return;
@@ -642,12 +686,16 @@ app.registerExtension({
             setTimeout(() => {
                 refreshQueued = false;
                 try {
+                    repairStaleWidgetValues();
+                    loadAspectData(dataW?.value);
                     refreshInputPresetAvailability();
                 } catch (e) {
                     console.warn('[AspectRatioSelector] 刷新输入图比例选项失败', e);
                 }
             }, 0);
         }
+        // loadedGraphNode 在节点从工作流恢复完成后触发（widget 值已就位）
+        node._pslArsRefresh = scheduleRefresh;
 
         const prevOnConnectionsChange = node.onConnectionsChange;
         node.onConnectionsChange = function (type, index, connected, link, ioSlot) {
@@ -688,11 +736,15 @@ app.registerExtension({
         const prevOnConfigure = node.onConfigure;
         node.onConfigure = function (infoObj) {
             const r = prevOnConfigure?.apply(this, arguments);
-            loadAspectData(dataW?.value);
-            rebuildDropdown();
-            updateAll();
-            scheduleRefresh();   // 连线状态可能在此之后才恢复
+            scheduleRefresh();   // widget 值与连线可能在此之后才恢复，延后统一读取
             return r;
         };
+    },
+
+    // 工作流恢复结束后再读一次：新前端里 nodeCreated/onConfigure 触发时
+    // widget 值可能还没填好，这里才是值已就位的可靠时机
+    async loadedGraphNode(node) {
+        if (node.comfyClass !== 'AspectRatioSelectorNode') return;
+        node._pslArsRefresh?.();
     },
 });
