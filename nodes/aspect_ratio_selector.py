@@ -18,7 +18,7 @@ def _parse_aspect_data(raw):
 
 
 def _manual_ratio(data):
-    """前端写入的宽高（自由/预设模式的比例；输入图比例模式下是最近一次运行得到的比例）。"""
+    """前端写入的宽高（自由/预设模式的比例；「同输入图」模式下是最近一次运行得到的比例）。"""
     try:
         w = float(data.get("w", 16))
         h = float(data.get("h", 9))
@@ -43,7 +43,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
     """可视化分辨率选择器 — JS 前端拖拽矩形选比例，Python 后端计算整数 W×H 输出。
 
     可选接入一张图片：节点会把它按算出的 W×H 缩放（或中心裁剪）后从 image 输出；
-    连接图片后前端会在预设里多出「输入图比例」，输出宽高改用输入图的宽高比。
+    连接图片后前端会在预设里多出「同输入图」，输出宽高改用输入图的宽高比。
     """
 
     @classmethod
@@ -55,7 +55,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
             description=(
                 "可视化分辨率选择器：拖矩形选宽高比，按总像素数换算成整数 W×H。"
                 "可选接入图片：按同样的 W×H 缩放/中心裁剪后从 image 输出；"
-                "连接图片后预设列表会多出「输入图比例」，宽高比取自输入图，总像素数与最小步长仍生效。"
+                "连接图片后预设列表会多出「同输入图」，宽高比取自输入图，总像素数与最小步长仍生效。"
                 "未接图片时 image 输出为空。"
             ),
             inputs=[
@@ -63,7 +63,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     "image",
                     display_name="输入图（可选）",
                     optional=True,
-                    tooltip="可选输入图。连接后 image 输出为它按 width×height 缩放/裁剪的结果，预设里会多出「输入图比例」",
+                    tooltip="可选输入图。连接后 image 输出为它按 width×height 缩放/裁剪的结果，预设里会多出「同输入图」",
                 ),
                 io.Float.Input(
                     "total_megapixels",
@@ -145,7 +145,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
         if image is not None:
             input_h, input_w = int(image.shape[1]), int(image.shape[2])
 
-        # 「输入图比例」只在真的拿到图时生效；拿不到（未接线/上游被静音）就退回前端记录的最近比例
+        # 「同输入图」只在真的拿到图时生效；拿不到（未接线/上游被静音）就退回前端记录的最近比例
         if data.get("useInput") and input_w > 0 and input_h > 0:
             aspect_w, aspect_h = float(input_w), float(input_h)
         else:

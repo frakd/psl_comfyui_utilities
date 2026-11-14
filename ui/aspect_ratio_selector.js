@@ -6,7 +6,7 @@ import { app } from '../../scripts/app.js';
 //  可选输入图：多出「输入图比例」预设，运行后由后端 ui 回填真实比例
 // ============================================================
 
-const INPUT_LABEL = '输入图比例';
+const INPUT_LABEL = '同输入图';
 
 // 与后端 schema 的 Combo options 保持一致
 const UPSCALE_VALUES = ['nearest-exact', 'bilinear', 'area', 'bicubic', 'lanczos'];
@@ -439,7 +439,7 @@ app.registerExtension({
             info.classList.remove('unknown');
             const { w, h } = computeResolution(getTotalMp(), getMinStep(), state.dragW, state.dragH);
             const mp = (w * h / 10000).toFixed(2);
-            info.textContent = `${w} × ${h}  (${mp} 万像素)` + (state.useInput ? ' · 输入图比例' : '');
+            info.textContent = `${w} × ${h}  (${mp} 万像素)` + (state.useInput ? ` · ${INPUT_LABEL}` : '');
         }
 
         // 只重绘，不写隐藏 widget：载入工作流时 widget 值由前端恢复，
