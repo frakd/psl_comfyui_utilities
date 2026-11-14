@@ -108,6 +108,17 @@ def test_invalid_json_falls_back_to_16_9():
     assert result[:2] == (136, 72)
 
 
+def test_half_step_rounds_like_frontend():
+    # 400 万、步长 32、1:1：2000/32 = 62.5，前端 Math.round → 63（2016），
+    # 后端若用银行家舍入会得到 62（1984），这里锁死两者一致
+    result, _ = _run(
+        total_megapixels=400.0,
+        min_step=32,
+        aspect_data_json=json.dumps({"w": 1, "h": 1}),
+    )
+    assert result[:2] == (2016, 2016)
+
+
 def test_crop_center_vs_stretch():
     # 输入 640x480（4:3）。总像素 4 万 + 步长 48 → 图片目标 240×192（1.25），
     # 与输入比例有偏差：center 先裁掉左右各 20 列再缩放，disabled 直接拉伸
@@ -141,5 +152,6 @@ if __name__ == "__main__":
     test_input_ratio_falls_back_without_image()
     test_image_keeps_input_ratio()
     test_invalid_json_falls_back_to_16_9()
+    test_half_step_rounds_like_frontend()
     test_crop_center_vs_stretch()
     print("aspect ratio selector tests passed")

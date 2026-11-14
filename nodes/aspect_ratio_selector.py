@@ -34,8 +34,10 @@ def _compute_size(total_megapixels, min_step, aspect_w, aspect_h):
     ratio = aspect_w / aspect_h
     base_h = math.sqrt(total_px / ratio)
     base_w = total_px / base_h
-    w = round(base_w / min_step) * min_step
-    h = round(base_h / min_step) * min_step
+    # Python round() 是银行家舍入（62.5→62），前端 Math.round 是四舍五入（62.5→63）；
+    # 统一成四舍五入，否则预览显示的尺寸会和实际输出差一个步长
+    w = math.floor(base_w / min_step + 0.5) * min_step
+    h = math.floor(base_h / min_step + 0.5) * min_step
     return max(w, min_step), max(h, min_step)
 
 
