@@ -247,6 +247,27 @@ def parse_strength_schedule(raw):
     return [(index * width, (index + 1) * width, value) for index, value in enumerate(values)]
 
 
+def schedule_value_for_sigma(schedule, sigma):
+    """Pick the scheduled strength whose sigma range contains ``sigma``.
+
+    ``schedule`` is ``[(start_sigma, end_sigma, value), ...]`` with descending
+    boundaries converted from the percents by the model's ``percent_to_sigma``.
+    """
+    if not schedule or sigma is None:
+        return None
+    try:
+        current = float(sigma)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(current):
+        return None
+    for start, end, value in schedule:
+        if current <= start + 1e-6 and current >= end - 1e-6:
+            return value
+    # 数值边界兜底：超出首尾时回到最近的一端
+    return schedule[0][2] if current > schedule[0][0] else schedule[-1][2]
+
+
 def extract_weighted_terms(text):
     """Split (phrase:weight) terms out of free text; returns (clean_text, terms)."""
     text = str(text or "")

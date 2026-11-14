@@ -36,6 +36,7 @@ from .prompt_weight_core import (
     parse_presets,
     parse_strength_schedule,
     positions_from_ids,
+    schedule_value_for_sigma,
 )
 
 try:
@@ -142,7 +143,22 @@ def _attach_references(cond, vae, images, method):
     )
 
 
-def _make_forward_wrapper(pairs, text_len):
+def _make_schedule_bias_provider(ids, text_bias):
+    """Build (and cache) one ``context_attention_bias`` per scheduled value."""
+    cache = {}
+
+    def bias_for(value, device, dtype):
+        key = round(float(value), 6)
+        bias = cache.get(key)
+        if bias is None:
+            bias = _sum_bias(_image_bias(ids, key), text_bias)
+            cache[key] = bias
+        return None if bias is None else bias.to(device=device, dtype=dtype)
+
+    return bias_for
+
+
+def _make_forward_wrapper(pairs, text_len, schedule=None, schedule_bias=None):
     value_pos = [position for position, factor, _ in pairs if factor != 1.0]
     value_factor = [factor for _, factor, _ in pairs if factor != 1.0]
     bias_pos = [position for position, _, bias in pairs if bias != 0.0]
@@ -164,18 +180,30 @@ def _make_forward_wrapper(pairs, text_len):
             warn_once("rows", "cond_or_uncond is missing or uneven; cannot separate positive from negative, "
                               "weighting skipped")
         elif rows:
-            device = x.device
-            image_tokens = height * width
-            v_idx = torch.tensor(value_pos, device=device) + image_tokens if value_pos else None
-            v_factor = torch.tensor(value_factor, device=device, dtype=x.dtype) if value_pos else None
-            bias = None
-            if bias_pos:
-                bias = torch.zeros(batch, 1, 1, image_tokens + text_len, device=device, dtype=x.dtype)
-                positions = torch.tensor(bias_pos, device=device) + image_tokens
-                values = torch.tensor(bias_value, device=device, dtype=x.dtype)
-                for row in rows:
-                    bias[row, 0, 0, positions] = values
-            transformer_options[_STATE_KEY] = (rows, v_idx, v_factor, bias)
+            # 分段强度：按当前 sigma 选段，只覆盖本步的 context_attention_bias。
+            # conditioning 保持单条，避免每段各预计算一份 VAE reference ref_kv。
+            if schedule and schedule_bias is not None:
+                sigma = transformer_options.get("sigmas")
+                if torch.is_tensor(sigma):
+                    sigma = float(sigma.flatten()[0]) if sigma.numel() else None
+                value = schedule_value_for_sigma(schedule, sigma)
+                if value is not None:
+                    bias_tensor = schedule_bias(value, x.device, x.dtype)
+                    if bias_tensor is not None:
+                        kwargs["context_attention_bias"] = bias_tensor
+            if value_pos or bias_pos:
+                device = x.device
+                image_tokens = height * width
+                v_idx = torch.tensor(value_pos, device=device) + image_tokens if value_pos else None
+                v_factor = torch.tensor(value_factor, device=device, dtype=x.dtype) if value_pos else None
+                bias = None
+                if bias_pos:
+                    bias = torch.zeros(batch, 1, 1, image_tokens + text_len, device=device, dtype=x.dtype)
+                    positions = torch.tensor(bias_pos, device=device) + image_tokens
+                    values = torch.tensor(bias_value, device=device, dtype=x.dtype)
+                    for row in rows:
+                        bias[row, 0, 0, positions] = values
+                transformer_options[_STATE_KEY] = (rows, v_idx, v_factor, bias)
         return executor(x, timestep, context, transformer_options, **kwargs)
 
     return wrapper
@@ -228,13 +256,14 @@ def _make_block_patch(comfy_attention=None, previous=None):
     return patch
 
 
-def _patch_model(model, pairs, text_len):
+def _patch_model(model, pairs, text_len, schedule=None, ids=None, text_bias=None):
     patched = model.clone()
     patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _WRAPPER_KEY)
+    schedule_bias = _make_schedule_bias_provider(ids, text_bias) if schedule else None
     patched.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
         _WRAPPER_KEY,
-        _make_forward_wrapper(pairs, text_len),
+        _make_forward_wrapper(pairs, text_len, schedule, schedule_bias),
     )
     diffusion_model = patched.get_model_object("diffusion_model")
     existing = patched.model_options.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
@@ -397,6 +426,7 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
             logging.warning(f"{_NODE}: strength_schedule needs the official MOSS model "
                             "(context_attention_bias support); schedule ignored")
             schedule = []
+        schedule_segments = []
         if supports_bias:
             import node_helpers
 
@@ -404,14 +434,28 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
             if base is not None:
                 cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": base})
             if schedule:
-                for start, end, value in schedule:
-                    segment = _sum_bias(_image_bias(ids, value), text_bias)
-                    cond = node_helpers.conditioning_set_values_with_timestep_range(
-                        cond, {"context_attention_bias": segment}, start, end
-                    )
-                logging.info("%s: image_strength scheduled over %d segments", _NODE, len(schedule))
-            # The bias now lives in the conditioning metadata; keep only the
-            # value factors for the attention override.
+                model_sampling = getattr(getattr(model, "model", None), "model_sampling", None)
+                percent_to_sigma = getattr(model_sampling, "percent_to_sigma", None)
+                if percent_to_sigma is not None:
+                    # 分段边界与采样器判定 timestep_range 用同一套 percent→sigma；
+                    # conditioning 保持单条，bias 由模型 wrapper 每步覆盖。
+                    # 这样 VAE reference 的 ref_kv 只会预计算一份，不会随分段数翻倍。
+                    schedule_segments = [
+                        (float(percent_to_sigma(start)), float(percent_to_sigma(end)), value)
+                        for start, end, value in schedule
+                    ]
+                    logging.info("%s: image_strength scheduled over %d segments "
+                                 "(single conditioning)", _NODE, len(schedule_segments))
+                else:
+                    logging.warning(f"{_NODE}: cannot map strength_schedule percents to sigmas; "
+                                    "falling back to per-segment conditioning")
+                    for start, end, value in schedule:
+                        segment = _sum_bias(_image_bias(ids, value), text_bias)
+                        cond = node_helpers.conditioning_set_values_with_timestep_range(
+                            cond, {"context_attention_bias": segment}, start, end
+                        )
+            # The bias now lives in the conditioning metadata / per-step wrapper;
+            # keep only the value factors for the attention override.
             pairs = [(position, factor, 0.0) for position, factor, _ in pairs]
         elif image_bias is not None:
             # Non-official models ignore the field; keep the old behaviour and
@@ -420,7 +464,7 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
             cond = node_helpers.conditioning_set_values(cond, {"context_attention_bias": image_bias})
 
         cond = _attach_references(cond, vae, image_list, method)
-        if not pairs:
+        if not pairs and not schedule_segments:
             return io.NodeOutput(model, cond)
 
         if (diffusion_model is None or not hasattr(diffusion_model, "_forward")
@@ -428,5 +472,8 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
             raise ValueError(f"{_NODE}: model is not the official ComfyUI MOSS-Image diffusion model; "
                              "use the official MOSS-Image loader")
 
-        logging.info("%s: weighting %d text positions", _NODE, len(pairs))
-        return io.NodeOutput(_patch_model(model, pairs, cond_len), cond)
+        if pairs:
+            logging.info("%s: weighting %d text positions", _NODE, len(pairs))
+        return io.NodeOutput(
+            _patch_model(model, pairs, cond_len, schedule_segments, ids, text_bias), cond
+        )

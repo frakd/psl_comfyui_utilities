@@ -283,6 +283,16 @@ check("强度分段接受空白与中文标点",
 check("强度分段无方括号单值", core.parse_strength_schedule("0.5") == [(0.0, 1.0, 0.5)],
       repr(core.parse_strength_schedule("0.5")))
 
+segments = [(1.0, 0.5, 0.3), (0.5, 0.0, 1.0)]
+picked = [core.schedule_value_for_sigma(segments, sigma) for sigma in (1.0, 0.75, 0.5, 0.25, 0.0)]
+check("分段按 sigma 选段", picked == [0.3, 0.3, 0.3, 1.0, 1.0], repr(picked))
+check("分段越界回落到端点值",
+      core.schedule_value_for_sigma(segments, 1.2) == 0.3
+      and core.schedule_value_for_sigma(segments, -0.1) == 1.0)
+check("空分段或无 sigma 返回 None",
+      core.schedule_value_for_sigma([], 0.5) is None
+      and core.schedule_value_for_sigma(segments, None) is None)
+
 
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))
