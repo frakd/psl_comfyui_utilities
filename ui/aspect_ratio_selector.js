@@ -103,8 +103,6 @@ function injectStyles() {
             border: 1px solid #444;
             border-radius: 4px;
             overflow: hidden;
-            max-height: 220px;
-            overflow-y: auto;
             opacity: 0;
             pointer-events: none;
             transform: translateY(-4px);
