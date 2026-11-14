@@ -3,7 +3,10 @@ import { app } from '../../scripts/app.js';
 // ============================================================
 //  Aspect Ratio Selector — 可视化分辨率选择器
 //  增量拖拽无漂移 + 自定义渐入下拉
+//  可选输入图：多出「输入图比例」预设，运行后由后端 ui 回填真实比例
 // ============================================================
+
+const INPUT_LABEL = '输入图比例';
 
 const PRESETS = [
     { label: '自由比例', w: null, h: null },
@@ -96,6 +99,8 @@ function injectStyles() {
             border: 1px solid #444;
             border-radius: 4px;
             overflow: hidden;
+            max-height: 220px;
+            overflow-y: auto;
             opacity: 0;
             pointer-events: none;
             transform: translateY(-4px);
@@ -144,6 +149,10 @@ function injectStyles() {
             background: rgba(30,144,255,0.14);
             border: 2px solid #1e90ff;
         }
+        .ars-rect.input-locked {
+            background: rgba(150,150,150,0.06);
+            border: 1.5px dashed rgba(190,190,190,0.5);
+        }
         .ars-handle {
             position: absolute;
             width: ${HANDLE}px;
@@ -179,6 +188,7 @@ function injectStyles() {
             flex-shrink: 0;
             box-sizing: border-box;
         }
+        .ars-info.unknown { color: #777; font-style: italic; }
     `;
     document.head.appendChild(s);
 }
@@ -198,37 +208,84 @@ app.registerExtension({
 
         // ── 状态 ──
         let state = {
-            presetIdx: 0,
+            presetIdx: 0,       // 基础预设索引，0 = 自由比例
+            useInput: false,    // true = 输入图比例（仅输入图接线时可选）
+            inputW: 0,          // 最近一次运行得到的输入图尺寸
+            inputH: 0,
+            savedPresetIdx: 0,  // 进入输入图比例前的手动选择，断线时恢复
+            savedDragW: 16,
+            savedDragH: 9,
             dragW: 16,
             dragH: 9,
             rectW: 200,
             rectH: 100,
         };
 
-        try {
-            const ex = JSON.parse(dataW?.value || '{}');
-            if (ex.w && ex.h) {
-                state.dragW = ex.w;
-                state.dragH = ex.h;
-                if (ex.presetIdx !== undefined) {
-                    state.presetIdx = ex.presetIdx;
-                } else {
-                    for (let i = 0; i < PRESETS.length; i++) {
-                        if (PRESETS[i].w === ex.w && PRESETS[i].h === ex.h) {
-                            state.presetIdx = i;
-                            break;
-                        }
-                    }
-                }
+        const clampPresetIdx = (i) => (
+            Number.isInteger(i) && i >= 0 && i < PRESETS.length ? i : 0
+        );
+
+        function findPresetIndex(w, h) {
+            for (let i = 0; i < PRESETS.length; i++) {
+                if (PRESETS[i].w === w && PRESETS[i].h === h) return i;
             }
-        } catch (_) {}
+            return 0;
+        }
+
+        // aspect_data_json 只由前端维护：比例 + 选择模式 + 最近一次输入图尺寸
+        function loadAspectData(raw) {
+            let ex;
+            try { ex = JSON.parse(raw || '{}'); } catch (_) { return; }
+            if (!ex || typeof ex !== 'object') return;
+
+            const hasRatio = Number.isFinite(ex.w) && Number.isFinite(ex.h) && ex.w > 0 && ex.h > 0;
+            state.dragW = hasRatio ? ex.w : 16;
+            state.dragH = hasRatio ? ex.h : 9;
+            state.presetIdx = Number.isInteger(ex.presetIdx)
+                ? clampPresetIdx(ex.presetIdx)
+                : findPresetIndex(state.dragW, state.dragH);
+
+            state.useInput = ex.useInput === true;
+            state.inputW = Number.isFinite(ex.inputW) && ex.inputW > 0 ? Math.round(ex.inputW) : 0;
+            state.inputH = Number.isFinite(ex.inputH) && ex.inputH > 0 ? Math.round(ex.inputH) : 0;
+
+            state.savedPresetIdx = Number.isInteger(ex.savedPresetIdx)
+                ? clampPresetIdx(ex.savedPresetIdx)
+                : state.presetIdx;
+            state.savedDragW = Number.isFinite(ex.savedW) && ex.savedW > 0 ? ex.savedW : state.dragW;
+            state.savedDragH = Number.isFinite(ex.savedH) && ex.savedH > 0 ? ex.savedH : state.dragH;
+        }
+        loadAspectData(dataW?.value);
 
         const getTotalMp = () => parseFloat(totalMpW?.value) || 100.0;
         const getMinStep = () => parseInt(minStepW?.value) || 8;
 
         function syncToPython() {
-            if (dataW) dataW.value = JSON.stringify({ w: state.dragW, h: state.dragH, presetIdx: state.presetIdx });
+            if (dataW) dataW.value = JSON.stringify({
+                w: state.dragW, h: state.dragH,
+                presetIdx: state.presetIdx,
+                useInput: state.useInput,
+                inputW: state.inputW, inputH: state.inputH,
+                savedPresetIdx: state.savedPresetIdx,
+                savedW: state.savedDragW, savedH: state.savedDragH,
+            });
         }
+
+        // ── 输入图连接检测 ──
+        // 槽位要现查：nodeCreated 执行时 node.inputs 可能还没填好
+        function imageSlotIndex() {
+            return node.inputs?.findIndex((i) => i.name === 'image') ?? -1;
+        }
+
+        function imageConnected() {
+            const slot = imageSlotIndex();
+            if (slot < 0) return false;
+            return node.isInputConnected
+                ? node.isInputConnected(slot)
+                : node.inputs[slot].link != null;
+        }
+
+        const inputSizeKnown = () => state.inputW > 0 && state.inputH > 0;
 
         function fitRatioToCanvas(cw, ch) {
             const ratio = state.dragW / state.dragH;
@@ -254,22 +311,8 @@ app.registerExtension({
         ddWrap.className = 'ars-dropdown-wrap';
         const ddBtn = document.createElement('div');
         ddBtn.className = 'ars-dropdown-btn';
-        ddBtn.textContent = PRESETS[state.presetIdx].label;
         const ddOpts = document.createElement('div');
         ddOpts.className = 'ars-dropdown-options';
-        const optionEls = [];
-        PRESETS.forEach((p, i) => {
-            const opt = document.createElement('div');
-            opt.className = 'ars-option' + (i === state.presetIdx ? ' selected' : '');
-            opt.textContent = p.label;
-            opt.addEventListener('mousedown', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                selectPreset(i);
-            });
-            optionEls.push(opt);
-            ddOpts.appendChild(opt);
-        });
         ddWrap.appendChild(ddBtn);
         ddWrap.appendChild(ddOpts);
 
@@ -297,6 +340,49 @@ app.registerExtension({
         const info = document.createElement('div');
         info.className = 'ars-info';
 
+        // ── 下拉选项（接图时在自由比例前插入「输入图比例」）──
+        const INPUT_KEY = 'input';
+        const presetKey = (i) => `p${i}`;
+
+        let optionEls = [];   // [{ el, key }]
+
+        function visibleOptions() {
+            const list = [];
+            if (imageConnected()) list.push({ key: INPUT_KEY, label: INPUT_LABEL });
+            PRESETS.forEach((p, i) => list.push({ key: presetKey(i), label: p.label }));
+            return list;
+        }
+
+        function selectionKey() {
+            return state.useInput ? INPUT_KEY : presetKey(state.presetIdx);
+        }
+
+        function refreshOptionSelection() {
+            const key = selectionKey();
+            optionEls.forEach(({ el, key: k }) => {
+                el.className = 'ars-option' + (k === key ? ' selected' : '');
+            });
+            ddBtn.textContent = state.useInput ? INPUT_LABEL : PRESETS[state.presetIdx].label;
+        }
+
+        function rebuildDropdown() {
+            ddOpts.innerHTML = '';
+            optionEls = [];
+            visibleOptions().forEach((p) => {
+                const el = document.createElement('div');
+                el.textContent = p.label;
+                el.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (p.key === INPUT_KEY) selectInputPreset();
+                    else selectPreset(Number(p.key.slice(1)));
+                });
+                optionEls.push({ el, key: p.key });
+                ddOpts.appendChild(el);
+            });
+            refreshOptionSelection();
+        }
+
         // ── 渲染 ──
         function render() {
             const rw = state.rectW;
@@ -306,7 +392,10 @@ app.registerExtension({
             handle.style.left = (PAD + rw - HANDLE * 0.5) + 'px';
             handle.style.top  = (PAD + rh - HANDLE * 0.5) + 'px';
 
-            if (state.presetIdx === 0) {
+            if (state.useInput) {
+                rectEl.className = 'ars-rect input-locked';
+                handle.className = 'ars-handle locked';
+            } else if (state.presetIdx === 0) {
                 rectEl.className  = dragging ? 'ars-rect free dragging' : 'ars-rect free';
                 handle.className  = dragging ? 'ars-handle dragging'   : 'ars-handle';
             } else {
@@ -314,9 +403,15 @@ app.registerExtension({
                 handle.className  = 'ars-handle locked';
             }
 
+            if (state.useInput && !inputSizeKnown()) {
+                info.textContent = `${INPUT_LABEL} · 运行后刷新`;
+                info.classList.add('unknown');
+                return;
+            }
+            info.classList.remove('unknown');
             const { w, h } = computeResolution(getTotalMp(), getMinStep(), state.dragW, state.dragH);
             const mp = (w * h / 10000).toFixed(2);
-            info.textContent = `${w} × ${h}  (${mp} 万像素)`;
+            info.textContent = `${w} × ${h}  (${mp} 万像素)` + (state.useInput ? ' · 输入图比例' : '');
         }
 
         function updateAll() {
@@ -324,15 +419,49 @@ app.registerExtension({
             syncToPython();
         }
 
+        // ── 输入图比例 ──
+        function applyInputAspect() {
+            if (!inputSizeKnown()) return;
+            const g = gcd(state.inputW, state.inputH);
+            state.dragW = state.inputW / g;
+            state.dragH = state.inputH / g;
+            fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
+        }
+
+        function selectInputPreset() {
+            if (!state.useInput) {
+                state.savedPresetIdx = state.presetIdx;
+                state.savedDragW = state.dragW;
+                state.savedDragH = state.dragH;
+            }
+            state.useInput = true;
+            applyInputAspect();
+            closeDropdown();
+            refreshOptionSelection();
+            updateAll();
+        }
+
+        function fallbackFromInput() {
+            state.useInput = false;
+            state.presetIdx = clampPresetIdx(state.savedPresetIdx);
+            state.dragW = state.savedDragW > 0 ? state.savedDragW : 16;
+            state.dragH = state.savedDragH > 0 ? state.savedDragH : 9;
+            fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
+        }
+
+        // 接线变化 / 工作流载入后调用：选项随连接状态增删，输入图比例在断线时回退
+        function refreshInputPresetAvailability() {
+            if (state.useInput && !imageConnected()) fallbackFromInput();
+            if (state.useInput) applyInputAspect();
+            rebuildDropdown();
+            updateAll();
+        }
+
         // ── 预设选择 ──
         function selectPreset(idx) {
             const p = PRESETS[idx];
+            state.useInput = false;
             state.presetIdx = idx;
-            ddBtn.textContent = p.label;
-            optionEls.forEach((el, i) => {
-                el.className = 'ars-option' + (i === idx ? ' selected' : '');
-            });
-            closeDropdown();
             if (p.w === null) {
                 fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
             } else {
@@ -340,6 +469,8 @@ app.registerExtension({
                 state.dragH = p.h;
                 fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
             }
+            closeDropdown();
+            refreshOptionSelection();
             updateAll();
         }
 
@@ -355,6 +486,8 @@ app.registerExtension({
         let dragging = false;
         let offX = 0, offY = 0;
 
+        const canvasDraggable = () => !state.useInput && state.presetIdx === 0;
+
         function toCanvas(e) {
             const rect = canvas.getBoundingClientRect();
 
@@ -368,7 +501,7 @@ app.registerExtension({
         }
 
         handle.addEventListener('mousedown', (e) => {
-            if (state.presetIdx !== 0) return;
+            if (!canvasDraggable()) return;
             e.preventDefault();
             e.stopPropagation();
 
@@ -439,7 +572,7 @@ app.registerExtension({
         const ro = new ResizeObserver(() => {
             const cw = canvas.clientWidth;
             const ch = canvas.clientHeight;
-            if (state.presetIdx !== 0) {
+            if (state.useInput || state.presetIdx !== 0) {
                 fitRatioToCanvas(cw, ch);
             }
             if (state.rectW > cw - PAD) state.rectW = Math.max(cw - PAD, MIN);
@@ -453,32 +586,66 @@ app.registerExtension({
         if (totalMpW) totalMpW.callback = onWidgetChanged;
         if (minStepW) minStepW.callback = onWidgetChanged;
 
+        // ==================== 连接变化：输入图比例选项随连接状态增删 ====================
+        // 载入工作流时连线可能晚于 onConfigure 完成，统一延后一帧刷新
+        let refreshQueued = false;
+        function scheduleRefresh() {
+            if (refreshQueued) return;
+            refreshQueued = true;
+            setTimeout(() => {
+                refreshQueued = false;
+                try {
+                    refreshInputPresetAvailability();
+                } catch (e) {
+                    console.warn('[AspectRatioSelector] 刷新输入图比例选项失败', e);
+                }
+            }, 0);
+        }
+
+        const prevOnConnectionsChange = node.onConnectionsChange;
+        node.onConnectionsChange = function (type, index, connected, link, ioSlot) {
+            const r = prevOnConnectionsChange?.apply(this, arguments);
+            if (type === 1) scheduleRefresh();   // 1 = INPUT
+            return r;
+        };
+
+        // ==================== 运行后回填输入图真实尺寸 ====================
+        const prevOnExecuted = node.onExecuted;
+        node.onExecuted = function (output) {
+            prevOnExecuted?.apply(this, arguments);
+            try {
+                const size = output?.psl_input_size;
+                const iw = Array.isArray(size) ? Number(size[0]) : NaN;
+                const ih = Array.isArray(size) ? Number(size[1]) : NaN;
+                if (Number.isFinite(iw) && iw > 0 && Number.isFinite(ih) && ih > 0) {
+                    state.inputW = Math.round(iw);
+                    state.inputH = Math.round(ih);
+                    if (state.useInput) applyInputAspect();
+                    updateAll();
+                }
+            } catch (e) {
+                console.warn('[AspectRatioSelector] 回填输入图尺寸失败', e);
+            }
+        };
+
         // ==================== 组装 ====================
         container.appendChild(ddWrap);
         container.appendChild(canvas);
         container.appendChild(info);
         node.addDOMWidget('aspect_view', 'HTML', container);
 
-        updateAll();
+        refreshInputPresetAvailability();
+        scheduleRefresh();
 
         // ==================== onConfigure: 刷新页面后从保存的 widget 数据恢复状态 ====================
-        node.onConfigure = function () {
-            try {
-                const ex = JSON.parse(dataW?.value || '{}');
-                if (ex.w && ex.h) {
-                    state.dragW = ex.w;
-                    state.dragH = ex.h;
-                    if (ex.presetIdx !== undefined) {
-                        state.presetIdx = ex.presetIdx;
-                    }
-                    fitRatioToCanvas(canvas.clientWidth || 260, canvas.clientHeight || 150);
-                    ddBtn.textContent = PRESETS[state.presetIdx].label;
-                    optionEls.forEach((el, i) => {
-                        el.className = 'ars-option' + (i === state.presetIdx ? ' selected' : '');
-                    });
-                    updateAll();
-                }
-            } catch (_) {}
+        const prevOnConfigure = node.onConfigure;
+        node.onConfigure = function (infoObj) {
+            const r = prevOnConfigure?.apply(this, arguments);
+            loadAspectData(dataW?.value);
+            rebuildDropdown();
+            updateAll();
+            scheduleRefresh();   // 连线状态可能在此之后才恢复
+            return r;
         };
     },
 });
