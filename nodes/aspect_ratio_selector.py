@@ -71,7 +71,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     default=100.0,
                     min=1.0,
                     max=10000.0,
-                    step=1.0,
+                    step=16.0,
                     tooltip="目标总像素数，单位万。例如 100 = 100万像素 = 1 Megapixel",
                 ),
                 io.Int.Input(
@@ -80,6 +80,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     default=8,
                     min=1,
                     max=64,
+                    step=8,
                     tooltip="输出的宽高必须是此值的整数倍。ComfyUI 中常设为 8 以适配 VAE 编码",
                 ),
                 # 新 widget 必须追加在 aspect_data_json 之后：前端按位置恢复

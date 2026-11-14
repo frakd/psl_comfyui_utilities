@@ -39,6 +39,8 @@ def test_schema_defaults():
         "image", "total_megapixels", "min_step", "aspect_data_json", "upscale_method", "crop",
     ]
     inputs = {item.id: item.as_dict() for item in schema.inputs}
+    assert inputs["total_megapixels"]["step"] == 16.0
+    assert inputs["min_step"]["step"] == 8
     assert inputs["image"]["optional"] is True
     assert inputs["upscale_method"]["default"] == "lanczos"
     assert inputs["upscale_method"]["options"] == ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
