@@ -275,6 +275,25 @@ app.registerExtension({
             rectH: 100,
         };
 
+        // prompt 里只送后端真正用到的字段；inputW/H、saved* 是纯前端预览状态，
+        // 运行后回填它们不能让 prompt 字面量变化，否则本节点与下游缓存会白失效。
+        // 取值以 widget 里"用户操作写入"的状态为准（onExecuted 不回写），
+        // 因此同输入图模式下运行回填输入尺寸也不会改变 prompt。
+        if (dataW) {
+            dataW.serializeValue = () => {
+                let stored = null;
+                try { stored = JSON.parse(dataW.value || '{}'); } catch (_) { /* 非法值按实时状态兜底 */ }
+                const ratioOk = Number.isFinite(stored?.w) && Number.isFinite(stored?.h)
+                    && stored.w > 0 && stored.h > 0;
+                return JSON.stringify({
+                    w: ratioOk ? stored.w : state.dragW,
+                    h: ratioOk ? stored.h : state.dragH,
+                    presetIdx: Number.isInteger(stored?.presetIdx) ? stored.presetIdx : state.presetIdx,
+                    useInput: stored?.useInput === true,
+                });
+            };
+        }
+
         const clampPresetIdx = (i) => (
             Number.isInteger(i) && i >= 0 && i < PRESETS.length ? i : 0
         );
@@ -742,6 +761,8 @@ app.registerExtension({
         };
 
         // ==================== 运行后回填输入图真实尺寸 ====================
+        // 只更新面板显示；不回写 aspect_data_json，也不标记工作流修改，
+        // 否则每次运行后 prompt 字面量变化会让本节点和下游缓存失效。
         const prevOnExecuted = node.onExecuted;
         node.onExecuted = function (output) {
             prevOnExecuted?.apply(this, arguments);
@@ -754,8 +775,6 @@ app.registerExtension({
                     state.inputH = Math.round(ih);
                     if (state.useInput) applyInputAspect();
                     updateAll();
-                    syncToPython();
-                    notifyWorkflowChanged();
                 }
             } catch (e) {
                 console.warn('[AspectRatioSelector] 回填输入图尺寸失败', e);
