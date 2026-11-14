@@ -58,7 +58,7 @@ function injectStyles() {
         /* 剪贴板行：蓝 = 内容出去（复制），绿 = 内容进来（粘贴）；红 = 清空 */
         .rtx-btn.copy { background: #2c5d8f; border-color: #3f79ad; }
         .rtx-btn.paste { background: #2c7a4b; border-color: #3f9a63; }
-        .rtx-btn.clear { background: #8f2c2c; border-color: #b03f3f; }
+        .rtx-btn.clear { background: #7d4444; border-color: #965a5a; }
         /* 锁定态：琥珀色填充 + 光晕 */
         .rtx-btn.lock.locked {
             background: #b57a10;
