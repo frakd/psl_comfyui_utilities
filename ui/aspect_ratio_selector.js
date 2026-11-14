@@ -8,6 +8,10 @@ import { app } from '../../scripts/app.js';
 
 const INPUT_LABEL = '输入图比例';
 
+// 与后端 schema 的 Combo options 保持一致
+const UPSCALE_VALUES = ['nearest-exact', 'bilinear', 'area', 'bicubic', 'lanczos'];
+const CROP_VALUES = ['disabled', 'center'];
+
 const PRESETS = [
     { label: '自由比例', w: null, h: null },
     { label: '1:1 正方形',  w: 1, h: 1 },
@@ -205,6 +209,19 @@ app.registerExtension({
         const upscaleW  = node.widgets.find(w => w.name === 'upscale_method');
         const cropW     = node.widgets.find(w => w.name === 'crop');
         if (dataW) dataW.hidden = true;
+
+        // 只兜底 prompt 序列化：中间版本可能给两个下拉留下非法值，这里保证进
+        // prompt 的永远是合法枚举；不改 widget 显示值，也不回写工作流。
+        function guardComboSerialization(widget, valid, fallback) {
+            if (!widget) return;
+            const prev = widget.serializeValue;
+            widget.serializeValue = function () {
+                const value = prev ? prev.call(this) : this.value;
+                return valid.includes(value) ? value : fallback;
+            };
+        }
+        guardComboSerialization(upscaleW, UPSCALE_VALUES, 'lanczos');
+        guardComboSerialization(cropW, CROP_VALUES, 'disabled');
 
         // ── 状态 ──
         let state = {
