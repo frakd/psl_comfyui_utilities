@@ -223,6 +223,43 @@ app.registerExtension({
         guardComboSerialization(upscaleW, UPSCALE_VALUES, 'lanczos');
         guardComboSerialization(cropW, CROP_VALUES, 'disabled');
 
+        function parseAspectJson(raw) {
+            try {
+                const ex = JSON.parse(raw || '{}');
+                return ex && typeof ex === 'object' ? ex : null;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // 一次性兼容迁移：坏排布版本可能把比例 JSON 写进 upscale_method / crop，
+        // 或给它们留下空串。只在值非法时修复，合法值一律不动，也不改比例本身。
+        function migrateBrokenComboValues() {
+            let changed = false;
+            const cur = parseAspectJson(dataW?.value);
+            const dataMissing = !cur || !Number.isFinite(cur.w) || !Number.isFinite(cur.h);
+            if (dataMissing && dataW) {
+                for (const candidate of [upscaleW?.value, cropW?.value]) {
+                    if (typeof candidate !== 'string') continue;
+                    const ex = parseAspectJson(candidate);
+                    if (ex && Number.isFinite(ex.w) && Number.isFinite(ex.h)) {
+                        dataW.value = candidate;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (upscaleW && !UPSCALE_VALUES.includes(upscaleW.value)) {
+                upscaleW.value = 'lanczos';
+                changed = true;
+            }
+            if (cropW && !CROP_VALUES.includes(cropW.value)) {
+                cropW.value = 'disabled';
+                changed = true;
+            }
+            if (changed) notifyWorkflowChanged();
+        }
+
         // ── 状态 ──
         let state = {
             presetIdx: 0,       // 基础预设索引，0 = 自由比例
@@ -686,6 +723,7 @@ app.registerExtension({
             setTimeout(() => {
                 refreshQueued = false;
                 try {
+                    migrateBrokenComboValues();
                     loadAspectData(dataW?.value);
                     refreshInputPresetAvailability();
                 } catch (e) {
