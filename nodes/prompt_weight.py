@@ -308,9 +308,10 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                                tooltip="图片在文本编码器注意力里的权重（ai-toolkit 格式，或不接 VAE 时）：0 忽略，1 不变，>1 强调。"
                                        "Moss-Image-Edit 格式下图片不进入文本编码器，该值不生效。"),
                 io.String.Input("strength_schedule", display_name="强度分段(列表)", default="",
-                                tooltip="可选。填数字列表（JSON），如 [0.3, 0.6, 1.2]：把整条采样轨迹等分成 3 段，"
-                                        "第 1 段用 0.3、第 2 段 0.6、第 3 段 1.2；不需要知道总步数（按 sigma 百分比等分，"
-                                        "换步数自动适配）。留空则全程使用上面的 image_strength。只在文本编码器视觉通道"
+                                tooltip="可选。填数字列表，如 0.3, 0.6, 1.2 或 [0.3, 0.6, 1.2]（方括号可省）："
+                                        "把整条采样轨迹等分成 3 段，第 1 段用 0.3、第 2 段 0.6、第 3 段 1.2；"
+                                        "不需要知道总步数（按 sigma 百分比等分，换步数自动适配）。"
+                                        "留空则全程使用上面的 image_strength。只在文本编码器视觉通道"
                                         "（ai-toolkit 格式，或不接 VAE）生效，VAE 参考 latent 通道不受影响。"),
                 io.Combo.Input("vision_size", display_name="视觉尺寸", options=_VISION_SIZES,
                                default=str(_VISION_SIZE),

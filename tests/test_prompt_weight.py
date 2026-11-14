@@ -273,6 +273,16 @@ check("强度分段钳制范围", [value for _, _, value in core.parse_strength_
       repr(core.parse_strength_schedule("[-1, 1000]")))
 check("强度分段拒绝非数字", core.parse_strength_schedule('[1, "x"]') == [])
 
+plain = core.parse_strength_schedule("0.3, 0.6, 1.2")
+check("强度分段接受无方括号列表",
+      [(round(a, 3), round(b, 3), value) for a, b, value in plain]
+      == [(0.0, 0.333, 0.3), (0.333, 0.667, 0.6), (0.667, 1.0, 1.2)], repr(plain))
+check("强度分段接受空白与中文标点",
+      [value for _, _, value in core.parse_strength_schedule("0.3 0.6，1.2")] == [0.3, 0.6, 1.2],
+      repr(core.parse_strength_schedule("0.3 0.6，1.2")))
+check("强度分段无方括号单值", core.parse_strength_schedule("0.5") == [(0.0, 1.0, 0.5)],
+      repr(core.parse_strength_schedule("0.5")))
+
 
 if FAIL:
     print("失败的用例：" + ", ".join(FAIL))

@@ -18,6 +18,8 @@ from collections import OrderedDict
 SPECIALS = (248045, 846, 198, 248046)
 
 _WEIGHT_RE = re.compile(r"\(([^():]+):(-?\d*\.?\d+)\)")
+# strength_schedule accepts "0.3, 0.6, 1.2" as well as a JSON list
+_STRENGTH_SEPARATORS = re.compile(r"[,;\s，、]+")
 # The slider exposes -2..2: >1 emphasizes, 1 is neutral, 0 removes, <0 subtracts.
 _MIN_ENTRY_WEIGHT = -2.0
 _MAX_ENTRY_WEIGHT = 2.0
@@ -199,6 +201,7 @@ def parse_presets(raw):
 def parse_strength_schedule(raw):
     """Split a list of strengths into equal trajectory slices.
 
+    Accepts a Python list, a JSON list, or a plain "0.4, 0.8, 1.2" string.
     [0.4, 0.8, 1.2] -> [(0.0, 1/3, 0.4), (1/3, 2/3, 0.8), (2/3, 1.0, 1.2)].
     Empty, invalid or non-positive-length lists return []; values clamp to 0..100.
     """
@@ -210,13 +213,20 @@ def parse_strength_schedule(raw):
             return []
         try:
             data = json.loads(text)
-        except (TypeError, ValueError) as exc:
-            _warn(f"strength_schedule is not valid JSON ({exc}); schedule ignored")
-            return []
+        except (TypeError, ValueError):
+            tokens = [
+                token for token in _STRENGTH_SEPARATORS.split(text.strip("[]()"))
+                if token
+            ]
+            try:
+                data = [float(token) for token in tokens]
+            except ValueError as exc:
+                _warn(f"strength_schedule is not a number list ({exc}); schedule ignored")
+                return []
     if isinstance(data, (int, float)) and not isinstance(data, bool):
         data = [data]
     if not isinstance(data, list):
-        _warn("strength_schedule must be a JSON list of numbers; schedule ignored")
+        _warn("strength_schedule must be a list of numbers; schedule ignored")
         return []
 
     values = []

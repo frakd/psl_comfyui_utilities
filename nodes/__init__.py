@@ -16,6 +16,7 @@ from .prompt_weight import MOSSImagePromptWeightPreset
 from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
 from .text_container import TextContainer
+from .value_curve import PSLValueCurve
 from .video_match_v2 import PSLAdvancedVideoMatchV2
 
 _NODE_CLASSES = (
@@ -38,6 +39,7 @@ _NODE_CLASSES = (
     TextContainer,
     ImageContainer,
     PSLLoRAStepSchedule,
+    PSLValueCurve,
     PSLVideoCombineMemory,
     PSLAdvancedVideoMatchV2,
     MOSSImagePromptWeightPreset,
