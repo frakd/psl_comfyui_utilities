@@ -42,8 +42,8 @@ def _compute_size(total_megapixels, min_step, aspect_w, aspect_h):
 class AspectRatioSelectorNode(io.ComfyNode):
     """可视化分辨率选择器 — JS 前端拖拽矩形选比例，Python 后端计算整数 W×H 输出。
 
-    可选接入一张图片：节点会把它按算出的 W×H 缩放（或中心裁剪）后从 image 输出；
-    连接图片后前端会在预设里多出「同输入图」，输出宽高改用输入图的宽高比。
+    可选接入一张图片：image 输出按总像素数等比缩放，保持输入图自身宽高比；
+    节点选中的比例只决定 width/height 输出。连接图片后预设里会多出「同输入图」。
     """
 
     @classmethod
@@ -54,8 +54,8 @@ class AspectRatioSelectorNode(io.ComfyNode):
             category="image/aspect_ratio",
             description=(
                 "可视化分辨率选择器：拖矩形选宽高比，按总像素数换算成整数 W×H。"
-                "可选接入图片：按同样的 W×H 缩放/中心裁剪后从 image 输出；"
-                "连接图片后预设列表会多出「同输入图」，宽高比取自输入图，总像素数与最小步长仍生效。"
+                "可选接入图片：image 输出按总像素数等比缩放并保持输入图自身比例，与选中的比例无关；"
+                "连接图片后预设列表会多出「同输入图」，只决定 width/height 输出的比例。"
                 "未接图片时 image 输出为空。"
             ),
             inputs=[
@@ -63,7 +63,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     "image",
                     display_name="输入图（可选）",
                     optional=True,
-                    tooltip="可选输入图。连接后 image 输出为它按 width×height 缩放/裁剪的结果，预设里会多出「同输入图」",
+                    tooltip="可选输入图。连接后 image 输出为它按『总像素数』等比缩放的结果（保持输入图自身比例），预设里会多出「同输入图」",
                 ),
                 io.Float.Input(
                     "total_megapixels",
@@ -103,7 +103,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                     display_name="裁剪",
                     options=CROP_METHODS,
                     default="disabled",
-                    tooltip="disabled：直接拉伸到目标尺寸；center：先按目标比例中心裁剪再缩放，不改变画面比例（未接输入图时隐藏）",
+                    tooltip="图片按输入图自身比例缩放到目标像素数；最小步长取整会带来细微比例差，disabled 直接拉伸，center 先按目标比例中心裁掉边缘再缩放",
                 ),
             ],
             outputs=[
@@ -125,7 +125,7 @@ class AspectRatioSelectorNode(io.ComfyNode):
                 io.Image.Output(
                     "image",
                     display_name="图像",
-                    tooltip="输入图按 width×height 缩放/裁剪后的结果；未连接输入图时为空",
+                    tooltip="输入图按总像素数等比缩放的结果（保持输入图自身比例）；未连接输入图时为空",
                 ),
             ],
         )
@@ -157,8 +157,11 @@ class AspectRatioSelectorNode(io.ComfyNode):
         out_image = None
         ui = None
         if image is not None:
+            # 图片输出永远保持输入图自身比例，只把尺寸缩放到总像素数附近；
+            # 节点选中的比例只决定 width/height 输出，不影响这张图
+            img_w, img_h = _compute_size(total_megapixels, min_step, input_w, input_h)
             samples = image.movedim(-1, 1)
-            out_image = comfy.utils.common_upscale(samples, w, h, upscale_method, crop).movedim(1, -1)
+            out_image = comfy.utils.common_upscale(samples, img_w, img_h, upscale_method, crop).movedim(1, -1)
             ui = {INPUT_ASPECT_UI_KEY: [input_w, input_h]}
 
         return io.NodeOutput(w, h, round(w * h / 10000, 4), out_image, ui=ui)

@@ -88,7 +88,8 @@ def test_input_ratio_falls_back_without_image():
     assert ui is None
 
 
-def test_image_is_resized_to_manual_ratio():
+def test_image_keeps_input_ratio():
+    # 输出宽高按选中比例算（1:1 → 200×200），图片却保持输入图 4:3 → 232×176
     image = torch.zeros(1, 480, 640, 3)
     result, ui = _run(
         image=image,
@@ -98,7 +99,7 @@ def test_image_is_resized_to_manual_ratio():
     )
     w, h, _, out_image = result
     assert (w, h) == (200, 200)
-    assert tuple(out_image.shape) == (1, 200, 200, 3)
+    assert tuple(out_image.shape) == (1, 176, 232, 3)
     assert ui == {"psl_input_size": [640, 480]}
 
 
@@ -108,28 +109,29 @@ def test_invalid_json_falls_back_to_16_9():
 
 
 def test_crop_center_vs_stretch():
-    # 纵向渐变图：中心裁剪会保留 25..74 行，拉伸则保留 0..99 行
-    rows = torch.arange(100, dtype=torch.float32).view(1, 100, 1, 1)
-    image = rows.expand(1, 100, 100, 3) / 100.0
-    data = json.dumps({"w": 2, "h": 1})
+    # 输入 640x480（4:3）。总像素 4 万 + 步长 48 → 图片目标 240×192（1.25），
+    # 与输入比例有偏差：center 先裁掉左右各 20 列再缩放，disabled 直接拉伸
+    cols = torch.arange(640, dtype=torch.float32).view(1, 1, 640, 1)
+    image = cols.expand(1, 480, 640, 3) / 640.0
+    data = json.dumps({"w": 2, "h": 1})   # 决定的是 width/height 输出，与图片无关
 
     result, _ = _run(
-        image=image, total_megapixels=2.0, min_step=1,
+        image=image, total_megapixels=4.0, min_step=48,
         upscale_method="bilinear", crop="center", aspect_data_json=data,
     )
     center = result[3]
-    assert tuple(center.shape) == (1, 100, 200, 3)
-    assert abs(float(center[0, 0, 0, 0]) - 0.2475) < 0.02
-    assert abs(float(center[0, 99, 0, 0]) - 0.7425) < 0.02
+    assert tuple(center.shape) == (1, 192, 240, 3)
+    assert abs(float(center[0, 0, 0, 0]) - 20.75 / 640) < 0.01
+    assert abs(float(center[0, 0, 239, 0]) - 618.25 / 640) < 0.01
 
     result, _ = _run(
-        image=image, total_megapixels=2.0, min_step=1,
+        image=image, total_megapixels=4.0, min_step=48,
         upscale_method="bilinear", crop="disabled", aspect_data_json=data,
     )
     stretch = result[3]
-    assert tuple(stretch.shape) == (1, 100, 200, 3)
+    assert tuple(stretch.shape) == (1, 192, 240, 3)
     assert float(stretch[0, 0, 0, 0]) < 0.01
-    assert float(stretch[0, 99, 0, 0]) > 0.98
+    assert float(stretch[0, 0, 239, 0]) > 0.99
 
 
 if __name__ == "__main__":
@@ -137,7 +139,7 @@ if __name__ == "__main__":
     test_manual_ratio_without_image()
     test_input_ratio_uses_image_size()
     test_input_ratio_falls_back_without_image()
-    test_image_is_resized_to_manual_ratio()
+    test_image_keeps_input_ratio()
     test_invalid_json_falls_back_to_16_9()
     test_crop_center_vs_stretch()
     print("aspect ratio selector tests passed")
