@@ -8,10 +8,6 @@ import { app } from '../../scripts/app.js';
 
 const INPUT_LABEL = '输入图比例';
 
-// 与后端 schema 的 Combo options 保持一致，用于识别并纠正被错位写入的旧值
-const UPSCALE_VALUES = ['nearest-exact', 'bilinear', 'area', 'bicubic', 'lanczos'];
-const CROP_VALUES = ['disabled', 'center'];
-
 const PRESETS = [
     { label: '自由比例', w: null, h: null },
     { label: '1:1 正方形',  w: 1, h: 1 },
@@ -210,44 +206,6 @@ app.registerExtension({
         const cropW     = node.widgets.find(w => w.name === 'crop');
         if (dataW) dataW.hidden = true;
 
-        function parseAspectJson(raw) {
-            try {
-                const ex = JSON.parse(raw || '{}');
-                return ex && typeof ex === 'object' ? ex : null;
-            } catch (_) {
-                return null;
-            }
-        }
-
-        // 中间版本把缩放算法插在隐藏 JSON 前面，旧工作流的比例 JSON 会被恢复进
-        // upscale_method（旧 schema 下也可能是 crop）。这里把 JSON 搬回隐藏 widget，
-        // 再按枚举表纠正两个下拉，避免坏值继续进 prompt 导致校验失败。
-        function looksLikeAspectData(value) {
-            if (typeof value !== 'string') return false;
-            const ex = parseAspectJson(value);
-            return !!ex && Number.isFinite(ex.w) && Number.isFinite(ex.h);
-        }
-
-        function repairStaleWidgetValues() {
-            const cur = parseAspectJson(dataW?.value);
-            const dataMissing = !cur || !Number.isFinite(cur.w) || !Number.isFinite(cur.h);
-            if (dataMissing && dataW) {
-                for (const candidate of [upscaleW?.value, cropW?.value]) {
-                    if (looksLikeAspectData(candidate)) {
-                        dataW.value = candidate;
-                        break;
-                    }
-                }
-            }
-            if (upscaleW && !UPSCALE_VALUES.includes(upscaleW.value)) {
-                upscaleW.value = 'lanczos';
-            }
-            if (cropW && !CROP_VALUES.includes(cropW.value)) {
-                cropW.value = 'disabled';
-            }
-        }
-        repairStaleWidgetValues();
-
         // ── 状态 ──
         let state = {
             presetIdx: 0,       // 基础预设索引，0 = 自由比例
@@ -311,6 +269,17 @@ app.registerExtension({
                 savedPresetIdx: state.savedPresetIdx,
                 savedW: state.savedDragW, savedH: state.savedDragH,
             });
+        }
+
+        // 直接改 hidden widget 不会走核心的 widget 变更路径，工作流草稿就不知道
+        // 状态变了（刷新后回到旧比例）。这里补一次核心在 widget 变更时会做的
+        // canvas 状态采集，让草稿/修改标记能记下这次变化。
+        function notifyWorkflowChanged() {
+            try {
+                app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.captureCanvasState?.();
+            } catch (e) {
+                console.warn('[AspectRatioSelector] 标记工作流变更失败', e);
+            }
         }
 
         // ── 输入图连接检测 ──
@@ -456,9 +425,11 @@ app.registerExtension({
             info.textContent = `${w} × ${h}  (${mp} 万像素)` + (state.useInput ? ' · 输入图比例' : '');
         }
 
+        // 只重绘，不写隐藏 widget：载入工作流时 widget 值由前端恢复，
+        // 此时任何自动回写都可能用默认值覆盖刚恢复的比例，并让草稿/缓存记住错误状态。
+        // 只有用户操作（拖拽、选预设、运行回填、断线回退）才调用 syncToPython。
         function updateAll() {
             render();
-            syncToPython();
         }
 
         // ── 输入图比例 ──
@@ -481,6 +452,8 @@ app.registerExtension({
             closeDropdown();
             refreshOptionSelection();
             updateAll();
+            syncToPython();
+            notifyWorkflowChanged();
         }
 
         function fallbackFromInput() {
@@ -493,11 +466,16 @@ app.registerExtension({
 
         // 接线变化 / 工作流载入后调用：选项随连接状态增删，输入图比例在断线时回退
         function refreshInputPresetAvailability() {
-            if (state.useInput && !imageConnected()) fallbackFromInput();
+            const fellBack = state.useInput && !imageConnected();
+            if (fellBack) fallbackFromInput();
             if (state.useInput) applyInputAspect();
             updateScaleWidgetsVisibility();
             rebuildDropdown();
             updateAll();
+            if (fellBack) {
+                syncToPython();                 // 回退是一次真实的状态变化，需要持久化
+                notifyWorkflowChanged();
+            }
         }
 
         // ── 缩放算法 / 裁剪只在接入图片时显示 ──
@@ -559,6 +537,8 @@ app.registerExtension({
             closeDropdown();
             refreshOptionSelection();
             updateAll();
+            syncToPython();
+            notifyWorkflowChanged();
         }
 
         // ── 初始化 ──
@@ -648,6 +628,7 @@ app.registerExtension({
             rectEl.classList.remove('dragging');
             handle.classList.remove('dragging');
             syncToPython();
+            notifyWorkflowChanged();
         });
 
         // ==================== 全局点击关闭下拉 ====================
@@ -675,8 +656,6 @@ app.registerExtension({
 
         // ==================== 连接变化：输入图比例选项随连接状态增删 ====================
         // 载入工作流时连线与 widget 值都可能晚于 nodeCreated 完成，统一延后一帧刷新。
-        // 注意：新前端在 nodeCreated / onConfigure 时 widget 值尚未恢复，读取比例和
-        // 纠正错位值都必须放在这里，否则会拿默认值覆盖已保存的数据。
         let refreshQueued = false;
         function scheduleRefresh() {
             if (refreshQueued) return;
@@ -684,7 +663,6 @@ app.registerExtension({
             setTimeout(() => {
                 refreshQueued = false;
                 try {
-                    repairStaleWidgetValues();
                     loadAspectData(dataW?.value);
                     refreshInputPresetAvailability();
                 } catch (e) {
@@ -715,6 +693,8 @@ app.registerExtension({
                     state.inputH = Math.round(ih);
                     if (state.useInput) applyInputAspect();
                     updateAll();
+                    syncToPython();
+                    notifyWorkflowChanged();
                 }
             } catch (e) {
                 console.warn('[AspectRatioSelector] 回填输入图尺寸失败', e);
@@ -739,8 +719,8 @@ app.registerExtension({
         };
     },
 
-    // 工作流恢复结束后再读一次：新前端里 nodeCreated/onConfigure 触发时
-    // widget 值可能还没填好，这里才是值已就位的可靠时机
+    // 工作流恢复结束后再读一次：新前端里 nodeCreated 触发时 widget 值还没填好，
+    // 这里才是值已就位的可靠时机
     async loadedGraphNode(node) {
         if (node.comfyClass !== 'AspectRatioSelectorNode') return;
         node._pslArsRefresh?.();
