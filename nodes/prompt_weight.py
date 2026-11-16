@@ -54,6 +54,8 @@ _STATE_KEY = "moss_prompt_preset"
 
 _VISION_SIZE = 384
 _VISION_SIZES = ["384", "512", "768", "1024", "1280", "1536", "1792"]
+# MOSS-Image is trained with at most 4096 text-conditioning tokens, template included.
+_TEXT_TOKEN_LIMIT = 4096
 _VISION_PREFIX = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 _DEFAULT_EDIT_FORMAT = "Moss-Image-Edit"
 
@@ -399,6 +401,10 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
             clip, prompt, cache=cache_mode == "enabled", images=vl or None,
             vision_slots=slots, extra=cache_extra, identity=cache_identity,
         )
+        if cond_len > _TEXT_TOKEN_LIMIT:
+            logging.warning(f"{_NODE}: conditioning length {cond_len} exceeds MOSS-Image's "
+                            f"{_TEXT_TOKEN_LIMIT}-token text budget (vision tokens included); "
+                            "output quality may degrade")
         layout_ok = ids is not None and (slots is None or len(ids) == cond_len)
         if ids is None:
             logging.warning(f"{_NODE}: the prompt contains vision tokens this node cannot measure; "
