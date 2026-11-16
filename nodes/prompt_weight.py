@@ -53,7 +53,7 @@ _WRAPPER_KEY = _NODE
 _STATE_KEY = "moss_prompt_preset"
 
 _VISION_SIZE = 384
-_VISION_SIZES = ["384", "512", "768", "1024"]
+_VISION_SIZES = ["384", "512", "768", "1024", "1280", "1536", "1792"]
 _VISION_PREFIX = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 _DEFAULT_EDIT_FORMAT = "Moss-Image-Edit"
 
@@ -308,7 +308,7 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                         "images/vae/edit_format/image_strength mirror the official TextEncodeMOSSImageEdit node, so "
                         "text weighting and image conditioning apply in one node; strength_schedule splits "
                         "image_strength into equal Sigma-percent slices of the sampling trajectory. vision_size "
-                        "sets the area budget of the text-encoder vision copy (384/512/768/1024). Requires the "
+                        "sets the area budget of the text-encoder vision copy (384/512/768/1024/1280/1536/1792). Requires the "
                         "official ComfyUI MOSS-Image model; wire both model and conditioning outputs to the sampler.",
             inputs=[
                 io.Clip.Input("clip"),
@@ -344,7 +344,7 @@ class MOSSImagePromptWeightPreset(io.ComfyNode):
                                         "（ai-toolkit 格式，或不接 VAE）生效，VAE 参考 latent 通道不受影响。"),
                 io.Combo.Input("vision_size", display_name="视觉尺寸", options=_VISION_SIZES,
                                default=str(_VISION_SIZE),
-                               tooltip="图片进入文本编码器时的面积预算：384 保持原行为，512/768/1024 会增加 vision token 数。"
+                               tooltip="图片进入文本编码器时的面积预算：384 保持原行为，512/768/1024/1280/1536/1792 会增加 vision token 数。"
                                        "只缩小不放大；仅在图片进入文本编码器时生效。"),
                 io.Combo.Input("merge_separator", display_name="分隔符", options=list(MERGE_SEPARATORS),
                                default="space",
