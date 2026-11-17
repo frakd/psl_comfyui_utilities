@@ -16,6 +16,9 @@ from comfy_api.latest import io
 
 MAX_LORAS = 8
 
+_QUANTIZED_TENSOR_TYPE = None
+_QUANT_CHECKED = False
+
 
 class _LoraConfig:
     def __init__(self, lora_name, strength, audio_weight, video_weight):
@@ -227,6 +230,25 @@ _MASK_CACHE = {}
 _MASK_CACHE_SEGMENTS = None
 
 
+def _module_is_quantized(module):
+    global _QUANTIZED_TENSOR_TYPE, _QUANT_CHECKED
+    if not _QUANT_CHECKED:
+        try:
+            import comfy.quant_ops
+            _QUANTIZED_TENSOR_TYPE = comfy.quant_ops.QuantizedTensor
+        except ImportError:
+            _QUANTIZED_TENSOR_TYPE = None
+        _QUANT_CHECKED = True
+    weight = getattr(module, "weight", None)
+    if _QUANTIZED_TENSOR_TYPE is not None and isinstance(weight, _QUANTIZED_TENSOR_TYPE):
+        return True
+    return getattr(module, "layout_type", None) is not None
+
+
+def _diffusion_model_is_quantized(dm):
+    return any(_module_is_quantized(module) for module in dm.modules())
+
+
 def _build_token_mask(n, segments, tag_weights, device, dtype):
     mask = torch.full((n,), float(tag_weights[1]), device=device, dtype=dtype)
     table = torch.tensor(tag_weights, device=device, dtype=dtype)
@@ -434,7 +456,7 @@ class _AVModuleBypass:
         base.index_add_(0, rows, delta)
         return True
 
-    def _add_masked_delta(self, base, delta, idx, scale):
+    def _add_masked_delta(self, base, delta, entry, idx, scale):
         if self.mask_mode == "scalar":
             if self.scalars is not None:
                 scale *= float(self.scalars[idx])
@@ -446,28 +468,31 @@ class _AVModuleBypass:
             return base
         if mask.dtype != delta.dtype:
             mask = mask.to(delta.dtype)
-        if (mask.ndim == 2 and delta.ndim == 2
-                and delta.shape[0] == mask.shape[0]
-                and delta.shape[1] % mask.shape[1] == 0):
-            if delta.shape[1] == mask.shape[1]:
-                base.addcmul_(delta, mask, value=scale)
-            else:
-                base.view(delta.shape[0], mask.shape[1], -1).addcmul_(
-                    delta.view(delta.shape[0], mask.shape[1], -1), mask.unsqueeze(-1), value=scale
-                )
-            return base
-        if mask.ndim == 1 and delta.ndim == 2:
-            m = mask
-            if (self.chunk_offset is not None and self.chunk_total is not None
-                    and m.shape[0] == self.chunk_total and m.shape[0] != delta.shape[0]):
-                start = self.chunk_offset
-                end = min(start + delta.shape[0], m.shape[0])
-                if start < end:
-                    m = m[start:end]
-            if m.shape[0] == delta.shape[0]:
-                base.addcmul_(delta, m.unsqueeze(-1), value=scale)
+        # 残差条目是本次新增的语义，可以用融合算子；全掩码条目沿用旧版逐 op 顺序，
+        # 保证 runtime 模式（量化底模）与改造前的输出逐位一致。
+        if entry.sparse:
+            if (mask.ndim == 2 and delta.ndim == 2
+                    and delta.shape[0] == mask.shape[0]
+                    and delta.shape[1] % mask.shape[1] == 0):
+                if delta.shape[1] == mask.shape[1]:
+                    base.addcmul_(delta, mask, value=scale)
+                else:
+                    base.view(delta.shape[0], mask.shape[1], -1).addcmul_(
+                        delta.view(delta.shape[0], mask.shape[1], -1), mask.unsqueeze(-1), value=scale
+                    )
                 return base
-        scale = self._apply_mask_scale_legacy(delta, self.entries[idx], idx, scale)
+            if mask.ndim == 1 and delta.ndim == 2:
+                m = mask
+                if (self.chunk_offset is not None and self.chunk_total is not None
+                        and m.shape[0] == self.chunk_total and m.shape[0] != delta.shape[0]):
+                    start = self.chunk_offset
+                    end = min(start + delta.shape[0], m.shape[0])
+                    if start < end:
+                        m = m[start:end]
+                if m.shape[0] == delta.shape[0]:
+                    base.addcmul_(delta, m.unsqueeze(-1), value=scale)
+                    return base
+        scale = self._apply_mask_scale_legacy(delta, entry, idx, scale)
         if scale is not None:
             base.add_(delta, alpha=scale)
         return base
@@ -528,7 +553,7 @@ class _AVModuleBypass:
                 delta = delta.to(device=base.device, dtype=base.dtype)
 
             scale = float(entry.config.strength) * float(lora_scale)
-            base = self._add_masked_delta(base, delta, idx, scale)
+            base = self._add_masked_delta(base, delta, entry, idx, scale)
 
         return base
 
@@ -789,15 +814,26 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
             tooltip="Cache the per-LoRA matmul tensors in VRAM so sampling stops re-uploading them every step. "
                     "Costs roughly the LoRA size in bf16 VRAM; turn on when stacking several large LoRAs.",
         ))
+        inputs.append(io.Combo.Input(
+            "merge_mode",
+            options=["auto", "merge", "runtime"],
+            default="auto",
+            optional=True,
+            tooltip="auto: merge into weights on bf16/fp16 checkpoints, keep runtime injection on quantized "
+                    "(int8/fp8) checkpoints because merging requantizes the whole weight and can swallow the "
+                    "LoRA delta. merge: always merge (fastest, lossy on quantized models). "
+                    "runtime: always per-module injection (matches pre-optimization output).",
+        ))
         return io.Schema(
             node_id="MiniMaxH3AVLoRAStack",
             display_name="MiniMax H3 AV LoRA Stack",
             category="MiniMax-H3/LoRA",
             description=(
                 "Stack MiniMax H3 LoRAs with per-LoRA audio/video weights. "
-                "Each LoRA is merged into the weights at its video weight and only the "
-                "audio/text rows are corrected at runtime, so per-modality weighting "
-                "stays cheap even with several stacked LoRAs."
+                "On bf16/fp16 weights each LoRA is merged at its video weight and only "
+                "audio/text rows are corrected at runtime; quantized (int8/fp8) layers are "
+                "kept on runtime injection because merging requantizes them lossily. "
+                "merge_mode controls the tradeoff."
             ),
             inputs=inputs,
             outputs=[
@@ -810,15 +846,33 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
     def execute(cls, model, **kwargs):
         chunks = max(1, int(kwargs.get("chunks", 1)))
         keep_on_gpu = bool(kwargs.get("keep_lora_on_gpu", False))
+        merge_mode = str(kwargs.get("merge_mode", "auto")).lower()
+        if merge_mode not in ("auto", "merge", "runtime"):
+            merge_mode = "auto"
         inner = getattr(model, "model", None)
         dm = getattr(inner, "diffusion_model", None) if inner is not None else None
         if dm is None or not hasattr(dm, "blocks"):
             raise ValueError("MiniMaxH3AVLoRAStack requires a MiniMax H3 diffusion model.")
 
+        # Merging a LoRA into an int8/fp8 weight requantizes the whole tensor with a
+        # recalculated scale; measured H3 LoRA deltas are far below the int8 grid, so
+        # auto keeps quantized layers on the runtime path and only merges fp16/bf16 ones.
+        if merge_mode == "auto":
+            merge_allowed_global = not _diffusion_model_is_quantized(dm)
+        else:
+            merge_allowed_global = merge_mode == "merge"
+
         new_model = model.clone()
         entries_by_key = {}
         info = []
         merged_total = 0
+        if merge_mode == "auto" and not merge_allowed_global:
+            info.append("auto: quantized layers detected, keeping them on runtime injection")
+
+        def _merge_allowed(module):
+            if merge_allowed_global:
+                return True
+            return merge_mode == "auto" and not _module_is_quantized(module)
 
         for i in range(1, MAX_LORAS + 1):
             lora_name = kwargs.get(f"lora_{i}", "None")
@@ -855,15 +909,16 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
             loaded = comfy.lora.load_lora(lora_dict, key_map, log_missing=False)
             config = _LoraConfig(lora_name, strength, audio_weight, video_weight)
 
-            if abs(audio_weight - video_weight) < 1e-6:
+            if abs(audio_weight - video_weight) < 1e-6 and merge_allowed_global:
                 patched = new_model.add_patches(loaded, strength * audio_weight)
                 merged_total += len(patched)
                 info.append(f"{lora_name}: merged {len(patched)} modules")
                 continue
 
-            # Unequal weights: merge the video component into the weights (video
-            # rows dominate the packed sequence) and keep only the per-row delta
-            # where a tag's weight differs from the merged one.
+            # Split weights (or a runtime-only model): merge the video component into
+            # the weights when allowed and keep only the per-row delta where a tag's
+            # weight differs from the merged one; otherwise inject every key at runtime.
+            equal_weights = abs(audio_weight - video_weight) < 1e-6
             plans = []
             for key, adapter in loaded.items():
                 if not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
@@ -880,24 +935,37 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                     continue
                 mode = _classify_key(key)
                 plain_lora = isinstance(adapter, comfy.weight_adapter.LoRAAdapter)
+                allowed = _merge_allowed(module)
                 if mode in ("token", "adaln"):
-                    if plain_lora and video_weight != 0.0:
-                        plans.append((key, adapter, "merge_residual", video_weight))
+                    if not allowed:
+                        plans.append((key, adapter, mode, "runtime", None))
+                    elif equal_weights:
+                        plans.append((key, adapter, mode, "merge_full", audio_weight))
+                    elif plain_lora and video_weight != 0.0:
+                        plans.append((key, adapter, mode, "merge_residual", video_weight))
                     else:
-                        plans.append((key, adapter, "runtime", None))
+                        plans.append((key, adapter, mode, "runtime", None))
                 elif mode == "video_scalar":
-                    if video_weight != 0.0:
-                        plans.append((key, adapter, "merge_scalar", video_weight))
+                    if video_weight == 0.0:
+                        continue
+                    plans.append((key, adapter, mode,
+                                  "merge_full" if allowed else "runtime",
+                                  video_weight if allowed else None))
                 elif mode == "audio_scalar":
-                    if audio_weight != 0.0:
-                        plans.append((key, adapter, "merge_scalar", audio_weight))
+                    if audio_weight == 0.0:
+                        continue
+                    plans.append((key, adapter, mode,
+                                  "merge_full" if allowed else "runtime",
+                                  audio_weight if allowed else None))
                 elif mode == "global" and plain_lora:
-                    plans.append((key, adapter, "merge_scalar", 1.0))
+                    plans.append((key, adapter, mode,
+                                  "merge_full" if allowed else "runtime",
+                                  1.0 if allowed else None))
                 else:
-                    plans.append((key, adapter, "runtime", None))
+                    plans.append((key, adapter, mode, "runtime", None))
 
             merge_groups = {}
-            for key, adapter, kind, factor in plans:
+            for key, adapter, mode, kind, factor in plans:
                 if factor is None:
                     continue
                 merge_groups.setdefault(round(float(factor), 6), {})[key] = adapter
@@ -908,8 +976,7 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
 
             count_merged = 0
             count_runtime = 0
-            for key, adapter, kind, factor in plans:
-                mode = _classify_key(key)
+            for key, adapter, mode, kind, factor in plans:
                 if kind == "merge_residual":
                     if key in merged_keys:
                         entry = _LoraEntry(
@@ -922,7 +989,7 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                         entry = _LoraEntry(config, adapter, (video_weight, 1.0, audio_weight))
                         count_runtime += 1
                     entries_by_key.setdefault(key, []).append(entry)
-                elif kind == "merge_scalar":
+                elif kind == "merge_full":
                     if key in merged_keys:
                         count_merged += 1
                     else:

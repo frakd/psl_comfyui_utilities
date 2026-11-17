@@ -355,3 +355,48 @@ if FAIL:
     print(f"{len(FAIL)} FAILED: {FAIL}")
     raise SystemExit(1)
 print("all checks passed")
+
+# runtime 模式：完全不合并，全量掩码注入（与旧版数值路径一致）
+inner, _, new_model, info = _run_execute(audio_weight_1=0.0, video_weight_1=1.0, merge_mode="runtime")
+dm = inner.diffusion_model
+check("runtime mode -> no merge", not new_model.patch_calls, len(new_model.patch_calls))
+check("runtime mode full tag weights", _tag_of(dm.blocks[0].attn.qkv_proj) == (1.0, 1.0, 0.0),
+      _tag_of(dm.blocks[0].attn.qkv_proj))
+check("runtime mode token_refiner wrapper installed", hasattr(dm.token_refiner.blocks[0].attn.qkv_proj, "_h3_av_bypasses"))
+check("runtime mode audio head at weight 0 stays skipped", not hasattr(dm.final_layer.audio_out, "_h3_av_bypasses"))
+check("runtime info", "runtime" in info, info)
+
+# auto + 量化底模：自动退回 runtime，不合并
+_orig_quant = h3._diffusion_model_is_quantized
+_orig_mod_quant = h3._module_is_quantized
+h3._diffusion_model_is_quantized = lambda model: True
+h3._module_is_quantized = lambda module: True
+try:
+    inner, _, new_model, info = _run_execute(audio_weight_1=0.0, video_weight_1=1.0)
+    check("auto+quantized -> no merge", not new_model.patch_calls, len(new_model.patch_calls))
+    check("auto+quantized -> runtime entries",
+          _tag_of(inner.diffusion_model.blocks[0].attn.qkv_proj) == (1.0, 1.0, 0.0))
+    check("auto+quantized info", "quantized" in info, info)
+    inner, _, new_model, info = _run_execute(audio_weight_1=1.0, video_weight_1=1.0)
+    check("auto+quantized equal weights -> no merge", not new_model.patch_calls, len(new_model.patch_calls))
+finally:
+    h3._diffusion_model_is_quantized = _orig_quant
+    h3._module_is_quantized = _orig_mod_quant
+
+# merge 模式强制合并（即使被判定为量化模型）
+_orig_quant = h3._diffusion_model_is_quantized
+_orig_mod_quant = h3._module_is_quantized
+h3._diffusion_model_is_quantized = lambda model: True
+h3._module_is_quantized = lambda module: True
+try:
+    inner, _, new_model, info = _run_execute(audio_weight_1=0.0, video_weight_1=1.0, merge_mode="merge")
+    check("merge mode forces merge", bool(new_model.patch_calls) and "quantized" not in info)
+finally:
+    h3._diffusion_model_is_quantized = _orig_quant
+    h3._module_is_quantized = _orig_mod_quant
+
+print()
+if FAIL:
+    print(f"{len(FAIL)} FAILED: {FAIL}")
+    raise SystemExit(1)
+print("all checks passed")
