@@ -775,19 +775,20 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                 optional=True,
                 tooltip="Set to the same value as SolAttn's MiniMax H3 Chunk FeedForward when enabled.",
             ),
-            io.Boolean.Input(
-                "keep_lora_on_gpu",
-                default=False,
-                optional=True,
-                tooltip="Cache the per-LoRA matmul tensors in VRAM so sampling stops re-uploading them every step. "
-                        "Costs roughly the LoRA size in bf16 VRAM; turn on when stacking several large LoRAs.",
-            ),
         ]
         for i in range(1, MAX_LORAS + 1):
             inputs.append(io.Combo.Input(f"lora_{i}", options=lora_list, default="None", optional=True))
             inputs.append(io.Float.Input(f"strength_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
             inputs.append(io.Float.Input(f"audio_weight_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
             inputs.append(io.Float.Input(f"video_weight_{i}", default=1.0, min=-10.0, max=10.0, step=0.01, optional=True))
+        # 新增输入一律追加在末尾：widget 值按位序保存，插在前面会让旧工作流的 LoRA 参数整体错位
+        inputs.append(io.Boolean.Input(
+            "keep_lora_on_gpu",
+            default=False,
+            optional=True,
+            tooltip="Cache the per-LoRA matmul tensors in VRAM so sampling stops re-uploading them every step. "
+                    "Costs roughly the LoRA size in bf16 VRAM; turn on when stacking several large LoRAs.",
+        ))
         return io.Schema(
             node_id="MiniMaxH3AVLoRAStack",
             display_name="MiniMax H3 AV LoRA Stack",
