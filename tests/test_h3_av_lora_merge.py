@@ -372,12 +372,12 @@ _orig_mod_quant = h3._module_is_quantized
 h3._diffusion_model_is_quantized = lambda model: True
 h3._module_is_quantized = lambda module: True
 try:
-    inner, _, new_model, info = _run_execute(audio_weight_1=0.0, video_weight_1=1.0)
+    inner, _, new_model, info = _run_execute(audio_weight_1=0.0, video_weight_1=1.0, merge_mode="auto")
     check("auto+quantized -> no merge", not new_model.patch_calls, len(new_model.patch_calls))
     check("auto+quantized -> runtime entries",
           _tag_of(inner.diffusion_model.blocks[0].attn.qkv_proj) == (1.0, 1.0, 0.0))
     check("auto+quantized info", "quantized" in info, info)
-    inner, _, new_model, info = _run_execute(audio_weight_1=1.0, video_weight_1=1.0)
+    inner, _, new_model, info = _run_execute(audio_weight_1=1.0, video_weight_1=1.0, merge_mode="auto")
     check("auto+quantized equal weights -> no merge", not new_model.patch_calls, len(new_model.patch_calls))
 finally:
     h3._diffusion_model_is_quantized = _orig_quant

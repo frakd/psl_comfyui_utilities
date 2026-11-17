@@ -817,12 +817,13 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
         inputs.append(io.Combo.Input(
             "merge_mode",
             options=["auto", "merge", "runtime"],
-            default="auto",
+            default="merge",
             optional=True,
-            tooltip="auto: merge into weights on bf16/fp16 checkpoints, keep runtime injection on quantized "
-                    "(int8/fp8) checkpoints because merging requantizes the whole weight and can swallow the "
-                    "LoRA delta. merge: always merge (fastest, lossy on quantized models). "
-                    "runtime: always per-module injection (matches pre-optimization output).",
+            tooltip="merge (default): always merge into weights (fastest; on quantized int8/fp8 checkpoints the "
+                    "whole layer is requantized and small LoRA deltas get diluted by quantization dither, so "
+                    "recalibrate strength if needed). auto: merge only fp16/bf16 layers and keep quantized "
+                    "layers on runtime injection. runtime: always per-module injection (matches "
+                    "pre-optimization output bit-for-bit).",
         ))
         return io.Schema(
             node_id="MiniMaxH3AVLoRAStack",
@@ -830,10 +831,10 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
             category="MiniMax-H3/LoRA",
             description=(
                 "Stack MiniMax H3 LoRAs with per-LoRA audio/video weights. "
-                "On bf16/fp16 weights each LoRA is merged at its video weight and only "
-                "audio/text rows are corrected at runtime; quantized (int8/fp8) layers are "
-                "kept on runtime injection because merging requantizes them lossily. "
-                "merge_mode controls the tradeoff."
+                "By default each LoRA is merged at its video weight and only audio/text rows are "
+                "corrected at runtime. On quantized (int8/fp8) checkpoints merging requantizes the "
+                "layer and dilutes small deltas; merge_mode=auto keeps those layers on runtime "
+                "injection instead, runtime disables merging entirely."
             ),
             inputs=inputs,
             outputs=[
@@ -846,9 +847,9 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
     def execute(cls, model, **kwargs):
         chunks = max(1, int(kwargs.get("chunks", 1)))
         keep_on_gpu = bool(kwargs.get("keep_lora_on_gpu", False))
-        merge_mode = str(kwargs.get("merge_mode", "auto")).lower()
+        merge_mode = str(kwargs.get("merge_mode", "merge")).lower()
         if merge_mode not in ("auto", "merge", "runtime"):
-            merge_mode = "auto"
+            merge_mode = "merge"
         inner = getattr(model, "model", None)
         dm = getattr(inner, "diffusion_model", None) if inner is not None else None
         if dm is None or not hasattr(dm, "blocks"):
