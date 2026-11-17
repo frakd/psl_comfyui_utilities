@@ -23,14 +23,19 @@ class _LoraConfig:
         self.strength = float(strength)
         self.audio_weight = float(audio_weight)
         self.video_weight = float(video_weight)
-        self.uid = id(self)
 
 
 class _LoraEntry:
-    def __init__(self, config, adapter):
+    def __init__(self, config, adapter, tag_weights, sparse=False, scalar=1.0):
         self.config = config
         self.adapter = adapter
-        self.mask_index = 0
+        # per-tag delta weight, indexed by the packed-row tag:
+        # (0 video/cond/ref-image, 1 text, 2 audio)
+        self.tag_weights = tuple(float(w) for w in tag_weights)
+        # residual entries only cover a minority of rows; compute their delta on
+        # gathered rows instead of the full activation
+        self.sparse = bool(sparse)
+        self.scalar = float(scalar)
 
 
 def _module_path(key):
@@ -69,17 +74,30 @@ def _classify_key(key):
     return "global"
 
 
-def _linear_lora(adapter, x):
+def _adapter_pair(adapter, device, dtype, keep_on_gpu):
+    if not keep_on_gpu:
+        v = adapter.weights
+        return v[1].to(device=device, dtype=dtype), v[0].to(device=device, dtype=dtype)
+    cache = getattr(adapter, "_h3_av_pair_cache", None)
+    if cache is not None and cache[0] == device and cache[1] == dtype:
+        return cache[2], cache[3]
     v = adapter.weights
-    up, down, alpha = v[0], v[1], v[2]
+    down = v[1].to(device=device, dtype=dtype)
+    up = v[0].to(device=device, dtype=dtype)
+    adapter._h3_av_pair_cache = (device, dtype, down, up)
+    return down, up
+
+
+def _linear_lora(adapter, x, keep_on_gpu=False):
+    v = adapter.weights
+    up, down = v[0], v[1]
     if up.ndim != 2 or down.ndim != 2:
         return None, 1.0
     if down.shape[1] != x.shape[-1] or up.shape[1] != down.shape[0]:
         return None, 1.0
-    down = down.to(device=x.device, dtype=x.dtype)
-    up = up.to(device=x.device, dtype=x.dtype)
+    down, up = _adapter_pair(adapter, x.device, x.dtype, keep_on_gpu)
     rank = down.shape[0]
-    scale = (alpha / rank) if alpha is not None else 1.0
+    scale = (v[2] / rank) if v[2] is not None else 1.0
     return F.linear(F.linear(x, down), up), scale
 
 
@@ -201,49 +219,64 @@ def _move_adapter_to_device(adapter):
     adapter.weights = tuple(weights)
 
 
-def _build_token_mask(n, segments, audio_weight, video_weight, device):
-    mask = torch.ones(n, device=device, dtype=torch.float32)
+# Masks only depend on the packed-row tags and the per-tag weights; the same
+# mod_segments object is shared by every block within one forward, so cache the
+# built mask and let all blocks reuse it. A new segments object (next sampling
+# step) invalidates the cache.
+_MASK_CACHE = {}
+_MASK_CACHE_SEGMENTS = None
+
+
+def _build_token_mask(n, segments, tag_weights, device, dtype):
+    mask = torch.full((n,), float(tag_weights[1]), device=device, dtype=dtype)
+    table = torch.tensor(tag_weights, device=device, dtype=dtype)
     for a, b, row in segments:
         if isinstance(row, torch.Tensor):
-            seg_mask = torch.ones(b - a, device=row.device, dtype=torch.float32)
-            tags = row % 3
-            seg_mask[tags == 2] = audio_weight
-            seg_mask[tags == 0] = video_weight
-            mask[a:b] = seg_mask.to(device)
+            tags = (row % 3).to(device=device, dtype=torch.long)
+            mask[a:b] = table[tags]
         else:
-            tag = int(row) % 3
-            value = audio_weight if tag == 2 else (video_weight if tag == 0 else 1.0)
-            mask[a:b] = value
+            mask[a:b] = float(tag_weights[int(row) % 3])
     return mask
 
 
-def _build_modality_mask(n, segments, audio_weight, video_weight, device):
-    mask = torch.ones(n, 3, device=device, dtype=torch.float32)
+def _build_modality_mask(n, segments, tag_weights, device, dtype):
+    mask = torch.full((n, 3), float(tag_weights[1]), device=device, dtype=dtype)
     for a, b, row in segments:
         if isinstance(row, torch.Tensor):
             idx = (row // 3).long()
             tags = (row % 3).long()
             for i in torch.unique(idx):
                 tag = int(tags[idx == i][0])
-                value = audio_weight if tag == 2 else (video_weight if tag == 0 else 1.0)
-                mask[int(i), tag] = value
+                mask[int(i), tag] = float(tag_weights[tag])
         else:
             row_index = int(row)
-            tag = row_index % 3
-            value = audio_weight if tag == 2 else (video_weight if tag == 0 else 1.0)
-            mask[row_index // 3, tag] = value
+            mask[row_index // 3, row_index % 3] = float(tag_weights[row_index % 3])
     return mask
 
 
-def _build_single_final_mask(n, seg, weight, device):
-    mask = torch.ones(n, device=device, dtype=torch.float32)
+def _cached_mask(kind, n, segments, tag_weights, device, dtype):
+    global _MASK_CACHE_SEGMENTS
+    if segments is not _MASK_CACHE_SEGMENTS:
+        _MASK_CACHE.clear()
+        _MASK_CACHE_SEGMENTS = segments
+    key = (kind, n, tag_weights, device, dtype)
+    mask = _MASK_CACHE.get(key)
+    if mask is None:
+        builder = _build_token_mask if kind == "token" else _build_modality_mask
+        mask = builder(n, segments, tag_weights, device, dtype)
+        _MASK_CACHE[key] = mask
+    return mask
+
+
+def _build_single_final_mask(n, seg, weight, device, dtype=torch.float32):
+    mask = torch.ones(n, device=device, dtype=dtype)
     if seg is None:
         return mask
     row = seg[2]
     if isinstance(row, torch.Tensor):
-        mask[row.unique().long()] = weight
+        mask[row.unique().long()] = float(weight)
     else:
-        mask[int(row)] = weight
+        mask[int(row)] = float(weight)
     return mask
 
 
@@ -251,17 +284,17 @@ class _AVModuleBypass:
     _warned_shape_keys = set()
     _warned_chunk_keys = set()
 
-    def __init__(self, module, entries, mask_mode="token", scalar_mode="global", chunks=1):
+    def __init__(self, module, entries, mask_mode="token", chunks=1, keep_on_gpu=False):
         self.module = module
         self.original_forward = None
         self.entries = entries
         self.mask_mode = mask_mode
-        self.scalar_mode = scalar_mode
         self.masks = None
         self.scalars = None
         self.chunks = int(chunks)
         self.chunk_offset = None
         self.chunk_total = None
+        self.keep_on_gpu = bool(keep_on_gpu)
         self.shape_warned = False
 
     def install(self):
@@ -308,9 +341,9 @@ class _AVModuleBypass:
         self.chunk_offset = None
         self.chunk_total = None
 
-    def _apply_mask_scale(self, delta, entry, idx, scale):
+    def _apply_mask_scale_legacy(self, delta, entry, idx, scale):
         if self.mask_mode in ("token", "adaln"):
-            mask = self.masks[entry.mask_index] if self.masks is not None else None
+            mask = self.masks[idx] if self.masks is not None else None
             if mask is not None:
                 m = mask.to(device=delta.device, dtype=delta.dtype)
                 if (m.ndim == 2 and delta.ndim == 2
@@ -360,12 +393,91 @@ class _AVModuleBypass:
                 scale *= float(self.scalars[idx])
         return scale
 
+    def _resolve_token_mask(self, idx, n):
+        if self.masks is None:
+            return None
+        mask = self.masks[idx]
+        if mask is None or mask.ndim != 1:
+            return None
+        if mask.shape[0] == n:
+            return mask
+        if (self.chunk_offset is not None and self.chunk_total is not None
+                and mask.shape[0] == self.chunk_total):
+            start = self.chunk_offset
+            end = min(start + n, mask.shape[0])
+            if start < end:
+                return mask[start:end]
+        return None
+
+    def _add_sparse_delta(self, base, x, entry, mask):
+        rows = torch.nonzero(mask, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            return True
+        if rows.numel() * 4 > mask.shape[0]:
+            return False
+        delta, lora_scale = _linear_lora(entry.adapter, x.index_select(0, rows), self.keep_on_gpu)
+        if delta is None:
+            logging.warning(
+                "[H3 AV LoRA] skipping incompatible LoRA delta for %s (%s)",
+                entry.config.lora_name, type(self.module).__name__
+            )
+            return True
+        if delta.device != base.device or delta.dtype != base.dtype:
+            delta = delta.to(device=base.device, dtype=base.dtype)
+        weights = mask.index_select(0, rows).unsqueeze(-1)
+        if weights.dtype != delta.dtype:
+            weights = weights.to(delta.dtype)
+        scale = float(entry.config.strength) * float(lora_scale)
+        delta.mul_(weights)
+        if scale != 1.0:
+            delta.mul_(scale)
+        base.index_add_(0, rows, delta)
+        return True
+
+    def _add_masked_delta(self, base, delta, idx, scale):
+        if self.mask_mode == "scalar":
+            if self.scalars is not None:
+                scale *= float(self.scalars[idx])
+            base.add_(delta, alpha=scale)
+            return base
+        mask = self.masks[idx] if self.masks is not None else None
+        if mask is None:
+            base.add_(delta, alpha=scale)
+            return base
+        if mask.dtype != delta.dtype:
+            mask = mask.to(delta.dtype)
+        if (mask.ndim == 2 and delta.ndim == 2
+                and delta.shape[0] == mask.shape[0]
+                and delta.shape[1] % mask.shape[1] == 0):
+            if delta.shape[1] == mask.shape[1]:
+                base.addcmul_(delta, mask, value=scale)
+            else:
+                base.view(delta.shape[0], mask.shape[1], -1).addcmul_(
+                    delta.view(delta.shape[0], mask.shape[1], -1), mask.unsqueeze(-1), value=scale
+                )
+            return base
+        if mask.ndim == 1 and delta.ndim == 2:
+            m = mask
+            if (self.chunk_offset is not None and self.chunk_total is not None
+                    and m.shape[0] == self.chunk_total and m.shape[0] != delta.shape[0]):
+                start = self.chunk_offset
+                end = min(start + delta.shape[0], m.shape[0])
+                if start < end:
+                    m = m[start:end]
+            if m.shape[0] == delta.shape[0]:
+                base.addcmul_(delta, m.unsqueeze(-1), value=scale)
+                return base
+        scale = self._apply_mask_scale_legacy(delta, self.entries[idx], idx, scale)
+        if scale is not None:
+            base.add_(delta, alpha=scale)
+        return base
+
     def _apply(self, x, base):
         if not self.entries:
             return base
 
-        # Accumulate each LoRA delta into the fresh module output to avoid holding
-        # multiple full-size activations at once.
+        # Accumulate each non-LoRA delta into the fresh module output to avoid
+        # holding multiple full-size activations at once.
         non_lora_total = None
         for idx, entry in enumerate(self.entries):
             adapter = entry.adapter
@@ -383,7 +495,7 @@ class _AVModuleBypass:
                 delta = delta.to(device=base.device, dtype=base.dtype)
 
             scale = float(entry.config.strength)
-            scale = self._apply_mask_scale(delta, entry, idx, scale)
+            scale = self._apply_mask_scale_legacy(delta, entry, idx, scale)
             if scale is None:
                 continue
             if non_lora_total is None:
@@ -401,7 +513,11 @@ class _AVModuleBypass:
             if not isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
                 continue
             adapter.multiplier = 1.0
-            delta, lora_scale = _linear_lora(adapter, x)
+            if entry.sparse and self.mask_mode == "token":
+                mask = self._resolve_token_mask(idx, x.shape[0])
+                if mask is not None and self._add_sparse_delta(base, x, entry, mask):
+                    continue
+            delta, lora_scale = _linear_lora(adapter, x, self.keep_on_gpu)
             if delta is None:
                 logging.warning(
                     "[H3 AV LoRA] skipping incompatible LoRA delta for %s (%s)",
@@ -412,20 +528,16 @@ class _AVModuleBypass:
                 delta = delta.to(device=base.device, dtype=base.dtype)
 
             scale = float(entry.config.strength) * float(lora_scale)
-            scale = self._apply_mask_scale(delta, entry, idx, scale)
-            if scale is None:
-                continue
-            base.add_(delta, alpha=scale)
+            base = self._add_masked_delta(base, delta, idx, scale)
 
         return base
 
 
 class _H3BlockAVPatch:
-    def __init__(self, block, child_wrappers, configs):
+    def __init__(self, block, child_wrappers):
         self.block = block
         self.original_forward = None
         self.child_wrappers = child_wrappers
-        self.configs = configs
 
     def install(self):
         if getattr(self.block, "_h3_av_block_patches", None) is None:
@@ -461,27 +573,24 @@ class _H3BlockAVPatch:
                     wrapper.clear_masks()
 
     def _prepare(self, x, t_emb, mod_segments):
-        token_masks = [
-            _build_token_mask(x.shape[0], mod_segments, c.audio_weight, c.video_weight, x.device)
-            for c in self.configs
-        ]
-        modality_masks = [
-            _build_modality_mask(t_emb.shape[0], mod_segments, c.audio_weight, c.video_weight, t_emb.device)
-            for c in self.configs
-        ]
         for wrapper in self.child_wrappers:
             if wrapper.mask_mode == "token":
-                wrapper.set_masks(token_masks)
+                wrapper.set_masks([
+                    _cached_mask("token", x.shape[0], mod_segments, entry.tag_weights, x.device, x.dtype)
+                    for entry in wrapper.entries
+                ])
             elif wrapper.mask_mode == "adaln":
-                wrapper.set_masks(modality_masks)
+                wrapper.set_masks([
+                    _cached_mask("adaln", t_emb.shape[0], mod_segments, entry.tag_weights, t_emb.device, t_emb.dtype)
+                    for entry in wrapper.entries
+                ])
 
 
 class _H3FinalLayerAVPatch:
-    def __init__(self, final_layer, child_wrappers, configs):
+    def __init__(self, final_layer, child_wrappers):
         self.final_layer = final_layer
         self.original_forward = None
         self.child_wrappers = child_wrappers
-        self.configs = configs
 
     def install(self):
         if getattr(self.final_layer, "_h3_av_final_patches", None) is None:
@@ -504,40 +613,41 @@ class _H3FinalLayerAVPatch:
         del self.final_layer._h3_av_final_patches
         del self.final_layer._h3_av_final_original_forward
 
-    def _dispatch(self, x, t_emb, video_seg, audio_seg):
+    def _dispatch(self, x, t_emb, video_seg, audio_seg, *args, **kwargs):
         patches = self.final_layer._h3_av_final_patches
-        video_masks = [patch._build_masks(t_emb, video_seg, "video") for patch in patches]
-        audio_masks = [patch._build_masks(t_emb, audio_seg, "audio") for patch in patches]
+        video_masks = [patch._build_masks(t_emb, video_seg, 0) for patch in patches]
+        audio_masks = [patch._build_masks(t_emb, audio_seg, 2) for patch in patches]
 
         try:
-            for patch, masks in zip(patches, video_masks):
-                patch._set_masks(masks)
-            video_out, _ = self.final_layer._h3_av_final_original_forward(x, t_emb, video_seg, audio_seg)
+            for patch, per_wrapper in zip(patches, video_masks):
+                patch._set_masks(per_wrapper)
+            video_out = self.final_layer._h3_av_final_original_forward(
+                x, t_emb, video_seg, audio_seg, *args, **kwargs)[0]
         finally:
             for patch in patches:
                 patch._clear_masks()
 
         try:
-            for patch, masks in zip(patches, audio_masks):
-                patch._set_masks(masks)
-            _, audio_out = self.final_layer._h3_av_final_original_forward(x, t_emb, video_seg, audio_seg)
+            for patch, per_wrapper in zip(patches, audio_masks):
+                patch._set_masks(per_wrapper)
+            audio_out = self.final_layer._h3_av_final_original_forward(
+                x, t_emb, video_seg, audio_seg, *args, **kwargs)[1]
         finally:
             for patch in patches:
                 patch._clear_masks()
-        return video_out, audio_out
+        return [video_out, audio_out]
 
-    def _build_masks(self, t_emb, seg, kind):
-        weights = [
-            c.video_weight if kind == "video" else c.audio_weight
-            for c in self.configs
-        ]
+    def _build_masks(self, t_emb, seg, tag):
         return [
-            _build_single_final_mask(t_emb.shape[0], seg, weight, t_emb.device)
-            for weight in weights
+            [
+                _build_single_final_mask(t_emb.shape[0], seg, entry.tag_weights[tag], t_emb.device, t_emb.dtype)
+                for entry in wrapper.entries
+            ]
+            for wrapper in self.child_wrappers
         ]
 
-    def _set_masks(self, masks):
-        for wrapper in self.child_wrappers:
+    def _set_masks(self, per_wrapper):
+        for wrapper, masks in zip(self.child_wrappers, per_wrapper):
             wrapper.set_masks(masks)
 
     def _clear_masks(self):
@@ -619,8 +729,8 @@ class _H3AVInjection:
     def inject(self, model_patcher):
         for wrapper in self.wrappers:
             for entry in wrapper.entries:
-                # LoRA tensors are cast per module in _linear_lora; pre-moving every
-                # adapter to the GPU at injection adds avoidable VRAM pressure.
+                # LoRA tensors are cast per module in _linear_lora; pre-moving
+                # every adapter to the GPU at injection adds avoidable VRAM pressure.
                 if not isinstance(entry.adapter, comfy.weight_adapter.LoRAAdapter):
                     _move_adapter_to_device(entry.adapter)
             if wrapper.install():
@@ -665,6 +775,13 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                 optional=True,
                 tooltip="Set to the same value as SolAttn's MiniMax H3 Chunk FeedForward when enabled.",
             ),
+            io.Boolean.Input(
+                "keep_lora_on_gpu",
+                default=False,
+                optional=True,
+                tooltip="Cache the per-LoRA matmul tensors in VRAM so sampling stops re-uploading them every step. "
+                        "Costs roughly the LoRA size in bf16 VRAM; turn on when stacking several large LoRAs.",
+            ),
         ]
         for i in range(1, MAX_LORAS + 1):
             inputs.append(io.Combo.Input(f"lora_{i}", options=lora_list, default="None", optional=True))
@@ -677,8 +794,9 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
             category="MiniMax-H3/LoRA",
             description=(
                 "Stack MiniMax H3 LoRAs with per-LoRA audio/video weights. "
-                "For standard H3 LoRAs the node applies token-row masks inside the "
-                "shared DiT blocks; optional audio/video-specific keys are split by key."
+                "Each LoRA is merged into the weights at its video weight and only the "
+                "audio/text rows are corrected at runtime, so per-modality weighting "
+                "stays cheap even with several stacked LoRAs."
             ),
             inputs=inputs,
             outputs=[
@@ -687,17 +805,10 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
             ],
         )
 
-    @staticmethod
-    def _config_index(configs, config):
-        for i, c in enumerate(configs):
-            if c.uid == config.uid:
-                return i
-        configs.append(config)
-        return len(configs) - 1
-
     @classmethod
     def execute(cls, model, **kwargs):
         chunks = max(1, int(kwargs.get("chunks", 1)))
+        keep_on_gpu = bool(kwargs.get("keep_lora_on_gpu", False))
         inner = getattr(model, "model", None)
         dm = getattr(inner, "diffusion_model", None) if inner is not None else None
         if dm is None or not hasattr(dm, "blocks"):
@@ -706,8 +817,7 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
         new_model = model.clone()
         entries_by_key = {}
         info = []
-        use_merge = True
-        merge_entries = []
+        merged_total = 0
 
         for i in range(1, MAX_LORAS + 1):
             lora_name = kwargs.get(f"lora_{i}", "None")
@@ -742,13 +852,18 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
 
             key_map = comfy.lora.model_lora_keys_unet(inner, {})
             loaded = comfy.lora.load_lora(lora_dict, key_map, log_missing=False)
-            equal_weights = abs(audio_weight - video_weight) < 1e-6
-            if not equal_weights:
-                use_merge = False
-            elif use_merge:
-                merge_entries.append((lora_name, loaded, strength * audio_weight))
             config = _LoraConfig(lora_name, strength, audio_weight, video_weight)
-            count = 0
+
+            if abs(audio_weight - video_weight) < 1e-6:
+                patched = new_model.add_patches(loaded, strength * audio_weight)
+                merged_total += len(patched)
+                info.append(f"{lora_name}: merged {len(patched)} modules")
+                continue
+
+            # Unequal weights: merge the video component into the weights (video
+            # rows dominate the packed sequence) and keep only the per-row delta
+            # where a tag's weight differs from the merged one.
+            plans = []
             for key, adapter in loaded.items():
                 if not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
                     continue
@@ -762,22 +877,77 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                 if not _adapter_shape_matches(adapter, module):
                     info.append(f"{lora_name}: skipped shape mismatch {key}")
                     continue
-                entries_by_key.setdefault(key, []).append(_LoraEntry(config, adapter))
-                count += 1
-            info.append(f"{lora_name}: {count} modules")
+                mode = _classify_key(key)
+                plain_lora = isinstance(adapter, comfy.weight_adapter.LoRAAdapter)
+                if mode in ("token", "adaln"):
+                    if plain_lora and video_weight != 0.0:
+                        plans.append((key, adapter, "merge_residual", video_weight))
+                    else:
+                        plans.append((key, adapter, "runtime", None))
+                elif mode == "video_scalar":
+                    if video_weight != 0.0:
+                        plans.append((key, adapter, "merge_scalar", video_weight))
+                elif mode == "audio_scalar":
+                    if audio_weight != 0.0:
+                        plans.append((key, adapter, "merge_scalar", audio_weight))
+                elif mode == "global" and plain_lora:
+                    plans.append((key, adapter, "merge_scalar", 1.0))
+                else:
+                    plans.append((key, adapter, "runtime", None))
 
-        if use_merge and merge_entries:
-            total_merged = 0
-            for merge_name, loaded, effective_strength in merge_entries:
-                patched = new_model.add_patches(loaded, effective_strength)
-                info.append(f"{merge_name}: merged {len(patched)} modules")
-                total_merged += len(patched)
-            if total_merged == 0:
-                info.append("no compatible LoRA modules loaded")
-            return (new_model, "; ".join(info))
+            merge_groups = {}
+            for key, adapter, kind, factor in plans:
+                if factor is None:
+                    continue
+                merge_groups.setdefault(round(float(factor), 6), {})[key] = adapter
+
+            merged_keys = set()
+            for factor, subset in merge_groups.items():
+                merged_keys.update(new_model.add_patches(subset, strength * factor))
+
+            count_merged = 0
+            count_runtime = 0
+            for key, adapter, kind, factor in plans:
+                mode = _classify_key(key)
+                if kind == "merge_residual":
+                    if key in merged_keys:
+                        entry = _LoraEntry(
+                            config, adapter,
+                            (0.0, 1.0 - video_weight, audio_weight - video_weight),
+                            sparse=True,
+                        )
+                        count_merged += 1
+                    else:
+                        entry = _LoraEntry(config, adapter, (video_weight, 1.0, audio_weight))
+                        count_runtime += 1
+                    entries_by_key.setdefault(key, []).append(entry)
+                elif kind == "merge_scalar":
+                    if key in merged_keys:
+                        count_merged += 1
+                    else:
+                        entry = _LoraEntry(config, adapter, (video_weight, 1.0, audio_weight))
+                        entry.scalar = {
+                            "video_scalar": video_weight,
+                            "audio_scalar": audio_weight,
+                        }.get(mode, 1.0)
+                        entries_by_key.setdefault(key, []).append(entry)
+                        count_runtime += 1
+                else:
+                    entry = _LoraEntry(config, adapter, (video_weight, 1.0, audio_weight))
+                    if mode in ("video_scalar", "audio_scalar", "global"):
+                        entry.scalar = {
+                            "video_scalar": video_weight,
+                            "audio_scalar": audio_weight,
+                        }.get(mode, 1.0)
+                    entries_by_key.setdefault(key, []).append(entry)
+                    count_runtime += 1
+
+            merged_total += count_merged
+            info.append(f"{lora_name}: merged {count_merged} modules, runtime {count_runtime}")
 
         if not entries_by_key:
-            info.append("no compatible LoRA modules loaded")
+            if merged_total == 0:
+                info.append("no compatible LoRA modules loaded")
             return (new_model, "; ".join(info))
 
         wrappers = []
@@ -799,6 +969,7 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                     entries,
                     mask_mode=mode,
                     chunks=chunks if chunked else 1,
+                    keep_on_gpu=keep_on_gpu,
                 )
                 wrappers.append(wrapper)
                 m = re.match(r"blocks\.(\d+)", _module_path(key))
@@ -811,32 +982,19 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
                     mlp_info = mlp_map.setdefault(int(m.group(1)), {"wrappers": []})
                     mlp_info["wrappers"].append(wrapper)
             elif mode == "final_adaln":
-                wrapper = _AVModuleBypass(module, entries, mask_mode="adaln")
+                wrapper = _AVModuleBypass(module, entries, mask_mode="adaln", keep_on_gpu=keep_on_gpu)
                 wrappers.append(wrapper)
                 final_info = final_map.setdefault("adaln", {"wrappers": []})
                 final_info["wrappers"].append(wrapper)
             else:
-                scalar_mode = mode
-                wrapper = _AVModuleBypass(module, entries, mask_mode="scalar", scalar_mode=scalar_mode)
-                scalar_values = []
-                for entry in entries:
-                    if mode == "video_scalar":
-                        scalar_values.append(entry.config.video_weight)
-                    elif mode == "audio_scalar":
-                        scalar_values.append(entry.config.audio_weight)
-                    else:
-                        scalar_values.append(1.0)
-                wrapper.set_scalars(scalar_values)
+                wrapper = _AVModuleBypass(module, entries, mask_mode="scalar", keep_on_gpu=keep_on_gpu)
+                wrapper.set_scalars([entry.scalar for entry in entries])
                 wrappers.append(wrapper)
 
         block_patches = []
         for block_id, block_info in sorted(block_map.items()):
-            configs = []
-            for wrapper in block_info["wrappers"]:
-                for entry in wrapper.entries:
-                    entry.mask_index = cls._config_index(configs, entry.config)
             block = dm.blocks[block_id]
-            block_patches.append(_H3BlockAVPatch(block, block_info["wrappers"], configs))
+            block_patches.append(_H3BlockAVPatch(block, block_info["wrappers"]))
 
         mlp_patches = []
         for block_id, mlp_info in sorted(mlp_map.items()):
@@ -847,11 +1005,7 @@ class MiniMaxH3AVLoRAStack(io.ComfyNode):
 
         final_patches = []
         if "adaln" in final_map:
-            configs = []
-            for wrapper in final_map["adaln"]["wrappers"]:
-                for entry in wrapper.entries:
-                    entry.mask_index = cls._config_index(configs, entry.config)
-            final_patches.append(_H3FinalLayerAVPatch(dm.final_layer, final_map["adaln"]["wrappers"], configs))
+            final_patches.append(_H3FinalLayerAVPatch(dm.final_layer, final_map["adaln"]["wrappers"]))
 
         injection = _H3AVInjection(wrappers, mlp_patches, block_patches, final_patches)
         # new_model 是本次执行新建的 clone，key 天然每次唯一；V3 下 cls 也是每次执行的
