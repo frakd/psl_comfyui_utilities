@@ -13,6 +13,7 @@ from .memory_monitor import MemoryMonitorEnd, MemoryMonitorStart
 from .model_reroute import ModelReroute
 from .persistent_output import PersistentOutput
 from .prompt_weight import MOSSImagePromptWeightPreset
+from .psl_rtx_chunked_combine import PSLRtxChunkedVideoCombine
 from .psl_video_memory import PSLVideoCombineMemory
 from .refreshable_text_box import RefreshableTextBox
 from .text_container import TextContainer
@@ -41,6 +42,7 @@ _NODE_CLASSES = (
     PSLLoRAStepSchedule,
     PSLValueCurve,
     PSLVideoCombineMemory,
+    PSLRtxChunkedVideoCombine,
     PSLAdvancedVideoMatchV2,
     MOSSImagePromptWeightPreset,
 )
